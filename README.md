@@ -41,6 +41,7 @@ A Hugging Face Space that runs:
 | `tools/verify_gated_client.mjs` | runs the real login gate + loader headless: proves the file only boots after the login |
 | `tools/run_epw_loader.mjs` | boots the client's own EPW loader to prove the file loads |
 | `tools/forward_ip_probe.py` | asks the proxy whether it sends a forwarded-IP header (embedded in `start.sh`) |
+| `tools/proxy_peers.py` | the addresses of the proxy that sits in front of the game port, from the kernel's own tables (embedded in `start.sh`) |
 | `tools/patch_auth_filter.py` | stops LoginSecurity/AuthMe from hiding `/login` from the console (embedded in `start.sh`) |
 | `tools/bucket_sync.py` | uploads a folder to the bucket (the fallback used when `hf` fails; embedded in `start.sh`) |
 | `tools/embed_tools.py` | keeps those embedded copies in sync (the tests fail when they differ) |
@@ -126,6 +127,7 @@ hf://buckets/smodusermc/1.12/game-data/security-logs/client-checks.log       ver
 hf://buckets/smodusermc/1.12/game-data/security-logs/shared-ips.txt          shared-IP + verdict report
 hf://buckets/smodusermc/1.12/game-data/security-logs/ip-report.log           every IP per account + shared-IP pairs
 hf://buckets/smodusermc/1.12/game-data/security-logs/logger-status.log       is the logger seeing joins? raw lines
+hf://buckets/smodusermc/1.12/game-data/security-logs/proxy-peers.txt         the proxy's own addresses (so an address can be classified)
 hf://buckets/smodusermc/1.12/game-data/private-logs/auth.log                 full /login lines (passwords)
 hf://buckets/smodusermc/1.12/game-data/private-logs/player-ips.log           real IPs behind "hidden"
 hf://buckets/smodusermc/1.12/game-data/private-logs/logins-real-ips.log      logins with the real IPs
@@ -287,7 +289,8 @@ some point is refused by the patcher (`REVOKED_BRANDS`) and by the server
 (`PUBLISHED_CLIENT_BRANDS`), and the test suite checks that the pair never
 appears in the git history: `git log --all -S"<brand>"` must be empty. The suite also checks the hidden-IP logging, the enforcement
 (kicks), the `/login` logging against a fake Bungee console, the IP report, the
-forwarded-IP discovery (with a fake proxy that refuses headers), the auth-filter
+forwarded-IP discovery (with a fake proxy that refuses headers), the proxy-peer
+evidence (against a fixture of the kernel's own tables), the auth-filter
 patch (its rule table, a fixture jar it patches and a real JVM loads, the
 `javap` rollback and the switch), the masking of the bucket's console copies,
 the per-account addresses, and that the copies embedded in `start.sh` match
@@ -296,9 +299,9 @@ environment it additionally **runs the real login gate and boots the client's
 own EPW loader** in Node, i.e. it proves the file you hand out works:
 
 ```bash
-bash tests/test_verified_client.sh              # 253 checks
+bash tests/test_verified_client.sh              # 280 checks
 VER_CLIENT_USER=<user> VER_CLIENT_PASS=<password> \
-    bash tests/test_verified_client.sh          # 268 checks (adds the boot test)
+    bash tests/test_verified_client.sh          # 295 checks (adds the boot test)
 
 # same, but print the logs it produced, so you can see the formats:
 PRINT_LOGS=1 bash tests/test_verified_client.sh
@@ -404,6 +407,7 @@ masked as well, so the bucket never carries your own password twice.
 | `FORWARD_IP` | `auto` | where the real client IP comes from: `auto` probes which header the proxy sends once and remembers it, `on` trusts `FORWARD_IP_HEADER`, `off` keeps the proxy's address, or put a header name here |
 | `FORWARD_IP_HEADER` | `""` | header to trust (with `FORWARD_IP=auto` + a name here it is used without probing) |
 | `FORWARD_IP_CANDIDATES` | `X-Real-IP X-Forwarded-For CF-Connecting-IP True-Client-IP X-Envoy-External-Address X-Client-IP` | headers tried in that order |
+| `FORWARD_IP_RETRY_INTERVAL` | `600` | seconds between background retries of the header discovery while the logged addresses are still the proxy's (only ever with nobody online; `0` disables) |
 | `AUTH_FILTER_PATCH` | `true` | neutralise the LoginSecurity/AuthMe password filter before Paper starts, so `/login` reaches the console and `auth.log` fills; `false` leaves the plugin jars untouched (and the logins stay invisible) |
 | `PUBLIC_URL` | `https://smodusermc-12.hf.space/` | what the probe connects to (the same path players take) |
 | `LOG_STATUS_INTERVAL` | `60` | how often `security-logs/logger-status.log` is refreshed |
@@ -430,17 +434,48 @@ player out for good.
 3. a header is only kept when the probe really got through **and** the plugin's
    log does not say it refused that header;
 4. the winning header is written to `private-logs/forward-ip.state`, which is
-   synced to the bucket, so the next boot uses it immediately and never probes
-   again. If no header works, `off` is remembered instead; if the Space could
-   not reach itself at all, nothing is remembered and it tries again next boot.
+   synced to the bucket **and restored into the container at boot**, so the next
+   boot uses it immediately and never probes again. If no header works, `off` is
+   remembered instead; if the Space could not reach itself at all it tries again
+   every `FORWARD_IP_RETRY_INTERVAL` seconds (600) — but only while nobody is
+   online, because applying a header restarts the proxy, and an `off` that a
+   probe really decided is only re-asked every sixth interval (about an hour),
+   since the answer rarely changes. This matters because
+   the boot probe can only succeed once the Space really answers on its public
+   URL, which is usually *not* the case while it is still starting up: without
+   the retry a failed boot probe was final until the next restart.
 
 The result is visible in the logs:
 
 ```
 security-logs/logger-status.log       real client IPs: on (X-Real-IP) - the logged IPs are the players' real addresses
-security-logs/ip-report.log           every IP per account + which accounts share one
+                                      proxy peers    : 1.2.3.4 1.2.3.5
+                                      ip evidence    : the addresses in the logs are not proxy peers - they are the players' own
+security-logs/ip-report.log           every IP per account + which accounts share one + which address is a player's
 private-logs/ip-report-private.log    the same report including your own IPs
+security-logs/proxy-peers.txt         the proxy's own addresses, so a log address can be classified
+private-logs/proxy-peers.log          the same list with the time each one was first seen
 ```
+
+Those two "proxy peers" lines are not a guess: everything from outside reaches
+the game port through the ingress, so the **peers of that port are the proxy's
+addresses** (read from the kernel's own tables — `tools/proxy_peers.py`, no `ss`
+needed). An address in the logs that equals a peer is the proxy's, and one that
+does not is a player's own. `ip-report.log` ends with that classification:
+
+```
+=== Which address is a real client address ===
+  1.2.3.4 -> the PROXY address (not a player), 3 account(s)
+  5.6.7.8 -> a real client address (not a proxy peer), 2 account(s)
+  verdict: both kinds are present - a row with the PROXY address had no forwarded header
+
+=== One device, two protocols (IPv4 + IPv6) ===
+  1 account(s) -> seen over IPv4 and IPv6 - that is one device, not two
+```
+
+The last section answers the other way an "IP" can look wrong: one machine that
+reaches the Space over IPv4 one time and IPv6 the next shows two addresses that
+are both correct, and it is still one device.
 
 If no header works, the status line says so in plain words
 (`… OFF - the logged IPs are the ADDRESS OF THE PROXY, not the player's …`) —

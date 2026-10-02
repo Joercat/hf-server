@@ -170,6 +170,12 @@ export BUCKET_SYNC_PY="$WORK/bucket_sync.py"
 export BUCKET_VIA=""
 export BUCKET_ERROR=""
 export LOGIN_CLIENT_FIELD=""   # set by start.sh from HIDE_VERIFIED_IP
+export PROXY_PEERS_PY="$WORK/proxy_peers.py"
+export PROXY_PEERS_STATE="$WORK/proxy-peers.log"
+export PROXY_PEERS_VIEW="$WORK/security/proxy-peers.txt"
+export GAME_PORT=7860
+export FORWARD_IP_RETRY_INTERVAL=600
+export FORWARD_IP_STATE="$WORK/forward-ip.state"
 : > "$VERDICT_CACHE"; : > "$IP_MAP"; : > "$PENDING_AUTH"; : > "$AUTH_SEEN"
 touch "$BLOG" "$CLIENT_LOG" "$LOGIN_LOG" "$CMD_LOG" "$AUTH_LOG" "$IP_MAP_FILE"
 : > "$WORK/kicks"
@@ -194,6 +200,9 @@ for f in strip_colours bungee_console bungee_alive query_client_brand check_play
          write_auth_filter_patch_py ensure_auth_filter_patch_py auth_patch_one \
          javap_dump javap_verify_patch apply_auth_filter_patch \
          auth_patch_post_start_check mask_console_tail real_client_ip_line \
+         write_proxy_peers_py ensure_proxy_peers_py proxy_peer_addrs proxy_peers_record \
+         proxy_peer_list is_proxy_addr logged_ip_is_proxy ip_evidence_line \
+         forward_ip_retry_needed forward_ip_retry_due \
          wait_for_paper_ready \
          handle_paper_line handle_bungee_line; do
     extract "$f"
@@ -1016,6 +1025,7 @@ def extract(marker):
 bad = []
 for name, marker in [("bucket_sync.py", "BUCKET_SYNC_PY_EOF"),
                      ("forward_ip_probe.py", "FORWARD_IP_PROBE_EOF"),
+                     ("proxy_peers.py", "PROXY_PEERS_EOF"),
                      ("patch_auth_filter.py", "AUTH_FILTER_PATCH_PY_EOF")]:
     if extract(marker) != (root / "tools" / name).read_text():
         bad.append(name)
@@ -1033,6 +1043,7 @@ def extract(marker):
     return s[i:j] + "\n"
 bad = [n for n, m in [("bucket_sync.py", "BUCKET_SYNC_PY_EOF"),
                       ("forward_ip_probe.py", "FORWARD_IP_PROBE_EOF"),
+                      ("proxy_peers.py", "PROXY_PEERS_EOF"),
                       ("patch_auth_filter.py", "AUTH_FILTER_PATCH_PY_EOF")]
        if extract(m) != (root / "tools" / n).read_text()]
 print("MISMATCH:" + ",".join(bad) if bad else "OK")
@@ -1313,6 +1324,119 @@ check "the status says when the logged IP is the proxy's, not the player's" \
 set_forward_ip_in_listeners true X-Forwarded-For
 check "…and when the players' real addresses are in use" \
       "$(real_client_ip_line | grep -c 'real addresses')" "1"
+
+# --------------------------------------------------------------------------- #
+echo "== 20. the address in the log: the player's, or the proxy's =="
+
+# The tool reads the kernel's own tables, so the tests can hand it a fixture.
+PEERFX="$WORK/peerfx"; rm -rf "$PEERFX"; mkdir -p "$PEERFX/net"
+cat > "$PEERFX/net/tcp" <<'PEER_TCP'
+  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+   0: 00000000:1EB4 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 1 1 0000000000000000 100 0 0 10 0
+   1: 0100007F:1EB4 0500000A:8AE1 01 00000000:00000000 00:00000000 00000000  1000        0 2 1 0000000000000000 20 4 30 10 -1
+   2: 0100007F:1EB4 6300000A:9BC2 06 00000000:00000000 00:00000000 00000000  1000        0 3 1 0000000000000000 20 4 30 10 -1
+   3: 0100007F:1F90 0100007F:1EB4 01 00000000:00000000 00:00000000 00000000  1000        0 4 1 0000000000000000 20 4 30 10 -1
+PEER_TCP
+cat > "$PEERFX/net/tcp6" <<'PEER_TCP6'
+  sl  local_address rem_address   st
+   0: 00000000000000000000000000000000:1EB4 B80D0120000000000000000001000000:8AE1 01
+PEER_TCP6
+check "the proxy peers come out of the kernel tables (IPv4 and IPv6)" \
+      "$(python3 "$ROOT/tools/proxy_peers.py" --proc-dir "$PEERFX" | tr '\n' ' ')" \
+      "10.0.0.5 10.0.0.99 2001:db8::1 "
+check "…and a connection that is not to the game port is not a peer" \
+      "$(python3 "$ROOT/tools/proxy_peers.py" --proc-dir "$PEERFX" | grep -c '127.0.0.1')" "0"
+
+# a python wrapper so the recorded peers come from the fixture
+cat > "$WORK/peers_py.py" <<PYWRAP
+import subprocess, sys
+sys.exit(subprocess.call([sys.executable, "$ROOT/tools/proxy_peers.py",
+                          "--proc-dir", "$PEERFX"] + sys.argv[1:]))
+PYWRAP
+export PROXY_PEERS_PY="$WORK/peers_py.py"
+: > "$PROXY_PEERS_STATE"; : > "$IP_MAP"; : > "$IP_MAP_FILE"
+proxy_peers_record > "$WORK/peers-record.log" 2>&1
+check "the proxy peers are written into private-logs (so they survive a restart)" \
+      "$(grep -c '10.0.0.5' "$PROXY_PEERS_STATE")" "1"
+check "…and a readable copy goes to the synced folder" \
+      "$(grep -c 'is the PROXY' "$PROXY_PEERS_VIEW")" "1"
+proxy_peers_record > /dev/null 2>&1
+check "…and the same peer is never recorded twice" "$(grep -c . "$PROXY_PEERS_STATE")" "3"
+check "an address equal to a peer is the proxy's" "$(is_proxy_addr 10.0.0.5 && echo yes || echo no)" "yes"
+check "…while a player's address is not" "$(is_proxy_addr 203.0.113.9 && echo yes || echo no)" "no"
+
+# the evidence, and the report that spells it out
+printf '%s\t%s\t%s\t%s\n' Alice 10.0.0.5 bungee-handshake "$(date +%s)" >> "$IP_MAP"
+printf '%s\t%s\t%s\t%s\n' Bob 203.0.113.9 paper "$(date +%s)" >> "$IP_MAP"
+check "the evidence notices that a logged address is the proxy's" \
+      "$(logged_ip_is_proxy && echo yes || echo no)" "yes"
+check "…and says it in one sentence" "$(ip_evidence_line | grep -c "ARE THE PROXY'S")" "1"
+ip_report_body "$IP_MAP" "$WORK/ip-report.log" no
+check "the report marks a proxy address as the proxy's" \
+      "$(grep -c '^  10.0.0.5 -> the PROXY address (not a player), 1 account' "$WORK/ip-report.log")" "1"
+check "…and a non-peer address as a real client address" \
+      "$(grep -c '^  203.0.113.9 -> a real client address (not a proxy peer), 1 account' "$WORK/ip-report.log")" "1"
+check "…with a verdict for a mixture" \
+      "$(grep -c 'both kinds are present' "$WORK/ip-report.log")" "1"
+: > "$IP_MAP"
+printf '%s\t%s\t%s\t%s\n' Alice 10.0.0.5 bungee-handshake "$(date +%s)" >> "$IP_MAP"
+ip_report_body "$IP_MAP" "$WORK/ip-report.log" no
+check "a log that only has the proxy's address is called out" \
+      "$(grep -c 'every address here is the PROXY address' "$WORK/ip-report.log")" "1"
+check "…and none of that is mistaken for a shareable player address" \
+      "$(grep -c 'unknown' "$WORK/ip-report.log")" "0"
+
+# one device using both protocols is not two machines
+: > "$IP_MAP"
+printf '%s\t%s\t%s\t%s\n' Cara 203.0.113.9 paper "$(date +%s)" >> "$IP_MAP"
+printf '%s\t%s\t%s\t%s\n' Cara 2001:db8::5 paper "$(date +%s)" >> "$IP_MAP"
+ip_report_body "$IP_MAP" "$WORK/ip-report.log" no
+check "IPv4 + IPv6 for one account is reported as one device" \
+      "$(grep -c 'seen over IPv4 and IPv6 - that is one device, not two' "$WORK/ip-report.log")" "1"
+
+# when is the header discovery retried? only with nobody online, and only when
+# the addresses in the logs really are the proxy's
+: > "$IP_MAP"; : > "$ONLINE_STATE"; : > "$FORWARD_IP_STATE"
+printf '%s\t%s\t%s\t%s\n' Alice 10.0.0.5 bungee-handshake "$(date +%s)" >> "$IP_MAP"
+FORWARD_IP=auto
+check "the discovery is retried when the logs hold the proxy's address" \
+      "$(forward_ip_retry_needed && echo yes || echo no)" "yes"
+printf 'Alice\n' > "$ONLINE_STATE"
+check "…but never while somebody is online (it restarts the proxy)" \
+      "$(forward_ip_retry_needed && echo yes || echo no)" "no"
+: > "$ONLINE_STATE"
+printf 'X-Real-IP\n' > "$FORWARD_IP_STATE"
+check "…and not once a header already works" \
+      "$(forward_ip_retry_needed && echo yes || echo no)" "no"
+: > "$FORWARD_IP_STATE"; FORWARD_IP=off
+check "…and not when forwarding was switched off on purpose" \
+      "$(forward_ip_retry_needed && echo yes || echo no)" "no"
+FORWARD_IP=auto; FORWARD_IP_RETRY_INTERVAL=0
+check "…and the retries can be turned off entirely" \
+      "$(forward_ip_retry_needed && echo yes || echo no)" "no"
+FORWARD_IP_RETRY_INTERVAL=600
+printf 'off\n' > "$FORWARD_IP_STATE"
+check "a header that was ruled out is only re-asked rarely" \
+      "$(forward_ip_retry_due 1 && echo yes || echo no)" "no"
+check "…but it is asked again eventually (the proxy can change)" \
+      "$(forward_ip_retry_due 6 && echo yes || echo no)" "yes"
+: > "$FORWARD_IP_STATE"
+check "…while a boot that never got an answer is asked again next time" \
+      "$(forward_ip_retry_due 1 && echo yes || echo no)" "yes"
+: > "$IP_MAP"
+printf '%s\t%s\t%s\t%s\n' Bob 203.0.113.9 paper "$(date +%s)" >> "$IP_MAP"
+check "…and there is nothing to do when the addresses are the players' own" \
+      "$(forward_ip_retry_needed && echo yes || echo no)" "no"
+
+# the choice of header has to survive a restart, or every boot starts from zero
+check "the discovered header is remembered where the README says (private-logs)" \
+      "$(grep -c '^FORWARD_IP_STATE="\$PRIV_DIR/forward-ip.state"$' "$ROOT/start.sh")" "1"
+: > "$IP_MAP"; : > "$IP_MAP_FILE"
+write_logger_status
+check "logger-status prints the proxy peers" \
+      "$(grep -c '^proxy peers    :' "$SEC_DIR/logger-status.log")" "1"
+check "…and what the addresses in the logs are" \
+      "$(grep -c '^ip evidence    :' "$SEC_DIR/logger-status.log")" "1"
 
 echo
 echo "passed: $PASS  failed: $FAIL"

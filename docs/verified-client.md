@@ -342,6 +342,7 @@ files below stay inside the Space and *cannot* be read from outside):
 | private file | content |
 | --- | --- |
 | `auth.log` | full `/login`, `/register`, `/changepassword`, … commands of everybody except the verified client |
+| `proxy-peers.log` | the addresses the proxy in front of the server connects from, so an address in the logs can be classified as the player's or the proxy's |
 | `player-ips.log` | the real IPs that appear as `hidden` in the synced logs |
 | `logins-real-ips.log`, `shared-ips-private.txt` | the same reports as the bucket ones, but with the verified client's IP put back in |
 
@@ -408,6 +409,17 @@ using eaglercraft!`) become `VANILLA`; no answer at all becomes `UNKNOWN`, never
   `********`, the verified client's address `hidden`) and that three accounts
   on one device keep one address while two simultaneous logins never swap
   addresses;
+* asserts the IP evidence: the proxy peers come out of a fixture of the kernel's
+  tables (IPv4 and IPv6, listener and unrelated sockets ignored), are recorded
+  once with a readable copy in the synced folder, an address equal to a peer is
+  reported as the proxy's and one that is not as a real client address, a
+  proxy-only log is called out with its verdict, IPv4+IPv6 for one account is
+  reported as one device, and the header discovery is retried exactly when it
+  should be (never while somebody is online, never once a header works);
+* asserts the discovered header is remembered in `private-logs/`, i.e. inside
+  the folder that is synced to the bucket and restored at boot - a choice that
+  is written outside it does not survive a restart - and that a header a probe
+  really ruled out is only re-asked about once an hour, not on every tick;
 * **runs the real login gate and boots the client's own `loader.wasm`**: with
   `VER_CLIENT_USER`/`VER_CLIENT_PASS` set it calls
   `tools/verify_gated_client.mjs` (no boot before the login, wrong username and

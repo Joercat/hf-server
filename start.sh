@@ -240,8 +240,23 @@ FORWARD_IP="${FORWARD_IP:-auto}"
 FORWARD_IP_HEADER="${FORWARD_IP_HEADER:-}"
 FORWARD_IP_CANDIDATES="${FORWARD_IP_CANDIDATES:-X-Real-IP X-Forwarded-For CF-Connecting-IP True-Client-IP X-Envoy-External-Address X-Client-IP}"
 PUBLIC_URL="${PUBLIC_URL:-https://smodusermc-12.hf.space/}"
-FORWARD_IP_STATE="$PRIVATE_DIR/forward-ip.state"
+FORWARD_IP_STATE="$PRIV_DIR/forward-ip.state"
 FORWARD_IP_PROBE_PY="${FORWARD_IP_PROBE_PY:-/tmp/forward_ip_probe.py}"
+#   The boot probe can only succeed once the Space really answers on its public
+#   URL, which is usually not the case while it is still starting up - and a
+#   failed probe used to be final until the next restart. It is therefore
+#   retried in the background until a header works; a retry restarts the proxy,
+#   so it only ever happens while nobody is online. 0 disables the retries.
+FORWARD_IP_RETRY_INTERVAL="${FORWARD_IP_RETRY_INTERVAL:-600}"
+#   Which of the two it is - the player's address or the proxy's - is not a
+#   matter of opinion: everything from outside reaches the game port through the
+#   ingress, so the PEERS of that port are the proxy's own addresses. Comparing
+#   a logged address against them is what makes "the IPs are wrong" answerable:
+#   a logged address that equals a peer is the proxy's, never a player's.
+PROXY_PEERS_PY="${PROXY_PEERS_PY:-/tmp/proxy_peers.py}"
+PROXY_PEERS_STATE="$PRIV_DIR/proxy-peers.log"
+PROXY_PEERS_VIEW="$SEC_DIR/proxy-peers.txt"
+GAME_PORT="${GAME_PORT:-7860}"
 
 # =============================================
 # AUTH LOG CAPTURE  (why /login needs a patch)
@@ -369,6 +384,127 @@ ensure_forward_ip_probe_py() {
     [ -s "$FORWARD_IP_PROBE_PY" ] || write_forward_ip_probe_py
 }
 # <<< embedded forward_ip_probe.py <<<
+
+# >>> embedded proxy_peers.py (generated from tools/proxy_peers.py) >>>
+write_proxy_peers_py() {
+    mkdir -p "$(dirname "$PROXY_PEERS_PY")" 2>/dev/null
+    cat > "$PROXY_PEERS_PY" <<'PROXY_PEERS_EOF'
+#!/usr/bin/env python3
+"""proxy_peers.py - the addresses of the proxy that sits in front of the game port.
+
+Everything that reaches the game port (7860) from outside goes through the
+Hugging Face ingress, so the *peers* of the listening socket are the ingress's
+own addresses - never a player's.  Comparing a logged player address with them
+is what answers the question the logs alone cannot:
+
+  * the address equals a proxy peer -> the log holds the PROXY's address, not
+    the player's (no forwarded header is in use, so two logins can legitimately
+    show two different addresses for one player: the ingress has several nodes)
+  * it does not                     -> the log holds the player's own address
+
+No `ss`/`iproute2` needed: the kernel's own tables are read (/proc/net/tcp and
+/proc/net/tcp6, where they exist).
+
+usage:
+  proxy_peers.py                       # peers of port 7860
+  proxy_peers.py --port 25565 --json
+  proxy_peers.py --proc-dir ./fixture  # for the tests
+
+Exit code is 0 even when nothing can be read - "no peers" is a valid answer.
+"""
+
+import argparse
+import ipaddress
+import json
+import os
+import sys
+
+
+def decode_v4(hex_addr: str):
+    raw = bytes.fromhex(hex_addr)
+    if len(raw) != 4:
+        return None
+    return str(ipaddress.IPv4Address(raw[::-1]))
+
+
+def decode_v6(hex_addr: str):
+    raw = bytes.fromhex(hex_addr)
+    if len(raw) != 16:
+        return None
+    # /proc/net/tcp6 stores the address as four 32-bit words, each in host
+    # (little endian) byte order
+    out = b""
+    for i in range(4):
+        out += raw[i * 4:(i + 1) * 4][::-1]
+    return str(ipaddress.IPv6Address(out))
+
+
+def split_addr(field: str):
+    if ":" not in field:
+        return None, None
+    hex_addr, _, hex_port = field.rpartition(":")
+    try:
+        port = int(hex_port, 16)
+    except ValueError:
+        return None, None
+    return hex_addr, port
+
+
+def peers(port: int, proc_dir: str = "/proc"):
+    found = []
+    for name, decode in (("tcp", decode_v4), ("tcp6", decode_v6)):
+        path = os.path.join(proc_dir, "net", name)
+        try:
+            with open(path, "r") as fh:
+                lines = fh.read().splitlines()[1:]
+        except OSError:
+            continue
+        for line in lines:
+            parts = line.split()
+            if len(parts) < 4:
+                continue
+            local_addr, local_port = split_addr(parts[1])
+            rem_addr, rem_port = split_addr(parts[2])
+            if local_port != port or not rem_port:
+                continue
+            if set(rem_addr) == {"0"}:          # the listening socket itself
+                continue
+            addr = decode(rem_addr)
+            if addr and addr not in found:
+                found.append(addr)
+    return sorted(found, key=lambda a: (0 if "." in a else 1, ipaddress.ip_address(a).packed))
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(description="addresses of the proxy in front of the game port")
+    ap.add_argument("--port", type=int, default=7860)
+    ap.add_argument("--proc-dir", default="/proc")
+    ap.add_argument("--json", action="store_true")
+    args = ap.parse_args(argv)
+
+    found = peers(args.port, args.proc_dir)
+    if args.json:
+        print(json.dumps({
+            "port": args.port,
+            "peers": found,
+            "ipv4": len([a for a in found if ":" not in a]),
+            "ipv6": len([a for a in found if ":" in a]),
+        }))
+    else:
+        for addr in found:
+            print(addr)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+PROXY_PEERS_EOF
+}
+ensure_proxy_peers_py() {
+    [ -s "$PROXY_PEERS_PY" ] || write_proxy_peers_py
+}
+# <<< embedded proxy_peers.py <<<
+
 
 # >>> embedded patch_auth_filter.py (generated from tools/patch_auth_filter.py) >>>
 write_auth_filter_patch_py() {
@@ -1444,6 +1580,114 @@ forward_ip_was_refused() {  # the plugin's own words when the header is missing
         | grep -q "header, disconnecting"
 }
 
+# -------------------------------------------------------------
+# Is the address in the log the player's, or the proxy's?
+# -------------------------------------------------------------
+proxy_peer_addrs() {   # the proxy's own addresses (kernel tables, no ss needed)
+    ensure_proxy_peers_py
+    python3 "$PROXY_PEERS_PY" --port "$GAME_PORT" 2>/dev/null
+}
+
+# Remember every peer we have seen: the proxy is not a single machine, and a
+# peer may be gone by the time a report is written. The list is written into
+# private-logs/ (which is restored from the bucket, so it survives a restart)
+# and a readable copy goes into the synced security-logs/.
+proxy_peers_record() {
+    local addr new=0
+    [ -n "$PRIV_DIR" ] || return 0
+    mkdir -p "$PRIV_DIR" "$SEC_DIR" 2>/dev/null
+    touch "$PROXY_PEERS_STATE" 2>/dev/null
+    while IFS= read -r addr; do
+        [ -n "$addr" ] || continue
+        grep -qF "$(printf '\t')$addr" "$PROXY_PEERS_STATE" 2>/dev/null && continue
+        printf '%s\t%s\n' "$(date '+%F %T')" "$addr" >> "$PROXY_PEERS_STATE" 2>/dev/null
+        new=$((new + 1))
+    done <<< "$(proxy_peer_addrs)"
+    [ "${new:-0}" -gt 0 ] 2>/dev/null && echo "   proxy peers: $new new address(es) recorded"
+    {
+        echo "The addresses the proxy in front of the server connects from."
+        echo "An address in the logs that equals one of these is the PROXY's, not a player's."
+        echo "updated: $(date '+%F %T')"
+        echo ""
+        awk -F'\t' 'NF>1 {print "  " $2 "   (first seen " $1 ")"}' "$PROXY_PEERS_STATE" 2>/dev/null | sort -u
+    } > "$PROXY_PEERS_VIEW" 2>/dev/null
+    return 0
+}
+
+proxy_peer_list() {   # the known proxy addresses, one per line
+    awk -F'\t' 'NF>1 {print $2}' "$PROXY_PEERS_STATE" 2>/dev/null | sort -u
+}
+
+is_proxy_addr() {
+    [ -n "${1:-}" ] || return 1
+    proxy_peer_list 2>/dev/null | grep -qxF "$1"
+}
+
+# 0 = the addresses in the IP map are the proxy's (so the logs hold nothing the
+# player's own address could be read from)
+logged_ip_is_proxy() {
+    local addr seen
+    seen=$(awk -F'\t' '{print $2}' "$IP_MAP" 2>/dev/null | sort -u)
+    [ -n "$seen" ] || return 1
+    while IFS= read -r addr; do
+        is_real_ip "$addr" || continue
+        is_proxy_addr "$addr" && return 0
+    done <<< "$seen"
+    return 1
+}
+
+# What a log line's address really is, in one sentence, for logger-status.log
+ip_evidence_line() {
+    if ! proxy_peer_list 2>/dev/null | grep -q .; then
+        echo "no proxy peer recorded yet - the players' addresses cannot be told from the proxy's"
+    elif logged_ip_is_proxy; then
+        echo "THE ADDRESSES IN THE LOGS ARE THE PROXY'S (they equal the peers of port $GAME_PORT) - the players' real IPs are not available, see the IPs section in README.md"
+    else
+        echo "the addresses in the logs are not proxy peers - they are the players' own"
+    fi
+}
+
+# A header can only be discovered while the public URL answers - i.e. not during
+# the boot (that is why the boot probe may fail even though a header exists).
+# Retry it in the background, but only with nobody online: applying a header
+# restarts the proxy.
+forward_ip_retry_needed() {
+    [ "$FORWARD_IP" = "auto" ] || return 1
+    case "${FORWARD_IP_RETRY_INTERVAL:-0}" in ""|*[!0-9]*) return 1 ;; esac
+    [ "$FORWARD_IP_RETRY_INTERVAL" -gt 0 ] || return 1
+    case "$(read_forward_ip_state)" in
+        ""|probe|off) : ;;
+        *) return 1 ;;                      # a header already worked
+    esac
+    [ -s "${ONLINE_STATE:-/dev/null}" ] && return 1      # never kick players for a retry
+    logged_ip_is_proxy || return 1                       # nothing to fix
+    return 0
+}
+
+# A probe that already answered "no header works" is only re-asked rarely: the
+# answer is unlikely to change, and every attempt restarts the proxy.
+forward_ip_retry_due() {   # $1 = tick number, 0 = ask now
+    case "$(read_forward_ip_state)" in
+        ""|probe) return 0 ;;
+        off)      [ $(( ${1:-0} % 6 )) -eq 0 ] ;;   # ~ every 6th interval
+        *)        return 1 ;;
+    esac
+}
+
+forward_ip_retry_loop() {
+    local tick=0
+    while true; do
+        sleep "${FORWARD_IP_RETRY_INTERVAL:-600}" 2>/dev/null || sleep 600
+        tick=$((tick + 1))
+        forward_ip_retry_due "$tick" || continue
+        if forward_ip_retry_needed; then
+            echo "[FORWARD-IP] the logged addresses are the proxy's - retrying the header discovery (nobody online)"
+            discover_forward_ip_header || true
+            proxy_peers_record
+        fi
+    done
+}
+
 forward_ip_probe_once() {   # 0 = the proxy passed the header through
     ensure_forward_ip_probe_py
     python3 "$FORWARD_IP_PROBE_PY" --url "$PUBLIC_URL" --timeout "${FORWARD_IP_TIMEOUT:-10}" \
@@ -2260,8 +2504,19 @@ ip_report_body() {
                    [ "$(verdict_for "$n")" = "VERIFIED" ] && printf '%s,' "$n"
                done)
     fi
-    awk -F'\t' -v skip="$skip" '
-        BEGIN { m = split(skip, a, ","); for (i = 1; i <= m; i++) if (a[i] != "") hidden[a[i]] = 1 }
+    awk -F'\t' -v skip="$skip" -v peersfile="${PROXY_PEERS_STATE:-}" '
+        BEGIN {
+            m = split(skip, a, ","); for (i = 1; i <= m; i++) if (a[i] != "") hidden[a[i]] = 1
+            if (peersfile != "") {
+                while ((getline l < peersfile) > 0) {
+                    p = index(l, "\t")
+                    if (p > 1) {
+                        addr = substr(l, p + 1)
+                        if (addr != "") { peer[addr] = 1; npeer++ }
+                    }
+                }
+            }
+        }
         $1 != "" && $2 != "" && $2 != "unknown" && $2 != "hidden" && !($1 in hidden) {
             pair = $1 SUBSEP $2
             if (!(pair in seen)) {
@@ -2273,6 +2528,7 @@ ip_report_body() {
             rows++
             who[$2] = who[$2] " " $1
             users[$2]++
+            if (!($2 in peer)) fam[$1] = fam[$1] (index($2, ":") ? "6" : "4")
         }
         END {
             print "=== Accounts and the IPs they were seen from ==="
@@ -2284,6 +2540,30 @@ ip_report_body() {
             print ""
             print "=== One IP, several accounts ==="
             for (ip in users) if (users[ip] > 1) print "  " ip " ->" who[ip]
+            print ""
+            print "=== Which address is a real client address ==="
+            if (npeer == 0) print "  (no proxy peer recorded yet - see security-logs/proxy-peers.txt)"
+            for (ip in users) {
+                if (ip in peer) print "  " ip " -> the PROXY address (not a player), " users[ip] " account(s)"
+                else            print "  " ip " -> a real client address (not a proxy peer), " users[ip] " account(s)"
+            }
+            proxied = 0; own = 0
+            for (ip in users) { if (ip in peer) proxied++; else own++ }
+            if (rows > 0) {
+                if (own == 0)          print "  verdict: every address here is the PROXY address - the real client IPs are not in these logs"
+                else if (proxied == 0) print "  verdict: the addresses here are the real client addresses (a forwarded header is in use)"
+                else                   print "  verdict: both kinds are present - a row with the PROXY address had no forwarded header"
+            }
+            print ""
+            print "=== One device, two protocols (IPv4 + IPv6) ==="
+            duals = 0
+            for (n in fam) {
+                if (fam[n] ~ /4/ && fam[n] ~ /6/) {
+                    print "  " duals + 1 " account(s) -> seen over IPv4 and IPv6 - that is one device, not two"
+                    duals++
+                }
+            }
+            if (duals == 0) print "  (none)"
         }' "$map" 2>/dev/null | sort > "$out"
 }
 
@@ -2325,6 +2605,8 @@ write_logger_status() {
         echo "client-checks  : $(wc -l < "$CLIENT_LOG" 2>/dev/null || echo 0) rows"
         echo "playerlist     : ${PLAYERLIST_LAST:-not polled yet}"
         echo "real client IPs: $(real_client_ip_line)"
+        echo "proxy peers    : $(proxy_peer_list 2>/dev/null | tr '\n' ' ')"
+        echo "ip evidence    : $(ip_evidence_line)"
         echo "login capture  : ${AUTH_PATCH_STATUS:-not run}"
         if [ "$VERIFIED_CLIENT_CONFIGURED" = true ]; then
             echo "verified client: ${VERIFIED_CLIENT_BRAND} (uuid ${VERIFIED_CLIENT_UUID})"
@@ -2764,6 +3046,7 @@ hf_push_saves() {
 hf_push_logs() {
     flush_pending_auth
     report_shared_ips
+    proxy_peers_record
     local STAGING="$LOG_STAGING" out rc
     rm -rf "$STAGING" && mkdir -p "$STAGING"
     [ -d "$SEC_DIR" ] && cp -a "$SEC_DIR" "$STAGING/security-logs"
@@ -2947,6 +3230,7 @@ auth_patch_post_start_check || true
 # Start security logger (logins/IPs + commands + verified client checks)
 warn_verified_client_problem
 warn_verified_client_mismatch
+proxy_peers_record 2>/dev/null || true
 write_logger_status
 start_security_logger
 echo " Security logger PID: $SECLOG_PID"
@@ -3207,6 +3491,8 @@ hf_sync_loop &
 SYNC_PID=$!
 log_sync_loop &
 LOGSYNC_PID=$!
+forward_ip_retry_loop &
+FORWARDIP_PID=$!
 
 # =============================================================
 # Shutdown — save world properly, then push, then stop processes
@@ -3285,6 +3571,11 @@ while true; do
         echo "[$(date '+%H:%M:%S')] Log sync died — restarting..."
         log_sync_loop &
         LOGSYNC_PID=$!
+    fi
+
+    if [ -z "${FORWARDIP_PID:-}" ] || ! kill -0 "$FORWARDIP_PID" 2>/dev/null; then
+        forward_ip_retry_loop &
+        FORWARDIP_PID=$!
     fi
 
     if ! kill -0 "$SECLOG_PID" 2>/dev/null; then
