@@ -970,30 +970,30 @@ mask_cmd() {
             # write anybody's password in clear until the pair is configured
             write_auth_masked "$name" "$cmd" "UNCONFIGURED" "${verdict:-UNKNOWN}"
         else
-        case "${verdict:-UNKNOWN}" in
-            VERIFIED)
-                # the owner: the password is never written anywhere, but the
-                # command is still recorded (masked, IP hidden) so auth.log
-                # shows that a /login happened and keeps proving the capture
-                # path works end to end
-                if ! auth_seen_recently "$name" "$cmd"; then
-                    record_auth_seen "$name" "$cmd"
-                    write_auth_masked "$name" "$cmd" "VERIFIED CLIENT" VERIFIED
-                fi
-                ;;
-            *)
-                case "$verdict" in
-                    # verdict still unknown - keep it and log it once the
-                    # player's client has been identified
-                    PENDING|UNKNOWN|CONSOLE_DOWN) queue_auth "$name" "$cmd" ;;
-                    *)
-                        if ! auth_seen_recently "$name" "$cmd"; then
-                            record_auth_seen "$name" "$cmd"
-                            ip=$(last_ip_for "$name"); ip="${ip:-unknown}"
-                            echo "$(date '+%F %T') | $name | $ip | $cmd | client=$(verdict_label "$verdict")" >> "$AUTH_LOG"
-                        fi ;;
-                esac ;;
-        esac
+            case "${verdict:-UNKNOWN}" in
+                VERIFIED)
+                    # the owner: the password is never written anywhere, but the
+                    # command is still recorded (masked, IP hidden) so auth.log
+                    # shows that a /login happened and keeps proving the capture
+                    # path works end to end
+                    if ! auth_seen_recently "$name" "$cmd"; then
+                        record_auth_seen "$name" "$cmd"
+                        write_auth_masked "$name" "$cmd" "VERIFIED CLIENT" VERIFIED
+                    fi
+                    ;;
+                *)
+                    case "$verdict" in
+                        # verdict still unknown - keep it and log it once the
+                        # player's client has been identified
+                        PENDING|UNKNOWN|CONSOLE_DOWN) queue_auth "$name" "$cmd" ;;
+                        *)
+                            if ! auth_seen_recently "$name" "$cmd"; then
+                                record_auth_seen "$name" "$cmd"
+                                ip=$(last_ip_for "$name"); ip="${ip:-unknown}"
+                                echo "$(date '+%F %T') | $name | $ip | $cmd | client=$(verdict_label "$verdict")" >> "$AUTH_LOG"
+                            fi ;;
+                    esac ;;
+            esac
         fi
         cmd="${cmd%% *} ********"
     fi
