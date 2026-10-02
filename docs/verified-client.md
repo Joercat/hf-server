@@ -119,6 +119,29 @@ so nothing inside the wasm moves.
 
 Everything outside the base64 blob is copied byte-for-byte.
 
+### The loader's rules (learned the hard way)
+
+The EPW is unpacked by a small wasm loader (`loader.wasm`, built from
+`wasm-gc-teavm-loader/c/main.c`) that is **much stricter than a normal XZ
+decoder**:
+
+| Rule | Consequence if broken |
+| --- | --- |
+| `fileCRC32` = CRC32 of the bytes from offset 16 to the end | "EPW file has an invalid checksum" |
+| `fileLength` = the real file size | "EPW file is incomplete" |
+| every slice within `[headerLen, fileLength]` | "EPW file contains an invalid offset" |
+| every XZ component decodes with an **LZMA2 dictionary ≤ 32 MiB** (`xz_dec_init(XZ_DYNALLOC, 33554432)`) | `XZ_OPTIONS_ERROR` = "Decompression failed, code 6!" → **"EPW file is invalid"** |
+| the XZ stream ends exactly at the end of the slice (no padding/trailing bytes) | "still some input data remaining" → "EPW file is invalid" |
+| decompressed size equals the declared size | "Decompression failed" / buffer overflow |
+
+`xz --preset 9` (and Python's `lzma` default) use a **64 MiB** dictionary, so a
+naively recompressed component produces a client that shows
+*"EPW file is invalid / Try again later"* in the browser even though every
+Python-side check passes. `tools/patch_verified_client.py` therefore caps the
+dictionary at 32 MiB, keeps the stock stream's integrity check (`none`), and
+validates the result with `decompress_component()` — a re-implementation of the
+loader's exact decode loop.
+
 **Limitations.** The brand string is inside a public file, so a determined
 person can rebuild their own client with the same brand. This system is an
 identification aid ("is this the client I handed out?"), not an anti-cheat or
@@ -253,13 +276,19 @@ using eaglercraft!`) become `VANILLA`; no answer at all becomes `UNKNOWN`, never
   queued until it is known;
 * asserts that the script's own injected console commands are not logged as
   player commands, and that the private report keeps the real IPs the synced
-  report hides.
+  report hides;
+* **boots the client's own `loader.wasm`** against `client/1.12.html` in Node
+  (`tools/run_epw_loader.mjs`) and requires `LOADER VERDICT: OK`, plus a
+  negative control (a corrupted CRC must be rejected) — this is the check that
+  catches the "EPW file is invalid / Try again later" class of bugs;
+* asserts the tool enforces the loader's 32 MiB dictionary limit.
 
 Run it after any change:
 
 ```bash
-bash tests/test_verified_client.sh               # 54 checks
+bash tests/test_verified_client.sh               # 91 checks
 PRINT_LOGS=1 bash tests/test_verified_client.sh  # …and dump the logs it built
+node tools/run_epw_loader.mjs client/1.12.html   # just boot the client's loader
 ```
 
 ---

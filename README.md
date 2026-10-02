@@ -33,6 +33,7 @@ A Hugging Face Space that runs:
 | `plugins/` | backend plugins copied into Paper (AuthMe jars live here) |
 | `client/1.12.html` | **the verified client** (patched, see below) |
 | `tools/patch_verified_client.py` | patches / inspects the client brand |
+| `tools/run_epw_loader.mjs` | boots the client's own EPW loader to prove the file loads |
 | `tools/fetch-logs.sh` | downloads all the server logs from the bucket |
 | `tools/push-to-space.sh` | uploads only the files the Space needs |
 | `tests/test_verified_client.sh` | test suite (client ⇄ server consistency + detection) |
@@ -182,14 +183,32 @@ python3 tools/patch_verified_client.py client/1.12.html --brand "MyOwnBrand16Chr
 After changing the brand, put the printed UUID into `start.sh`
 (`VERIFIED_CLIENT_UUID`) and run the tests — they fail if client and server
 drift apart. The suite also checks the hidden-IP logging, the enforcement
-(kicks) and the `/login` logging against a fake Bungee console:
+(kicks) and the `/login` logging against a fake Bungee console, and **boots the
+client's own EPW loader** (in Node) to prove the file still loads:
 
 ```bash
-bash tests/test_verified_client.sh              # 54 checks
+bash tests/test_verified_client.sh              # 91 checks
 
 # same, but print the logs it produced, so you can see the formats:
 PRINT_LOGS=1 bash tests/test_verified_client.sh
+
+# just boot the client's loader against the client (needs node):
+node tools/run_epw_loader.mjs client/1.12.html
 ```
+
+The loader is strict, and the tool now mirrors it:
+
+* every component must decode with an **LZMA2 dictionary of at most 32 MiB** —
+  the loader calls `xz_dec_init(XZ_DYNALLOC, 33554432)`, and a bigger
+  dictionary fails with `XZ_OPTIONS_ERROR` ("Decompression failed, code 6!"),
+  which the client shows as *"EPW file is invalid / Try again later"*. Plain
+  `xz --preset 9` uses 64 MiB, so the tool caps the dictionary at 32 MiB and
+  refuses to write a file that the loader would reject.
+* the XZ stream must end **exactly** at the declared slice length (no trailing
+  bytes) and decompress to exactly the declared size, `fileLength`/`fileCRC32`
+  must match, and every slice must stay in bounds. `--check` verifies all of
+  this on an existing file, and `tools/run_epw_loader.mjs` then runs the real
+  loader as the final proof.
 
 ### Policy switches (top of `start.sh`)
 

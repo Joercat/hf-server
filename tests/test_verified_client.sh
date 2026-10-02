@@ -371,6 +371,60 @@ check "the push helper uploads exactly Dockerfile + start.sh (+ README on flag)"
 check "nothing in the repo references a client file at runtime" \
       "$(grep -c '/opt/server/client' "$ROOT/start.sh" "$ROOT/Dockerfile" | grep -c ':0$')" "2"
 
+# --------------------------------------------------------------------------- #
+echo "== 8. the client really boots: its own EPW loader must accept the file =="
+if command -v node >/dev/null 2>&1; then
+    LOADER_OUT=$(node "$ROOT/tools/run_epw_loader.mjs" "$ROOT/client/1.12.html" 2>&1); LOADER_RC=$?
+    check "the client's own loader.wasm accepts the patched client" "$LOADER_RC" "0"
+    check "…and reports success" "$(grep -c 'resultSuccess *: true' <<<"$LOADER_OUT")" "1"
+    check "…after decompressing classes.wasm" \
+          "$(grep -c 'Decompressing classes.wasm\.\.\.$' <<<"$LOADER_OUT")" "1"
+    check "…and both asset EPKs" "$(grep -c 'Decompressing assets EPK' <<<"$LOADER_OUT")" "2"
+
+    # negative control: a corrupted container must be rejected by the same test
+    node "$ROOT/tools/run_epw_loader.mjs" "$ROOT/client/1.12.html" --dump-epw "$WORK/epw.bin" >/dev/null 2>&1
+    python3 - "$WORK/epw.bin" <<'PY'
+import struct, sys
+p = sys.argv[1]
+b = bytearray(open(p, "rb").read())
+struct.pack_into("<I", b, 12, struct.unpack_from("<I", b, 12)[0] ^ 0xFF)   # break fileCRC32
+open(p, "wb").write(b)
+PY
+    BAD_OUT=$(node "$ROOT/tools/run_epw_loader.mjs" "$WORK/epw.bin" 2>&1); BAD_RC=$?
+    check "a corrupted EPW is rejected by the same test" "$([ "$BAD_RC" -ne 0 ] && echo yes)" "yes"
+    check "…with the loader's checksum error" "$(grep -c 'invalid checksum' <<<"$BAD_OUT")" "1"
+else
+    echo "  skip - node is not installed (cannot run the client's own EPW loader)"
+fi
+
+# the tool must know the loader's hard limits (this is what broke the first build:
+# xz preset 9 uses a 64 MiB dictionary, the loader only allows 32 MiB)
+LIMITS=$(python3 - "$ROOT" <<'PY'
+import importlib.util, lzma, sys
+root = sys.argv[1]
+spec = importlib.util.spec_from_file_location("pvc", root + "/tools/patch_verified_client.py")
+pvc = importlib.util.module_from_spec(spec); spec.loader.exec_module(pvc)
+
+big = lzma.compress(b"x" * 1000, format=lzma.FORMAT_XZ,
+                    filters=[{"id": lzma.FILTER_LZMA2, "preset": 9}])   # preset 9 = 64 MiB dict
+info = pvc.xz_stream_info(big)
+ok1 = info["dict_size"] == 64 * 1024 * 1024 and pvc.EAGLER_MAX_DICT == 32 * 1024 * 1024
+
+small = pvc.compress_component(b"x" * 1000, {"dict_size": info["dict_size"], "check": 0})
+ok2 = pvc.xz_stream_info(small)["dict_size"] == 32 * 1024 * 1024
+
+class Fake:
+    name = "test"; data = big; decompressed_length = 1000
+try:
+    pvc.decompress_component(Fake())
+    ok3 = False
+except ValueError as exc:
+    ok3 = "limit" in str(exc)
+print("yes" if (ok1 and ok2 and ok3) else f"no {ok1} {ok2} {ok3}")
+PY
+)
+check "the tool enforces the loader's 32 MiB dictionary limit" "$LIMITS" "yes"
+
 if [ "${PRINT_LOGS:-0}" = "1" ]; then
     echo
     echo "############ security-logs/logins.log"

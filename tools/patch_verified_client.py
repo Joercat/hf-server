@@ -51,6 +51,19 @@ EXPECTED_BRAND_LEN = 16                 # the stock brand string is 16 bytes lon
 STOCK_BRAND = "Eaglercraft 1.12"
 STOCK_BRAND_UUID = "522b2ce5-c9b9-36cf-be7c-5d90f55e631a"
 
+# The EPW loader (loader.wasm -> main.c) decompresses every component with
+#     xz_dec_init(XZ_DYNALLOC, 33554432)
+# i.e. an LZMA2 dictionary of AT MOST 32 MiB.  A stream compressed with a bigger
+# dictionary fails with XZ_OPTIONS_ERROR ("Decompression failed, code 6!") and
+# the client shows "EPW file is invalid / Try again later", so every component
+# must stay within these limits.  The stock 1.12 client uses a 32 MiB dictionary
+# and no integrity check; we match that.
+EAGLER_MAX_DICT = 32 * 1024 * 1024
+XZ_CHECK_NONE, XZ_CHECK_CRC32, XZ_CHECK_CRC64, XZ_CHECK_SHA256 = 0, 1, 4, 10
+LZMA_CHECK_IDS = {XZ_CHECK_NONE: lzma.CHECK_NONE,
+                  XZ_CHECK_CRC32: lzma.CHECK_CRC32,
+                  XZ_CHECK_CRC64: lzma.CHECK_CRC64}
+
 ASSETS_URI_MARKER = b'window.eaglercraftXOpts.assetsURI = "data:application/octet-stream;base64,'
 
 # string-pool entry: <len byte><brand><next entry len><next entry>
@@ -177,6 +190,77 @@ def epw_data_slices(header):
     return out
 
 
+def read_vli(buf, off):
+    """XZ variable length integer: 7 bits per byte, little endian."""
+    value, shift = 0, 0
+    for _ in range(9):
+        b = buf[off]
+        off += 1
+        value |= (b & 0x7F) << shift
+        if not (b & 0x80):
+            return value, off
+        shift += 7
+    raise ValueError("malformed XZ VLI")
+
+
+def lzma2_dict_size(prop):
+    """Dictionary size encoded in the LZMA2 filter property byte."""
+    if prop > 40:
+        raise ValueError(f"invalid LZMA2 property byte {prop}")
+    if prop == 40:
+        return 0xFFFFFFFF
+    return (2 | (prop & 1)) << (prop // 2 + 11)
+
+
+def xz_stream_info(blob):
+    """Decode an XZ stream header far enough to see the LZMA2 options.
+
+    The loader reads these itself: a dictionary above EAGLER_MAX_DICT or an
+    integrity check it was not built with makes it refuse the whole file.
+    """
+    if bytes(blob[:6]) != b"\xfd7zXZ\x00":
+        raise ValueError("slice does not start with an XZ stream header")
+    check = blob[6]
+    i = 12                                    # 6 magic + 2 flags + 4 flags-CRC32
+    header_size = blob[i]
+    i += 1
+    block_flags = blob[i]
+    i += 1
+    if block_flags & 0x3F:
+        raise ValueError("unknown block header flags")
+    if block_flags & 0x40:                    # compressed size field
+        _, i = read_vli(blob, i)
+    if block_flags & 0x80:                    # uncompressed size field
+        _, i = read_vli(blob, i)
+    filter_id, i = read_vli(blob, i)
+    props_size, i = read_vli(blob, i)
+    props = bytes(blob[i:i + props_size])
+    info = {"check": check, "filter": filter_id, "props": props,
+            "dict_size": None, "block_header_size": header_size}
+    if filter_id == 0x21 and props_size == 1:     # LZMA2
+        info["dict_size"] = lzma2_dict_size(props[0])
+    return info
+
+
+def lzma2_filter(dict_size, preset=9):
+    return {"id": lzma.FILTER_LZMA2, "preset": preset, "dict_size": dict_size}
+
+
+def compress_component(blob, original_stream_info):
+    """Recompress an EPW component the way the loader can actually read it."""
+    dict_size = original_stream_info["dict_size"] or EAGLER_MAX_DICT
+    dict_size = min(dict_size, EAGLER_MAX_DICT)
+    check = LZMA_CHECK_IDS.get(original_stream_info["check"], lzma.CHECK_NONE)
+    out = lzma.compress(bytes(blob), format=lzma.FORMAT_XZ, check=check,
+                        filters=[lzma2_filter(dict_size)])
+    info = xz_stream_info(out)
+    if info["dict_size"] is None or info["dict_size"] > EAGLER_MAX_DICT:
+        raise ValueError("internal error: recompressed stream exceeds the loader's dictionary limit")
+    if info["check"] != original_stream_info["check"]:
+        raise ValueError("internal error: recompressed stream changed the integrity check")
+    return out
+
+
 def validate_wasm(blob):
     """Minimal WebAssembly binary walk: every section must fit exactly."""
     if blob[:8] != b"\x00asm\x01\x00\x00\x00":
@@ -207,6 +291,37 @@ def validate_wasm(blob):
         raise ValueError("trailing bytes in module")
 
 
+def decompress_component(sl, strict=True):
+    """Decode one compressed EPW component exactly like loader.wasm does.
+
+    loader.wasm (main.c) runs the stream through xz-embedded with a 32 MiB
+    dictionary limit and requires that the stream ends *exactly* at the end of
+    the declared slice ("Decompression completed, but there is still some input
+    data remaining" -> "EPW file is invalid").
+    """
+    data = sl.data
+    info = xz_stream_info(data)
+    if info["dict_size"] is None:
+        raise ValueError(f"{sl.name}: not an LZMA2 XZ stream (filter 0x{info['filter']:02x})")
+    if info["dict_size"] > EAGLER_MAX_DICT:
+        raise ValueError(f"{sl.name}: dictionary {info['dict_size']} exceeds the loader's "
+                         f"{EAGLER_MAX_DICT} byte limit (XZ_OPTIONS_ERROR, code 6)")
+    if info["check"] not in LZMA_CHECK_IDS:
+        raise ValueError(f"{sl.name}: unsupported integrity check {info['check']}")
+    dec = lzma.LZMADecompressor(format=lzma.FORMAT_XZ)
+    blob = dec.decompress(data)
+    if strict:
+        if not dec.eof:
+            raise ValueError(f"{sl.name}: XZ stream is truncated")
+        if dec.unused_data:
+            raise ValueError(f"{sl.name}: {len(dec.unused_data)} bytes of trailing data in the "
+                             "slice (the loader would refuse it)")
+    if len(blob) != sl.decompressed_length:
+        raise ValueError(f"{sl.name}: decompressed {len(blob)} bytes, header says "
+                         f"{sl.decompressed_length}")
+    return blob
+
+
 def validate_epw(data, verbose=False):
     """Repeat every structural check the Eaglercraft EPW loader performs."""
     if bytes(data[:8]) != EPW_MAGIC:
@@ -221,12 +336,12 @@ def validate_epw(data, verbose=False):
             raise ValueError(f"slice {sl.name} is out of bounds")
     for sl in epw_data_slices(header):
         if isinstance(sl, CompressedSlice):
-            blob = lzma.decompress(sl.data)
-            if len(blob) != sl.decompressed_length:
-                raise ValueError(f"{sl.name}: decompressed {len(blob)} bytes, header says "
-                                 f"{sl.decompressed_length}")
+            decompress_component(sl)
     if verbose:
-        print(f"    EPW ok: {len(data)} bytes, {header['num_epks']} asset EPK(s), CRC32 ok")
+        dicts = sorted({xz_stream_info(s.data)["dict_size"]
+                        for s in epw_data_slices(header) if isinstance(s, CompressedSlice)})
+        print(f"    EPW ok: {len(data)} bytes, {header['num_epks']} asset EPK(s), CRC32 ok, "
+              f"XZ dictionaries {'/'.join(str(d // 1048576) + 'MiB' for d in dicts)}")
     return header
 
 
@@ -269,9 +384,14 @@ def patch_html(html, new_brand, verbose=True):
               f"{struct.unpack_from('<H', data, 16)[0]}.{struct.unpack_from('<H', data, 18)[0]}, "
               f"fork={header['slices']['clientForkName'].data.decode('utf-8', 'replace')!r}")
 
-    wasm = bytearray(lzma.decompress(comp.data))
+    orig_stream = xz_stream_info(comp.data)
+    wasm = bytearray(decompress_component(comp))
     if len(wasm) != comp.decompressed_length:
         raise SystemExit("classes.wasm decompressed size mismatch")
+    if verbose:
+        print(f"[+] xz    : dictionary {orig_stream['dict_size'] // 1048576}MiB, "
+              f"check={'none' if orig_stream['check'] == 0 else orig_stream['check']} "
+              f"(the loader allows at most {EAGLER_MAX_DICT // 1048576}MiB)")
 
     old_brand = read_brand(wasm)
     if old_brand is None:
@@ -288,7 +408,7 @@ def patch_html(html, new_brand, verbose=True):
     wasm[m.start(1):m.end(1)] = new_brand_b
     validate_wasm(bytes(wasm))
 
-    new_comp = lzma.compress(bytes(wasm), format=lzma.FORMAT_XZ, preset=9)
+    new_comp = compress_component(wasm, orig_stream)
     if verbose:
         print(f"[+] wasm  : {len(wasm)} bytes unchanged; XZ {old_comp_len} -> {len(new_comp)} bytes")
 
@@ -310,9 +430,7 @@ def patch_html(html, new_brand, verbose=True):
     validate_epw(bytes(rebuilt), verbose=verbose)
 
     # sanity: the patched payload is what it should be
-    check = lzma.decompress(bytes(rebuilt)[
-        new_header["slices"]["classesWASMData"].offset:
-        new_header["slices"]["classesWASMData"].offset + len(new_comp)])
+    check = decompress_component(new_header["slices"]["classesWASMData"])
     validate_wasm(check)
     if read_brand(check) != new_brand:
         raise SystemExit("internal error: patched brand not found after rebuild")
@@ -348,8 +466,12 @@ def main():
 
     if args.check:
         start, end, data = decode_assets_uri(html)
-        header = validate_epw(data, verbose=True)
-        wasm = lzma.decompress(header["slices"]["classesWASMData"].data)
+        try:
+            header = validate_epw(data, verbose=True)
+        except ValueError as exc:
+            raise SystemExit(f"    INVALID - the Eaglercraft loader would refuse this file:\n"
+                             f"      {exc}")
+        wasm = decompress_component(header["slices"]["classesWASMData"])
         brand = read_brand(wasm)
         print(f"    brand     : {brand!r}")
         print(f"    brandUUID : {brand_uuid(brand) if brand else '?'}")
