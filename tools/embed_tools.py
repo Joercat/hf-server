@@ -21,6 +21,9 @@ TOOLS = [
      "write": "write_bucket_sync_py", "ensure": "ensure_bucket_sync_py"},
     {"name": "forward_ip_probe.py", "var": "FORWARD_IP_PROBE_PY", "marker": "FORWARD_IP_PROBE_EOF",
      "write": "write_forward_ip_probe_py", "ensure": "ensure_forward_ip_probe_py"},
+    {"name": "patch_auth_filter.py", "var": "AUTH_FILTER_PATCH_PY", "marker": "AUTH_FILTER_PATCH_PY_EOF",
+     "write": "write_auth_filter_patch_py", "ensure": "ensure_auth_filter_patch_py",
+     "anchor": "# <<< embedded forward_ip_probe.py <<<"},
 ]
 
 
@@ -67,9 +70,9 @@ def main() -> int:
                 continue
             text = text[:start] + new + text[stop:]
         else:
-            # first time: put it right after the variables it uses
-            anchor = 'FORWARD_IP_PROBE_PY="${FORWARD_IP_PROBE_PY:-/tmp/forward_ip_probe.py}"'
-            if tool["name"] == "forward_ip_probe.py" and anchor in text:
+            # first time: put it right after an anchor that exists in start.sh
+            anchor = tool.get("anchor")
+            if anchor and anchor in text:
                 pos = text.index(anchor) + len(anchor)
                 text = text[:pos] + "\n\n" + new + "\n" + text[pos:]
             else:

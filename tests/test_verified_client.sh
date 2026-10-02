@@ -191,6 +191,10 @@ for f in strip_colours bungee_console bungee_alive query_client_brand check_play
          playerlist_names playerlist_check playerlist_loop \
          bucket_id_of bucket_prefix_of bucket_sync_dir bucket_write_probe bucket_py \
          write_bucket_sync_py ensure_bucket_sync_py \
+         write_auth_filter_patch_py ensure_auth_filter_patch_py auth_patch_one \
+         javap_dump javap_verify_patch apply_auth_filter_patch \
+         auth_patch_post_start_check mask_console_tail real_client_ip_line \
+         wait_for_paper_ready \
          handle_paper_line handle_bungee_line; do
     extract "$f"
 done | sed "s|/tmp/bungee.log|$BLOG|g" > "$FUNCS"
@@ -1011,7 +1015,8 @@ def extract(marker):
     return s[i:j] + "\n"
 bad = []
 for name, marker in [("bucket_sync.py", "BUCKET_SYNC_PY_EOF"),
-                     ("forward_ip_probe.py", "FORWARD_IP_PROBE_EOF")]:
+                     ("forward_ip_probe.py", "FORWARD_IP_PROBE_EOF"),
+                     ("patch_auth_filter.py", "AUTH_FILTER_PATCH_PY_EOF")]:
     if extract(marker) != (root / "tools" / name).read_text():
         bad.append(name)
 print("MISMATCH:" + ",".join(bad) if bad else "OK")
@@ -1027,7 +1032,8 @@ def extract(marker):
     j = s.index("\n%s\n" % marker, i)
     return s[i:j] + "\n"
 bad = [n for n, m in [("bucket_sync.py", "BUCKET_SYNC_PY_EOF"),
-                      ("forward_ip_probe.py", "FORWARD_IP_PROBE_EOF")]
+                      ("forward_ip_probe.py", "FORWARD_IP_PROBE_EOF"),
+                      ("patch_auth_filter.py", "AUTH_FILTER_PATCH_PY_EOF")]
        if extract(m) != (root / "tools" / n).read_text()]
 print("MISMATCH:" + ",".join(bad) if bad else "OK")
 PY
@@ -1068,6 +1074,245 @@ check "…the login count" "$(grep -c '^logins.log     : 1 logins, 0 logouts' "$
 check "…the last player-list answer" "$(grep -c '^playerlist     : 18:00:00 got: There are 1' "$STATUS")" "1"
 check "…the forward_ip setting" "$(grep -c '^real client IPs: ' "$STATUS")" "1"
 check_at_least "…and the raw lines the parser sees" "$(grep -c 'Alice\[\|logged in with entity id' "$STATUS")" "1"
+
+
+# --------------------------------------------------------------------------- #
+echo "== 16. the auth plugins' password filter is neutralised (LoginSecurity 3.3.1) =="
+PATCH_TOOL="$ROOT/tools/patch_auth_filter.py"
+
+# LoginSecurity 3.3.1 adds com.lenis0012.bukkit.loginsecurity.util.LoggingFilter
+# to the log4j ROOT logger in LoginSecurity.enable() and that class returns DENY
+# for every message that starts with, or contains, "issued server command: "
+# plus one of four hard-coded words.  That is why no /login line ever reached the
+# console - so the patch has to name exactly that class and those strings.
+check "the patch targets LoginSecurity 3.3.1's LoggingFilter" \
+      "$(grep -c 'com/lenis0012/bukkit/loginsecurity/util/LoggingFilter.class' "$PATCH_TOOL")" "1"
+check "…and AuthMe's LogFilterHelper (for the switch later)" \
+      "$(grep -c 'fr/xephi/authme/output/LogFilterHelper.class' "$PATCH_TOOL")" "1"
+for word in /login /register /changepassword /changepass; do
+    check "the deny word $word is covered" \
+          "$(grep -Ec "^[[:space:]]*\"$word\",$" "$PATCH_TOOL")" "1"
+done
+check "the console prefix LoginSecurity matches on is covered too" \
+      "$(grep -c '"issued server command: ",' "$PATCH_TOOL")" "1"
+
+# A fixture jar whose class holds exactly those strings, before and after the
+# patch.  The model below is LoginSecurity's denyIfExposesPassword, run over the
+# strings that are really in the class file (command-shortcut.enabled is false by
+# default, so only the four words and the prefix matter).
+AFX="$WORK/authfilter"
+rm -rf "$AFX"
+python3 "$PATCH_TOOL" --selftest --dir "$AFX" > /dev/null 2>&1
+model() {   # $1 jar, $2 log line -> DENY / NEUTRAL, exactly like LoginSecurity
+    python3 - "$1" "$2" "$PATCH_TOOL" <<'PY'
+import sys, zipfile, importlib.util
+jar, line, tool_path = sys.argv[1], sys.argv[2].lower(), sys.argv[3]
+spec = importlib.util.spec_from_file_location("authpatch", tool_path)
+tool = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(tool)
+with zipfile.ZipFile(jar) as zf:
+    entry = [n for n in zf.namelist() if n.endswith(".class")][0]
+    data = zf.read(entry)
+strings = tool.ClassFile(data).strings()
+# the commands the class compares against, and the console prefix it looks for
+words = [x for x in strings
+         if any(w in x for w in ("/login", "/register", "/changepassword", "/changepass"))]
+prefix = next((x for x in strings if "issued server command" in x), "issued server command: ")
+# LoginSecurity: startsWith(word) or contains("issued server command: " + word)
+deny_ls = any(line.startswith(x.lower()) or (prefix + x).lower() in line for x in words)
+# AuthMe: contains("issued server command:") and one of the commands it knows
+# (its own list is built at runtime from LogFilterHelper.COMMANDS_TO_SKIP, so it
+# is spelled out here; we only ever patch the prefix it looks for)
+authme_cmds = ("/login ", "/l ", "/log ", "/register ", "/reg ", "/unregister ",
+               "/unreg ", "/changepassword ", "/cp ", "/changepass ")
+deny_authme = prefix.lower() in line and any(c in line for c in authme_cmds)
+print("DENY" if (deny_ls or deny_authme) else "NEUTRAL")
+PY
+}
+LOGIN_LINE="Steve issued server command: /login hunter2"
+check "LoginSecurity's filter would have DENIED this line (that was the bug)" \
+      "$(model "$AFX/LoginSecurity-original.jar" "$LOGIN_LINE")" "DENY"
+check "…and after the patch the same filter can only answer NEUTRAL" \
+      "$(model "$AFX/LoginSecurity-patched.jar" "$LOGIN_LINE")" "NEUTRAL"
+check "the AuthMe filter is neutralised the same way" \
+      "$(model "$AFX/AuthMe-patched.jar" "$LOGIN_LINE")" "NEUTRAL"
+check "…while the AuthMe line would have been denied before" \
+      "$(model "$AFX/AuthMe-original.jar" "$LOGIN_LINE")" "DENY"
+
+# The patched class has to still be a class: a real JVM loads and runs it.
+JAVA_BIN=""
+for cand in "$(command -v java 2>/dev/null)" /usr/lib/jvm/*/bin/java; do
+    [ -x "$cand" ] && { JAVA_BIN="$cand"; break; }
+done
+if [ -z "$JAVA_BIN" ] && python3 -c "import jdk4py" 2>/dev/null; then
+    JAVA_BIN=$(python3 -c "import jdk4py,os;print(os.path.join(str(jdk4py.JAVA_HOME),'bin','java'))" 2>/dev/null)
+    [ -x "$JAVA_BIN" ] || JAVA_BIN=""
+fi
+if [ -n "$JAVA_BIN" ]; then
+    check "the patched class still loads and runs in a JVM" \
+          "$("$JAVA_BIN" -cp "$AFX/LoginSecurity-patched.jar" com.lenis0012.bukkit.loginsecurity.util.LoggingFilter 2>&1 | grep -o 'authlog-patched' | wc -l | tr -d ' ')" "5"
+    check "…and the untouched class prints the raw deny strings" \
+          "$("$JAVA_BIN" -cp "$AFX/LoginSecurity-original.jar" com.lenis0012.bukkit.loginsecurity.util.LoggingFilter 2>&1 | grep -o 'authlog-patched' | wc -l | tr -d ' ')" "0"
+else
+    echo "  --   no JVM found here, the load test is skipped"
+fi
+
+# idempotent, and reversible if a plugin update needs the original back
+python3 "$PATCH_TOOL" --apply --json "$AFX/LoginSecurity-patched.jar" > "$AFX/second.json" 2>/dev/null
+check "patching an already patched jar does nothing" \
+      "$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["status"])' "$AFX/second.json")" "already-patched"
+ORIG_MD5=$(md5sum "$AFX/LoginSecurity-original.jar" | cut -d' ' -f1)
+python3 "$PATCH_TOOL" --restore --backup-dir "$AFX/backup" "$AFX/LoginSecurity-patched.jar" > /dev/null 2>&1
+check "the original jar can be put back byte for byte" \
+      "$(md5sum "$AFX/LoginSecurity-patched.jar" | cut -d' ' -f1)" "$ORIG_MD5"
+
+# the patch has to be surgical: the plugin's own command class uses the same
+# words for its real work and must stay untouched
+DECOY_CHECK=$(python3 "$PATCH_TOOL" --selftest --dir "$AFX/decoy" --json > /dev/null 2>&1; python3 - "$AFX/decoy/LoginSecurity-original.jar" "$AFX/decoy/LoginSecurity-patched.jar" <<'PY'
+import sys, zipfile
+def decoy(path):
+    with zipfile.ZipFile(path) as zf:
+        return zf.read("com/lenis0012/bukkit/loginsecurity/commands/CommandLogin.class")
+print("same" if decoy(sys.argv[1]) == decoy(sys.argv[2]) else "changed")
+PY
+)
+check "…and the plugin's own command class is left alone" "$DECOY_CHECK" "same"
+
+# start.sh patches the real jars in the plugins folder before Paper starts
+export PLUGIN_DIR="$WORK/plugins"
+export AUTH_FILTER_PATCH_PY="$WORK/patch_auth_filter.py"
+export AUTH_PATCH_BACKUP_DIR="$WORK/jar-backups"
+export AUTH_PATCH_JAR_GLOB='*LoginSecurity*.jar *AuthMe*.jar'
+mkdir -p "$PLUGIN_DIR"
+cp "$AFX/LoginSecurity-original.jar" "$PLUGIN_DIR/LoginSecurity-3.3.1.jar"
+JAVA_HOME_DIR=""
+apply_auth_filter_patch > "$WORK/authpatch.log" 2>&1
+check "start.sh patches the LoginSecurity jar in the plugins folder" \
+      "$(python3 "$PATCH_TOOL" --check --json "$PLUGIN_DIR/LoginSecurity-3.3.1.jar" | tail -1 | grep -c 'already-patched')" "1"
+check "…keeps a backup of the untouched jar" \
+      "$([ -f "$AUTH_PATCH_BACKUP_DIR/LoginSecurity-3.3.1.jar.authlog-orig" ] && echo yes || echo no)" "yes"
+check "…records it for the synced status file" "$(printf '%s' "$AUTH_PATCH_STATUS" | grep -c 'LoginSecurity')" "1"
+check "…and remembers that the plugin has to load" "$(printf '%s' "$AUTH_PATCH_EXPECT" | grep -c 'LoginSecurity')" "1"
+check "without javap it says so instead of pretending" "$(grep -c 'not checked (no javap)' "$WORK/authpatch.log")" "1"
+AUTH_FILTER_PATCH=false apply_auth_filter_patch > "$WORK/authpatch-off.log" 2>&1
+check "the patch can be switched off" "$(printf '%s' "$AUTH_PATCH_STATUS" | grep -c 'disabled (AUTH_FILTER_PATCH=false)')" "1"
+check "…and then it really does not touch the jar" "$(grep -c 'disabled by AUTH_FILTER_PATCH=false' "$WORK/authpatch-off.log")" "1"
+check "start.sh applies the patch before Paper starts" \
+      "$(awk '/^apply_auth_filter_patch$/{a=NR} /^start_paper$/{s=NR} END{print (a && s && a < s) ? "yes" : "no"}' "$ROOT/start.sh")" "yes"
+
+# If javap ever reports a change the patch did not make, the jar must go back.
+mkdir -p "$WORK/fakejdk/bin"
+cat > "$WORK/fakejdk/bin/javap" <<'FAKEJAVAP'
+#!/bin/bash
+# pretend the patched class lost a method: a difference that has nothing to do
+# with the deny strings
+case "$*" in
+    *authlog-orig*) echo "  5: invokevirtual #7 // Method helper:()V" ;;
+    *)              echo "  5: invokevirtual #7 // Method" ;;
+esac
+FAKEJAVAP
+chmod +x "$WORK/fakejdk/bin/javap"
+cp "$AFX/LoginSecurity-original.jar" "$PLUGIN_DIR/LoginSecurity-javap.jar"
+rm -rf "$AUTH_PATCH_BACKUP_DIR"
+JAVA_HOME_DIR="$WORK/fakejdk" AUTH_PATCH_JAR_GLOB='*LoginSecurity-javap*.jar' apply_auth_filter_patch > "$WORK/authpatch2.log" 2>&1
+check "a patch that fails the javap check is rolled back" \
+      "$(python3 "$PATCH_TOOL" --check --json "$PLUGIN_DIR/LoginSecurity-javap.jar" | tail -1 | grep -c 'would-patch')" "1"
+check "…and the status says the jar was left alone" \
+      "$(printf '%s' "$AUTH_PATCH_STATUS" | grep -c 'javap check failed')" "1"
+
+# …and a plugin that is patched but never enables must not leave the server
+# without its auth plugin
+start_paper() { :; }
+wait_for_paper_ready() { return 0; }
+BACKEND_PID=999999
+AUTH_PATCH_BACKUP_DIR="$WORK/jar-backups"
+cp "$AFX/LoginSecurity-original.jar" "$PLUGIN_DIR/LoginSecurity-3.3.1.jar"
+JAVA_HOME_DIR="" apply_auth_filter_patch > /dev/null 2>&1
+printf '[12:00:00 INFO]: no plugin lines here\n' > /tmp/paper.log
+AUTH_PATCH_RESTART_DONE=false
+auth_patch_post_start_check > "$WORK/poststart.log" 2>&1
+check "a patched plugin that did not load gets the original jar back" \
+      "$(python3 "$PATCH_TOOL" --check --json "$PLUGIN_DIR/LoginSecurity-3.3.1.jar" | tail -1 | grep -c 'would-patch')" "1"
+check "…and the status explains the rollback" "$(printf '%s' "$AUTH_PATCH_STATUS" | grep -c 'ROLLED BACK')" "1"
+check "…and Paper is restarted exactly once" "$(grep -c 'restarting Paper with the original plugin jar' "$WORK/poststart.log")" "1"
+cp "$AFX/LoginSecurity-patched.jar" "$PLUGIN_DIR/LoginSecurity-3.3.1.jar"
+printf '%s\n' '[12:00:00 INFO]: [LoginSecurity] Enabling LoginSecurity v3.3.1' > /tmp/paper.log
+AUTH_PATCH_RESTART_DONE=false
+auth_patch_post_start_check > "$WORK/poststart2.log" 2>&1
+check "a patched plugin that does load is left alone" \
+      "$(grep -c 'patched plugin(s) loaded' "$WORK/poststart2.log")" "1"
+check "…and no restart is triggered" "$(grep -c 'restarting Paper' "$WORK/poststart2.log")" "0"
+
+# --------------------------------------------------------------------------- #
+echo "== 17. the /login line reaches auth.log now that nothing filters it =="
+: > "$AUTH_LOG"; : > "$CMD_LOG"; : > "$AUTH_SEEN"; : > "$PENDING_AUTH"; : > "$VERDICT_CACHE"; : > "$IP_MAP"
+set_verdict Steve UNVERIFIED
+record_ip Steve 1.2.3.4 paper
+handle_paper_line "[12:00:10 INFO]: Steve issued server command: /login Tr0ub4dor&3"
+check "the password lands in private-logs/auth.log" \
+      "$(grep -c '| Steve | 1.2.3.4 | /login Tr0ub4dor&3 | client=OTHER EAGLERCRAFT CLIENT' "$AUTH_LOG")" "1"
+check "the synced commands.log only shows the mask" \
+      "$(grep -c 'Steve | 1.2.3.4 | /login \*\*\*\*\*\*\*\*' "$CMD_LOG")" "1"
+check "…and never the password" "$(grep -c 'Tr0ub4dor' "$CMD_LOG")" "0"
+handle_paper_line "[12:00:20 INFO]: Steve issued server command: /register S3cret!"
+handle_paper_line "[12:00:30 INFO]: Steve issued server command: /changepassword N3wPass"
+check "…/register too" "$(grep -c '| /register S3cret! |' "$AUTH_LOG")" "1"
+check "…and /changepassword" "$(grep -c '| /changepassword N3wPass |' "$AUTH_LOG")" "1"
+
+# --------------------------------------------------------------------------- #
+echo "== 18. the console copies in the bucket are masked =="
+: > "$VERDICT_CACHE"
+set_verdict CreppyBitch VERIFIED
+set_verdict Steve UNVERIFIED
+printf '%s\n' \
+  "[12:00:10 INFO]: Steve issued server command: /login hunter2" \
+  "[12:00:11 INFO]: Steve[/1.2.3.4:5555] logged in with entity id 42" \
+  "[12:00:12 INFO]: CreppyBitch issued server command: /login hunter2" \
+  "[12:00:13 INFO]: CreppyBitch[/7.7.7.7:4444] logged in with entity id 43" > "$WORK/tail.log"
+mask_console_tail < "$WORK/tail.log" > "$WORK/tail-masked.log"
+check "no password survives in the synced console copy" "$(grep -c 'hunter2' "$WORK/tail-masked.log")" "0"
+check "…the command stays readable (masked)" \
+      "$(grep -c 'issued server command: /login \*\*\*\*\*\*\*\*' "$WORK/tail-masked.log")" "2"
+check "other players keep their address" "$(grep -c 'Steve\[/1\.2\.3\.4:5555\]' "$WORK/tail-masked.log")" "1"
+check "the verified client's address is written as hidden" \
+      "$(grep -c 'CreppyBitch\[/hidden\]' "$WORK/tail-masked.log")" "1"
+check "…and never appears in the copy" "$(grep -c '7\.7\.7\.7' "$WORK/tail-masked.log")" "0"
+check "mask_console_tail is wired into the bucket upload" \
+      "$(grep -c 'mask_console_tail > "\$STAGING/logs/paper.log"' "$ROOT/start.sh")" "1"
+check "the logger status reports the login capture state" \
+      "$(grep -c 'login capture  : \${AUTH_PATCH_STATUS:-not run}' "$ROOT/start.sh")" "1"
+
+# --------------------------------------------------------------------------- #
+echo "== 19. three accounts, one device: the addresses stay put =="
+# the address is recorded per account from the join line, and a login row stays
+# "hidden" until the client check resolves - that is why the LOGIN row alone is
+# not where you read an IP from
+check_player_client() { :; }          # no background checks in this section
+: > "$IP_MAP"; : > "$IP_MAP_FILE"; : > "$VERDICT_CACHE"; : > "$LOGIN_LOG"; : > "$ONLINE_STATE"
+for n in Acc1 Acc2 Acc3; do
+    set_verdict "$n" UNVERIFIED
+    record_login "$n" 203.0.113.9 paper
+done
+check "each of the three accounts keeps the address the server saw" \
+      "$(for n in Acc1 Acc2 Acc3; do last_ip_for "$n"; done | sort -u | tr -d '\n')" "203.0.113.9"
+check "the private IP log has one row per login, all with that address" \
+      "$(grep -c '203.0.113.9' "$IP_MAP_FILE")" "3"
+check "the synced row stays hidden until the check resolves (by design)" \
+      "$(grep -c '| LOGIN | Acc1 | hidden' "$LOGIN_LOG")" "1"
+check "…while the address is kept privately meanwhile" "$(last_ip_for Acc1)" "203.0.113.9"
+record_login Acc4 198.51.100.7 paper
+check "a later login from a different address does not touch the others" \
+      "$(last_ip_for Acc1)" "203.0.113.9"
+check "…and the new account has its own" "$(last_ip_for Acc4)" "198.51.100.7"
+check "every sighting is tied to the account it came from" \
+      "$(awk -F'\t' '{print $1"="$2}' "$IP_MAP" | sort -u | tr '\n' ' ')" \
+      "Acc1=203.0.113.9 Acc2=203.0.113.9 Acc3=203.0.113.9 Acc4=198.51.100.7 "
+set_forward_ip_in_listeners false X-Real-IP
+check "the status says when the logged IP is the proxy's, not the player's" \
+      "$(real_client_ip_line | grep -c 'ADDRESS OF THE PROXY')" "1"
+set_forward_ip_in_listeners true X-Forwarded-For
+check "…and when the players' real addresses are in use" \
+      "$(real_client_ip_line | grep -c 'real addresses')" "1"
 
 echo
 echo "passed: $PASS  failed: $FAIL"

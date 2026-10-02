@@ -260,7 +260,8 @@ watch `client-checks.log` for logins that are not you.
    nothing in the synced logs points back at it. Anybody else is labelled
    `OTHER EAGLERCRAFT CLIENT`, `JAVA CLIENT` or `UNKNOWN CLIENT`, with their
    real IP — that is the whole answer to "was this me or somebody else?".
-6. **Enforcement** (`ENFORCE_VERIFIED_CLIENT=true`, the default): every account
+6. **Enforcement** (`ENFORCE_VERIFIED_CLIENT=false`, the default — everybody
+   may join and is only *marked*; set it to `true` to kick): every account
    that is not on the verified client is kicked through RCON right after the
    login, including real Java Minecraft clients (`ENFORCE_KICK_VANILLA`). A
    check that never resolved is *not* kicked (`ENFORCE_KICK_ON_UNKNOWN=false`),
@@ -283,6 +284,15 @@ watch `client-checks.log` for logins that are not you.
    Commands are queued for a moment when needed, so the verdict is always known
    before the line is written, and the same command seen twice (Paper and
    Bungee) is written once.
+
+   The line this reads has to exist in the first place: LoginSecurity 3.3.1
+   installs a log4j filter on the root logger that **deletes** every
+   `… issued server command: /login …` line (AuthMe does the same through
+   `LogFilterHelper`). `start.sh` neutralises the filter's deny strings in the
+   plugin jar before Paper starts (`tools/patch_auth_filter.py`, with a `javap`
+   check, a backup and a rollback when the plugin fails to load), so the auth
+   commands reach the console - see "Why `/login` needs a jar patch" in
+   `README.md`. `AUTH_FILTER_PATCH=false` switches that off.
 8. **IPs**: the login line carries whatever address the game sees. Behind the
    Hugging Face ingress that is the proxy, so `listeners.yml` is written with
    `forward_ip` + `forward_ip_header` — and because the plugin disconnects
@@ -340,6 +350,12 @@ private copy shows the real value, so the correlation analysis (same IP used by
 several accounts, one account seen from several IPs) is not lost — it just
 stays inside the Space.
 
+The raw console tails that are pushed to the bucket
+(`game-data/logs/{paper,bungee}.log`) are copies of the running logs, so every
+auth command argument in them is masked (`/login ********`) and the verified
+client's address is written as `hidden` — the full commands exist exactly once,
+in `private-logs/auth.log`.
+
 Console answers about players that are not Eaglercraft (`That player is not
 using eaglercraft!`) become `VANILLA`; no answer at all becomes `UNKNOWN`, never
 `VERIFIED`, so the check never produces false positives.
@@ -381,6 +397,17 @@ using eaglercraft!`) become `VANILLA`; no answer at all becomes `UNKNOWN`, never
 * asserts that the script's own injected console commands are not logged as
   player commands, and that the private report keeps the real IPs the synced
   report hides;
+* asserts the auth-filter patch: the rule table names LoginSecurity 3.3.1's
+  `LoggingFilter` and its deny strings, a fixture jar is patched and then
+  **loaded by a real JVM**, the filter's own deny logic answers `DENY` before
+  and `NEUTRAL` after the patch, the plugin's command class is untouched, the
+  patch is idempotent and reversible, a failed `javap` check rolls the jar back,
+  a patched plugin that does not load is restored and Paper restarted once, and
+  `AUTH_FILTER_PATCH=false` really disables it;
+* asserts the bucket's console copies are masked (every auth argument
+  `********`, the verified client's address `hidden`) and that three accounts
+  on one device keep one address while two simultaneous logins never swap
+  addresses;
 * **runs the real login gate and boots the client's own `loader.wasm`**: with
   `VER_CLIENT_USER`/`VER_CLIENT_PASS` set it calls
   `tools/verify_gated_client.mjs` (no boot before the login, wrong username and

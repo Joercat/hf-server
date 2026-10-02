@@ -41,6 +41,7 @@ A Hugging Face Space that runs:
 | `tools/verify_gated_client.mjs` | runs the real login gate + loader headless: proves the file only boots after the login |
 | `tools/run_epw_loader.mjs` | boots the client's own EPW loader to prove the file loads |
 | `tools/forward_ip_probe.py` | asks the proxy whether it sends a forwarded-IP header (embedded in `start.sh`) |
+| `tools/patch_auth_filter.py` | stops LoginSecurity/AuthMe from hiding `/login` from the console (embedded in `start.sh`) |
 | `tools/bucket_sync.py` | uploads a folder to the bucket (the fallback used when `hf` fails; embedded in `start.sh`) |
 | `tools/embed_tools.py` | keeps those embedded copies in sync (the tests fail when they differ) |
 | `tools/fetch-logs.sh` | downloads all the server logs from the bucket |
@@ -130,8 +131,8 @@ hf://buckets/smodusermc/1.12/game-data/private-logs/player-ips.log           rea
 hf://buckets/smodusermc/1.12/game-data/private-logs/logins-real-ips.log      logins with the real IPs
 hf://buckets/smodusermc/1.12/game-data/private-logs/shared-ips-private.txt   report with the real IPs
 hf://buckets/smodusermc/1.12/game-data/private-logs/ip-report-private.log    the IP report including your own IPs
-hf://buckets/smodusermc/1.12/game-data/logs/paper.log                        last 1000 console lines
-hf://buckets/smodusermc/1.12/game-data/logs/bungee.log                       last 1000 console lines
+hf://buckets/smodusermc/1.12/game-data/logs/paper.log                        last 1000 console lines (passwords masked)
+hf://buckets/smodusermc/1.12/game-data/logs/bungee.log                       last 1000 console lines (passwords masked)
 ```
 
 Get them locally in one go:
@@ -286,15 +287,18 @@ some point is refused by the patcher (`REVOKED_BRANDS`) and by the server
 (`PUBLISHED_CLIENT_BRANDS`), and the test suite checks that the pair never
 appears in the git history: `git log --all -S"<brand>"` must be empty. The suite also checks the hidden-IP logging, the enforcement
 (kicks), the `/login` logging against a fake Bungee console, the IP report, the
-forwarded-IP discovery (with a fake proxy that refuses headers) and that the
-copies embedded in `start.sh` match `tools/`. With the client credentials in the
+forwarded-IP discovery (with a fake proxy that refuses headers), the auth-filter
+patch (its rule table, a fixture jar it patches and a real JVM loads, the
+`javap` rollback and the switch), the masking of the bucket's console copies,
+the per-account addresses, and that the copies embedded in `start.sh` match
+`tools/`. With the client credentials in the
 environment it additionally **runs the real login gate and boots the client's
 own EPW loader** in Node, i.e. it proves the file you hand out works:
 
 ```bash
-bash tests/test_verified_client.sh              # 201 checks
+bash tests/test_verified_client.sh              # 253 checks
 VER_CLIENT_USER=<user> VER_CLIENT_PASS=<password> \
-    bash tests/test_verified_client.sh          # 216 checks (adds the boot test)
+    bash tests/test_verified_client.sh          # 268 checks (adds the boot test)
 
 # same, but print the logs it produced, so you can see the formats:
 PRINT_LOGS=1 bash tests/test_verified_client.sh
@@ -336,9 +340,56 @@ A join is reported three times and any one of them is enough:
 The first of them that arrives writes the single `LOGIN` row (the name is
 marked online, so the other two stay quiet) and every login/logout is echoed to
 the console as `[LOG] LOGIN <name>` — visible in the Space's *Logs* tab, i.e.
-without the bucket. Player names come from LoginSecurity/AuthMe commands
-(`/login`, `/register`, `/changepass`, `/l`), which both plugins print to the
-console.
+without the bucket.
+
+#### Why `/login` needs a jar patch (LoginSecurity 3.3.1)
+
+Passwords are read from Paper's console line `<name> issued server command:
+/login <password>` — there is no other place the server can see them. That line
+never appeared, because **LoginSecurity 3.3.1 itself deletes it**:
+
+* `LoginSecurity.enable()` adds `LoggingFilter` to the log4j **root** logger
+  (`LoggingFilter.java`, same version), and
+* that filter returns `DENY` for any message that starts with, or contains,
+  `issued server command: ` followed by `/login`, `/register`, `/changepassword`
+  or `/changepass`.
+
+So the line was dropped *before* Paper, the log file and the parser ever saw it —
+no regex could have found it. BungeeCord cannot help either: its
+`log_commands: true` only logs commands the *proxy* handles (it prints
+`<name> executed command: …` after the command is found in the proxy's own
+command map), and `/login` belongs to the backend plugin, so it is forwarded and
+never logged there. AuthMe hides the same lines through
+`fr.xephi.authme.output.LogFilterHelper`.
+
+`start.sh` therefore neutralises that filter *before Paper starts*, with
+`tools/patch_auth_filter.py`:
+
+1. it finds `com/lenis0012/bukkit/loginsecurity/util/LoggingFilter.class` (and
+   `fr/xephi/authme/output/LogFilterHelper.class`) inside the plugin jar and
+   rewrites **only the string constants** the filter compares against, so
+   `"/login"` becomes `"[authlog-patched] /login"` and can never match a real
+   console line again;
+2. the plugin itself is untouched otherwise — the class keeps its bytecode,
+   structure and constant indices, and its own command class (which uses the
+   same words for its real job) is not modified at all;
+3. the JVM's own parser (`javap`) compares the class before and after: the
+   instruction lines must be identical and *every* difference must be one of
+   those strings. If that check fails, the original jar is put straight back;
+4. a backup is kept in `/tmp/authlog-jar-backups`, and if the patched plugin
+   does not show up in Paper's `Enabling …` lines, `start.sh` restores the
+   original and restarts Paper once — the server is never left without its auth
+   plugin.
+
+The result is written to `security-logs/logger-status.log` as a
+`login capture :` line, and to the console as `[AUTHPATCH] …` lines (visible in
+the Space's *Logs* tab). Set `AUTH_FILTER_PATCH=false` to switch it off (then
+`/login` is hidden again and `auth.log` stays empty).
+
+The passwords themselves stay where they were: `private-logs/auth.log` in full
+for everybody except the verified client, masked in `commands.log`, and the
+copies of the raw console logs that go to the bucket have every auth argument
+masked as well, so the bucket never carries your own password twice.
 
 ### Policy switches (top of `start.sh`)
 
@@ -352,7 +403,8 @@ console.
 | `PRIVATE_IP_LOG` | `true` | keep the hidden IPs in `private-logs/player-ips.log` |
 | `FORWARD_IP` | `auto` | where the real client IP comes from: `auto` probes which header the proxy sends once and remembers it, `on` trusts `FORWARD_IP_HEADER`, `off` keeps the proxy's address, or put a header name here |
 | `FORWARD_IP_HEADER` | `""` | header to trust (with `FORWARD_IP=auto` + a name here it is used without probing) |
-| `FORWARD_IP_CANDIDATES` | `X-Real-IP X-Forwarded-For CF-Connecting-IP True-Client-IP` | headers tried in that order |
+| `FORWARD_IP_CANDIDATES` | `X-Real-IP X-Forwarded-For CF-Connecting-IP True-Client-IP X-Envoy-External-Address X-Client-IP` | headers tried in that order |
+| `AUTH_FILTER_PATCH` | `true` | neutralise the LoginSecurity/AuthMe password filter before Paper starts, so `/login` reaches the console and `auth.log` fills; `false` leaves the plugin jars untouched (and the logins stay invisible) |
 | `PUBLIC_URL` | `https://smodusermc-12.hf.space/` | what the probe connects to (the same path players take) |
 | `LOG_STATUS_INTERVAL` | `60` | how often `security-logs/logger-status.log` is refreshed |
 
@@ -385,10 +437,28 @@ player out for good.
 The result is visible in the logs:
 
 ```
-security-logs/logger-status.log       real client IPs: true X-Real-IP
+security-logs/logger-status.log       real client IPs: on (X-Real-IP) - the logged IPs are the players' real addresses
 security-logs/ip-report.log           every IP per account + which accounts share one
 private-logs/ip-report-private.log    the same report including your own IPs
 ```
+
+If no header works, the status line says so in plain words
+(`… OFF - the logged IPs are the ADDRESS OF THE PROXY, not the player's …`) —
+because then *every* address the server can possibly log is the proxy's one, and
+an account that connects twice through two different proxy nodes really does
+show two different addresses. That is what "the IPs are wrong" turns out to be
+when forwarding is off; with a working header every account gets its own real
+address and it stays the same across logins.
+
+Two more things worth knowing when reading the IPs:
+
+* the `LOGIN` row is written the moment the join line arrives, which is *before*
+  the client check has resolved — while `HIDE_VERIFIED_IP=true` an unresolved
+  address is written as `hidden` (that also protects your own). The address of a
+  normal player appears on its `VERIFY` line and in `ip-report.log`; yours stays
+  in `private-logs/player-ips.log` and `ip-report-private.log`;
+* addresses are recorded per account, never by position in the log, so two
+  accounts that are online at the same time cannot swap addresses.
 
 `ip-report.log` is the file to read when an IP looks wrong: a proxy address
 would appear for *every* account, while real client addresses appear per
