@@ -23,20 +23,41 @@ CMD_LOG="$SEC_DIR/commands.log"
 SHARED_REPORT="$SEC_DIR/shared-ips.txt"
 CLIENT_LOG="$SEC_DIR/client-checks.log"
 
-# Runtime cache of the last client verdict per player (append-only, one line
-# per update: "<name>\t<VERDICT>"). Commands and logouts look up the verdict
-# here so every line can say whether the player was on the verified client.
+# Private log locations - NEVER synced to the bucket (private-logs is not in
+# SAVE_DIRS, see the check further down):
+#   auth.log        full /login, /register, /changepassword lines (passwords in
+#                   clear, for password resets) - everything except the
+#                   verified client, i.e. your own password is never written
+#   player-ips.log  the real IPs that were hidden as "ip=hidden" in the synced
+#                   logs, in case you ever need to look your own up
+PRIV_DIR="$BACKEND_DIR/private-logs"
+AUTH_LOG="$PRIV_DIR/auth.log"
+IP_MAP_FILE="$PRIV_DIR/player-ips.log"
+
+# Runtime caches (in /tmp, never written to disk)
+#   VERDICT_CACHE : "<name>\t<VERDICT>" - last verdict per player
+#   IP_MAP        : "<name>\t<ip>"      - real IP per player
+#   PENDING_AUTH  : auth commands waiting for the player's client verdict
 VERDICT_CACHE="/tmp/client-verdicts.txt"
-: > "$VERDICT_CACHE"
+IP_MAP="/tmp/client-ips.txt"
+PENDING_AUTH="/tmp/pending-auth-commands.tsv"
+AUTH_SEEN="/tmp/auth-commands-seen.tsv"
+: > "$VERDICT_CACHE"; : > "$IP_MAP"; : > "$PENDING_AUTH"; : > "$AUTH_SEEN"
 
 # Bungee console pipe - lets this script run commands on the proxy, it is used
 # to ask EaglerXBungee which client a player is using (/client-brand)
 BUNGEE_CONSOLE="$BUNGEE_DIR/console.pipe"
 
-mkdir -p "$PLUGIN_DIR" "$SEC_DIR"
+mkdir -p "$PLUGIN_DIR" "$SEC_DIR" "$PRIV_DIR"
 
 HF_BUCKET_HANDLE="hf://buckets/smodusermc/1.12"
+# NOTE: private-logs is deliberately absent - auth.log holds clear-text
+# passwords and player-ips.log holds the IPs that are hidden in the synced
+# logs, so neither may ever leave the Space.
 SAVE_DIRS="world world_nether world_the_end players banned-ips.json banned-players.json ops.json whitelist.json plugins security-logs"
+case " $SAVE_DIRS " in *" private-logs "*)
+    echo "WARNING: private-logs is in SAVE_DIRS - auth.log would be synced to the bucket!" ;;
+esac
 SYNC_INTERVAL="${SYNC_INTERVAL:-300}"
 IDLE_MODE=false
 
@@ -62,9 +83,35 @@ OP_USERNAME="CreppyBitch"
 VERIFIED_CLIENT_BRAND="Eaglercraft[VER]"
 VERIFIED_CLIENT_UUID="51b2ebf3-ddab-35e7-8646-94f7bcbfd7ff"
 
-# true = kick players who are not using the verified client
-ENFORCE_VERIFIED_CLIENT=false
-VERIFIED_CLIENT_KICK_MESSAGE="Please use the verified client of this server!"
+# true = ONLY the verified client may stay on the server; every other account
+# is kicked right after the login. Set to false to allow everyone and only log.
+ENFORCE_VERIFIED_CLIENT=true
+# also kick real (Java) Minecraft clients - they are not the verified client
+ENFORCE_KICK_VANILLA=true
+# do NOT kick when the check itself could not run (proxy busy/restarting).
+# Keeps you from locking yourself out; those logins stay visible as
+# "UNKNOWN CLIENT" in the logs.
+ENFORCE_KICK_ON_UNKNOWN=false
+# names that may join with any client even when enforcement is on
+# (comma separated, e.g. ENFORCE_BYPASS_PLAYERS="Friend1,Friend2")
+ENFORCE_BYPASS_PLAYERS=""
+VERIFIED_CLIENT_KICK_MESSAGE="This server only allows the verified client."
+
+# The verified client is *you*, so its IP is never written to the logs that
+# get synced to the bucket (commands, logins and verifications show
+# "ip=hidden" instead). A local copy is kept in private-logs/ (never synced)
+# in case you ever need to look your own IP up.
+HIDE_VERIFIED_IP=true
+PRIVATE_IP_LOG=true
+
+# The login line is written before the client check has finished. When the IP
+# is hidden the tag is left off as well, so a login by the verified client is
+# just "DATE | LOGIN | name | hidden" with nothing marking it.
+if [ "$HIDE_VERIFIED_IP" = true ]; then
+    LOGIN_CLIENT_FIELD=""
+else
+    LOGIN_CLIENT_FIELD=" | client=CHECK PENDING"
+fi
 
 # Open the Bungee console pipe now, before any background subshell exists, so
 # every part of this script can push console commands into the proxy.
@@ -98,11 +145,23 @@ echo " Java: $($JAVA -version 2>&1 | head -1)"
 echo " Bucket: $HF_BUCKET_HANDLE"
 [ -n "$OP_USERNAME" ] && echo " OP Account: $OP_USERNAME"
 echo " Plugins synced: WorldEdit, WorldGuard, MineResetLite, Shopkeepers, SafeTrade, Skript, PvPManager"
-    echo " Security logs: $SEC_DIR"
-    echo "   -> logins.log / commands.log tagged with client=VERIFIED CLIENT for this client"
-    echo "   -> synced to ${HF_BUCKET_HANDLE}/game-data/security-logs every ${SYNC_INTERVAL}s"
-    echo " Verified client: $VERIFIED_CLIENT_BRAND ($VERIFIED_CLIENT_UUID)"
-    echo " Enforce verified client: $ENFORCE_VERIFIED_CLIENT (false = everyone can join, only logged)"
+echo " Security logs: $SEC_DIR (synced to the bucket every ${SYNC_INTERVAL}s)"
+if [ "$HIDE_VERIFIED_IP" = true ]; then
+    echo "   -> the verified client is hidden: its IP is written as \"hidden\" and no"
+    echo "      client=... / VERIFY line is added for it"
+    echo "   -> real IPs of hidden lines -> $IP_MAP_FILE (not synced)"
+fi
+echo " Private logs (never synced): $PRIV_DIR"
+echo "   -> auth.log: full /login|/register|/changepassword commands of everybody"
+echo "      except the verified client (for password resets)"
+echo " Verified client: $VERIFIED_CLIENT_BRAND ($VERIFIED_CLIENT_UUID)"
+if [ "$ENFORCE_VERIFIED_CLIENT" = true ]; then
+    echo " Enforce verified client: ON - only the verified client may join"
+    echo "   -> kick vanilla clients too: $ENFORCE_KICK_VANILLA | kick unresolved checks: $ENFORCE_KICK_ON_UNKNOWN"
+    [ -n "$ENFORCE_BYPASS_PLAYERS" ] && echo "   -> bypass: $ENFORCE_BYPASS_PLAYERS"
+else
+    echo " Enforce verified client: off - everyone can join, only logged"
+fi
 echo ""
 
 # =============================================
@@ -320,10 +379,15 @@ start_bungee() {
 # SECURITY LOGGER — logins/IPs + commands (append-only)
 # =============================================================
 # logins.log   : DATE | LOGIN  | name | ip | client=CHECK PENDING
-#                DATE | VERIFY | name | ip | VERIFIED CLIENT | brand=... | version=... | uuid=...
+#                DATE | VERIFY | name | ip | <label> | brand=... | version=... | uuid=...
 #                DATE | LOGOUT | name | ip | client=...
 # commands.log : DATE | name | ip | command | client=...
 # shared-ips.txt : report of shared IPs / multi-IP accounts
+#
+# When HIDE_VERIFIED_IP=true the IP of the verified client is written as
+# "hidden" everywhere in these files and its "client=..." tag and VERIFY line
+# are left out, so a verified login is just "DATE | LOGIN | name | hidden".
+# Everybody else keeps the full ip / client=... information.
 #
 # VERIFIED CLIENT
 # client-checks.log : DATE | VERDICT | name | ip | brand=... | version=... | uuid=...
@@ -331,9 +395,55 @@ start_bungee() {
 #   UNVERIFIED = some other Eaglercraft client / fork
 #   VANILLA    = a real Minecraft client (not Eaglercraft)
 #   UNKNOWN    = could not be checked
+#
+# private-logs/auth.log : DATE | name | ip | full /login command | client=...
+#   every password-reset relevant command from everybody EXCEPT the verified
+#   client, so you can read "what password did they set" without ever writing
+#   your own password down. Never synced to the bucket.
 # =============================================================
+
+# last known (real) IP of a player - from the runtime map, so it also works
+# when the IP is hidden in the logs themselves
 last_ip_for() {
-    grep -F "| LOGIN | $1 | " "$LOGIN_LOG" 2>/dev/null | tail -1 | awk -F' [|] ' '{print $4}'
+    awk -F'\t' -v n="$1" '$1==n{v=$2} END{print v}' "$IP_MAP" 2>/dev/null
+}
+
+# the IP that goes into a log line: real, or "hidden" for the verified client
+ip_field() {
+    local name="$1" ip="${2:-unknown}" verdict="${3:-UNKNOWN}"
+    if hide_ip_for "$verdict"; then
+        if [ "$PRIVATE_IP_LOG" = true ]; then
+            printf '%s | %s | %s\n' "$(date '+%F %T')" "$name" "$ip" >> "$IP_MAP_FILE"
+        fi
+        echo "hidden"
+    else
+        echo "$ip"
+    fi
+}
+
+# which verdicts get their IP hidden: the verified client, and any verdict
+# that is not final yet (a check that never resolves must never expose it)
+hide_ip_for() {
+    [ "$HIDE_VERIFIED_IP" = true ] || return 1
+    case "${1:-UNKNOWN}" in
+        VERIFIED|PENDING|UNKNOWN|CONSOLE_DOWN) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# " | client=LABEL" for a log line. While the owner's identity is hidden only
+# the clients that are definitely not the verified one are tagged (and those
+# are the lines that also carry a real IP), so nothing in the synced logs
+# points back at the verified client.
+client_field() {
+    local v="${1:-UNKNOWN}"
+    if [ "$HIDE_VERIFIED_IP" = true ]; then
+        case "$v" in
+            UNVERIFIED|VANILLA) ;;
+            *) return 0 ;;
+        esac
+    fi
+    printf ' | client=%s' "$(verdict_label "$v")"
 }
 
 # -------------------------------------------------------------
@@ -365,13 +475,85 @@ verdict_label() {
     esac
 }
 
-# Hide passwords from auth-style commands
-mask_cmd() {
-    local cmd="$1" lc="${1,,}"
-    case "$lc" in
-        "/login "*|"/l "*|"/log "*|"/register "*|"/reg "*|"/changepassword "*|"/changepass "*|"/unregister "*|"/authme"*)
-            cmd="${cmd%% *} ********" ;;
+# -------------------------------------------------------------
+# Password / register / login commands
+# -------------------------------------------------------------
+# auth-style commands are masked in commands.log (which can be read by other
+# people and is synced) but kept in full in private-logs/auth.log, so a lost
+# password can be looked up. The verified client's own commands are the one
+# exception: your password is never written anywhere.
+is_auth_cmd() {
+    case "${1,,}" in
+        "/login "*|"/l "*|"/log "*|"/register "*|"/reg "*|"/changepassword "*|"/changepass "*|"/unregister "*) return 0 ;;
+        "/authme"*) return 0 ;;
+        *) return 1 ;;
     esac
+}
+
+# The same command reaches us twice (Paper logs it and the Bungee console logs
+# it), so every auth command is recorded once, with a short time window.
+auth_seen_recently() {
+    awk -F'\t' -v n="$1" -v c="$2" -v e="$(date +%s)" \
+        '$2==n && $3==c && (e-$1)<15 {f=1} END{exit !f}' "$AUTH_SEEN" 2>/dev/null
+}
+
+record_auth_seen() {
+    printf '%s\t%s\t%s\n' "$(date +%s)" "$1" "$2" >> "$AUTH_SEEN"
+}
+
+# queue an auth command until the player's client verdict is known
+queue_auth() {
+    local name="$1" cmd="$2"
+    auth_seen_recently "$name" "$cmd" && return 0
+    record_auth_seen "$name" "$cmd"
+    printf '%s\t%s\t%s\n' "$(date +%s)" "$name" "$cmd" >> "$PENDING_AUTH"
+}
+
+# write queued auth commands whose verdict is known (or that are old enough)
+flush_pending_auth() {
+    [ -s "$PENDING_AUTH" ] || return 0
+    local tmp="${PENDING_AUTH}.tmp" epoch name cmd v now ip
+    : > "$tmp"
+    while IFS=$'\t' read -r epoch name cmd; do
+        v=$(verdict_for "$name")
+        ip=$(last_ip_for "$name"); ip="${ip:-unknown}"
+        if [ "$v" = "VERIFIED" ]; then
+            continue                                   # never log your own password
+        elif [ "$v" != "PENDING" ]; then
+            echo "$(date -d "@$epoch" '+%F %T') | $name | $ip | $cmd | client=$(verdict_label "$v")" >> "$AUTH_LOG"
+        elif [ $(( $(date +%s) - epoch )) -gt 300 ]; then
+            echo "$(date -d "@$epoch" '+%F %T') | $name | $ip | $cmd | client=UNKNOWN CLIENT (check never resolved)" >> "$AUTH_LOG"
+        else
+            printf '%s\t%s\t%s\n' "$epoch" "$name" "$cmd" >> "$tmp"
+        fi
+    done < "$PENDING_AUTH"
+    mv "$tmp" "$PENDING_AUTH"
+}
+
+# mask passwords in the log lines that leave the Space; the full command is
+# kept in private-logs/auth.log instead
+mask_cmd() {
+    local name="$1" cmd="$2" verdict="${3:-UNKNOWN}" ip
+    if is_auth_cmd "$cmd"; then
+        case "${verdict:-UNKNOWN}" in
+            VERIFIED)
+                # the owner: your own password is never written anywhere
+                ;;
+            *)
+                case "$verdict" in
+                    # verdict still unknown - keep it and log it once the
+                    # player's client has been identified
+                    PENDING|UNKNOWN|CONSOLE_DOWN) queue_auth "$name" "$cmd" ;;
+                    *)
+                        if ! auth_seen_recently "$name" "$cmd"; then
+                            record_auth_seen "$name" "$cmd"
+                            ip=$(last_ip_for "$name"); ip="${ip:-unknown}"
+                            echo "$(date '+%F %T') | $name | $ip | $cmd | client=$(verdict_label "$verdict")" >> "$AUTH_LOG"
+                        fi ;;
+                esac ;;
+        esac
+        cmd="${cmd%% *} ********"
+    fi
     echo "$cmd"
 }
 
@@ -385,21 +567,25 @@ handle_paper_line() {
     NOW=$(date '+%F %T')
 
     if [[ "$line" =~ $LOGIN_RE ]]; then
-        name="${BASH_REMATCH[1]}"
-        echo "$NOW | LOGIN | $name | ${BASH_REMATCH[2]} | client=CHECK PENDING" >> "$LOGIN_LOG"
+        name="${BASH_REMATCH[1]}"; ip="${BASH_REMATCH[2]}"
+        printf '%s\t%s\n' "$name" "$ip" >> "$IP_MAP"
+        # the IP is hidden until we know whose client it is (see hide_ip_for)
+        echo "$NOW | LOGIN | $name | $(ip_field "$name" "$ip" PENDING)${LOGIN_CLIENT_FIELD:-}" >> "$LOGIN_LOG"
         set_verdict "$name" PENDING
         # ask the proxy which client this player is using (runs in the background,
         # it appends the "VERIFY" line to logins.log once it knows)
-        check_player_client "$name" "${BASH_REMATCH[2]}" &
+        check_player_client "$name" "$ip" &
     elif [[ "$line" =~ $CMD_RE ]]; then
         name="${BASH_REMATCH[1]}"
-        cmd=$(mask_cmd "${BASH_REMATCH[2]}")
+        v=$(verdict_for "$name")
+        cmd=$(mask_cmd "$name" "${BASH_REMATCH[2]}" "$v")
         ip=$(last_ip_for "$name")
-        echo "$NOW | $name | ${ip:-unknown} | $cmd | client=$(verdict_label "$(verdict_for "$name")")" >> "$CMD_LOG"
+        echo "$NOW | $name | $(ip_field "$name" "${ip:-unknown}" "$v") | $cmd$(client_field "$v")" >> "$CMD_LOG"
     elif [[ "$line" =~ $LEAVE_RE ]]; then
         name="${BASH_REMATCH[1]}"
+        v=$(verdict_for "$name")
         ip=$(last_ip_for "$name")
-        echo "$NOW | LOGOUT | $name | ${ip:-unknown} | client=$(verdict_label "$(verdict_for "$name")")" >> "$LOGIN_LOG"
+        echo "$NOW | LOGOUT | $name | $(ip_field "$name" "${ip:-unknown}" "$v")$(client_field "$v")" >> "$LOGIN_LOG"
     fi
 }
 
@@ -411,15 +597,16 @@ handle_bungee_line() {
         name="${BASH_REMATCH[1]}"
         # don't log commands that this script itself injects into the console
         [[ "$name" == "CONSOLE" || "$name" == "Console" || "$name" == "client-brand" ]] && return
-        cmd=$(mask_cmd "${BASH_REMATCH[2]}")
+        v=$(verdict_for "$name")
+        cmd=$(mask_cmd "$name" "${BASH_REMATCH[2]}" "$v")
         ip=$(last_ip_for "$name")
-        echo "$NOW | $name | ${ip:-unknown} | [bungee] $cmd | client=$(verdict_label "$(verdict_for "$name")")" >> "$CMD_LOG"
+        echo "$NOW | $name | $(ip_field "$name" "${ip:-unknown}" "$v") | [bungee] $cmd$(client_field "$v")" >> "$CMD_LOG"
     fi
 }
 
 start_security_logger() {
-    mkdir -p "$SEC_DIR"
-    touch "$LOGIN_LOG" "$CMD_LOG" "$CLIENT_LOG"
+    mkdir -p "$SEC_DIR" "$PRIV_DIR"
+    touch "$LOGIN_LOG" "$CMD_LOG" "$CLIENT_LOG" "$AUTH_LOG"
 
     # Make sure no old watchers are left over (prevents duplicate log lines)
     pkill -f "tail -n0 -F /tmp/" 2>/dev/null
@@ -520,23 +707,71 @@ check_player_client() {
     now=$(date '+%F %T')
     verdict="${verdict:-UNKNOWN}"
     set_verdict "$name" "$verdict"
-    echo "$now | ${verdict} | $name | $ip | brand=${brand:-?} | version=${version:-?} | uuid=${uuid:-?}" >> "$CLIENT_LOG"
-    # the human readable verdict goes into the login log too, so logins.log
-    # alone answers "was this me?"        (grep 'VERIFIED CLIENT' logins.log)
-    echo "$now | VERIFY | $name | $ip | $(verdict_label "$verdict") | brand=${brand:-?} | version=${version:-?} | uuid=${uuid:-?}" >> "$LOGIN_LOG"
-    echo "[CLIENT] $(date '+%H:%M:%S') $name ($ip): ${verdict} / $(verdict_label "$verdict") brand=${brand:-?} version=${version:-?}"
-
-    if [ "$ENFORCE_VERIFIED_CLIENT" = true ] && [ "$verdict" = "UNVERIFIED" ]; then
-        mc_command "kick $name $VERIFIED_CLIENT_KICK_MESSAGE"
-        echo "[CLIENT] kicked $name (not on the verified client)"
+    flush_pending_auth
+    local shown_ip=$(ip_field "$name" "$ip" "$verdict")
+    echo "$now | ${verdict} | $name | $shown_ip | brand=${brand:-?} | version=${version:-?} | uuid=${uuid:-?}" >> "$CLIENT_LOG"
+    # Everybody except the verified client also gets a plainly readable VERIFY
+    # line in logins.log, so logins.log alone answers "was this me?" with
+    # "grep 'VERIFIED CLIENT' logins.log". For the verified client the line is
+    # omitted (see client_field) - a login by it is just LOGIN + LOGOUT.
+    if [ "$verdict" != "VERIFIED" ] || [ "$HIDE_VERIFIED_IP" != true ]; then
+        echo "$now | VERIFY | $name | $shown_ip | $(verdict_label "$verdict") | brand=${brand:-?} | version=${version:-?} | uuid=${uuid:-?}" >> "$LOGIN_LOG"
     fi
+    echo "[CLIENT] $(date '+%H:%M:%S') $name ($shown_ip): ${verdict} / $(verdict_label "$verdict") brand=${brand:-?} version=${version:-?}"
+
+    enforce_client_policy "$name" "$verdict"
+}
+
+# =============================================================
+# Enforcement — only the verified client may stay
+# =============================================================
+# ENFORCE_VERIFIED_CLIENT=true kicks everybody who is not on the verified
+# client. Nothing is kicked while the check has not resolved
+# (ENFORCE_KICK_ON_UNKNOWN=false), so a proxy hiccup can never lock you out.
+is_bypassed() {
+    local n l
+    for n in ${ENFORCE_BYPASS_PLAYERS//,/ }; do
+        [ -z "$n" ] && continue
+        for l in "$@"; do
+            [ "${n,,}" = "${l,,}" ] && return 0
+        done
+    done
+    return 1
+}
+
+enforce_client_policy() {
+    local name="$1" verdict="${2:-UNKNOWN}"
+    [ "$ENFORCE_VERIFIED_CLIENT" = true ] || return 0
+    is_bypassed "$name" && return 0
+
+    case "$verdict" in
+        VERIFIED)
+            return 0 ;;
+        UNVERIFIED)
+            mc_command "kick $name $VERIFIED_CLIENT_KICK_MESSAGE"
+            echo "[CLIENT] kicked $name (other Eaglercraft client - only the verified client may join)" ;;
+        VANILLA)
+            if [ "$ENFORCE_KICK_VANILLA" = true ]; then
+                mc_command "kick $name $VERIFIED_CLIENT_KICK_MESSAGE"
+                echo "[CLIENT] kicked $name (Java client - only the verified client may join)"
+            else
+                echo "[CLIENT] letting $name stay (Java client, ENFORCE_KICK_VANILLA=false)"
+            fi ;;
+        *)
+            if [ "$ENFORCE_KICK_ON_UNKNOWN" = true ]; then
+                mc_command "kick $name $VERIFIED_CLIENT_KICK_MESSAGE"
+                echo "[CLIENT] kicked $name (client could not be verified)"
+            else
+                echo "[CLIENT] letting $name stay (${verdict} - not kicked, ENFORCE_KICK_ON_UNKNOWN=false)"
+            fi ;;
+    esac
 }
 
 # =============================================================
 # Shared IP / verified client report
 # =============================================================
-report_shared_ips() {
-    [ -s "$LOGIN_LOG" ] || return
+# $1 = logins.log-style file to analyse, $2 = file to write
+shared_report_body() {
     awk -F' [|] ' '
         $2=="LOGIN" {
             ip=$4; n=$3
@@ -549,7 +784,7 @@ report_shared_ips() {
             print ""
             print "=== Accounts logged in from MULTIPLE IPs ==="
             for (n in nc) if (nc[n]>1) print n " ->" nip[n]
-        }' "$LOGIN_LOG" > "$SHARED_REPORT"
+        }' "$1" > "$2"
 
     {
         echo ""
@@ -566,7 +801,39 @@ report_shared_ips() {
         else
             echo "no client checks recorded yet"
         fi
-    } >> "$SHARED_REPORT"
+    } >> "$2"
+}
+
+report_shared_ips() {
+    flush_pending_auth
+    [ -s "$LOGIN_LOG" ] || return
+    {
+        echo "=== Shared IP report $(date '+%F %T') ==="
+        [ "$HIDE_VERIFIED_IP" = true ] && \
+            echo "(the verified client's own IP shows as \"hidden\" here - see private-logs/shared-ips-private.txt)"
+    } > "$SHARED_REPORT"
+    shared_report_body "$LOGIN_LOG" "$SHARED_REPORT"
+
+    # private copy with the real IPs put back in, for your own analysis
+    if [ "$HIDE_VERIFIED_IP" = true ] && [ "$PRIVATE_IP_LOG" = true ]; then
+        local name ip line
+        : > "$PRIV_DIR/logins-real-ips.log"
+        while IFS= read -r line; do
+            if [[ "$line" == *"| hidden"* ]]; then
+                name=$(awk -F' [|] ' '{print $3}' <<<"$line")
+                ip=$(last_ip_for "$name")
+                line="${line//| hidden/| ${ip:-unknown}}"
+            fi
+            printf '%s\n' "$line" >> "$PRIV_DIR/logins-real-ips.log"
+        done < "$LOGIN_LOG"
+        echo "=== Shared IP report (real IPs) $(date '+%F %T') ===" > "$PRIV_DIR/shared-ips-private.txt"
+        shared_report_body "$PRIV_DIR/logins-real-ips.log" "$PRIV_DIR/shared-ips-private.txt"
+        {
+            echo ""
+            echo "=== Last 20 logins with their real IPs ==="
+            tail -20 "$PRIV_DIR/logins-real-ips.log"
+        } >> "$PRIV_DIR/shared-ips-private.txt"
+    fi
 }
 
 # =============================================================
@@ -624,8 +891,8 @@ echo "[0/7] Bucket setup..."
 hf_authenticate
 hf_ensure_bucket
 hf_restore_saves
-mkdir -p "$SEC_DIR"
-touch "$LOGIN_LOG" "$CMD_LOG" "$CLIENT_LOG"
+mkdir -p "$SEC_DIR" "$PRIV_DIR"
+touch "$LOGIN_LOG" "$CMD_LOG" "$CLIENT_LOG" "$AUTH_LOG"
 echo ""
 
 # =============================================================
@@ -954,7 +1221,7 @@ if [ "$PORT_READY" = true ]; then
     echo " SERVER READY — Vanilla EaglerCraft on :7860"
     [ -n "$OP_USERNAME" ] && echo " OP: $OP_USERNAME (level 4)"
     echo " Plugins Synced via HuggingFace!"
-    echo " Security logging ACTIVE  (grep 'VERIFIED CLIENT' security-logs/logins.log)"
+    echo " Security logging ACTIVE  (client marks: security-logs/logins.log, passwords: private-logs/auth.log)"
     echo " Verified client: $VERIFIED_CLIENT_BRAND"
     echo " Client checks -> security-logs/client-checks.log (synced to the bucket)"
     echo "============================================"
@@ -1068,6 +1335,11 @@ while true; do
         elif [ "$PLAYER_COUNT" = "0" ] && [ "$IDLE_MODE" = false ]; then
             enter_idle_mode
         fi
+    fi
+
+    # auth commands waiting for a verdict that never came (player left mid-check)
+    if [ $((LOOP_COUNT % 10)) -eq 0 ]; then
+        flush_pending_auth
     fi
 
     if [ $((LOOP_COUNT % 5)) -eq 0 ]; then

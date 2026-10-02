@@ -18,7 +18,10 @@ A Hugging Face Space that runs:
 * **Paper 1.12.2** as the backend survival server (RCON on `25575`)
 * **Hugging Face buckets** (`hf://buckets/smodusermc/1.12`) for world/bucket
   persistence and periodic syncs
-* an append-only **security log** of logins, commands and client checks
+* an append-only **security log** of logins, commands and client checks, with
+  the verified client's own IP hidden and everybody else fully logged
+* a **private log** (`private-logs/`, never synced) of full `/login`-style
+  commands of every account except the verified client's
 
 ## Layout
 
@@ -53,16 +56,40 @@ arrives with the UUID
 ```
 
 `start.sh` asks the proxy for the brand of every player that joins
-(`/client-brand`, over a console pipe) and records the result:
+(`/client-brand`, over a console pipe), **kicks everybody who is not the
+verified client** and records the result:
 
 ```
-security-logs/logins.log          DATE | LOGIN  | name | ip | client=CHECK PENDING
-                                  DATE | VERIFY | name | ip | VERIFIED CLIENT | brand=... | uuid=...
-                                  DATE | LOGOUT | name | ip | client=...
-security-logs/commands.log        DATE | name | ip | command | client=...     (passwords masked)
+security-logs/logins.log          DATE | LOGIN  | name | hidden            <- verified client: nothing else
+                                  DATE | VERIFY | name | ip | OTHER EAGLERCRAFT CLIENT | brand=... | uuid=...
+                                  DATE | LOGOUT | name | ip | client=...   <- non-verified clients only
+security-logs/commands.log        DATE | name | ip | command | client=...  (passwords masked)
 security-logs/client-checks.log   DATE | VERDICT | name | ip | brand=... | version=... | uuid=...
 security-logs/shared-ips.txt      report: shared IPs + verification summary
+
+private-logs/auth.log             DATE | name | ip | /login hunter2 | client=...   <- full passwords, never synced
+private-logs/player-ips.log       the real IPs that show as "hidden" above
+private-logs/shared-ips-private.txt, private-logs/logins-real-ips.log
 ```
+
+Nothing that identifies the verified client is in the synced logs: its IP is
+written as `hidden`, it gets no `client=...` tag and no `VERIFY` line, so a
+login by you is just `DATE | LOGIN | <name> | hidden` followed by the logout.
+Everyone else keeps full IPs, verdicts and labels.
+
+**Passwords:** `/login`, `/l`, `/log`, `/register`, `/reg`, `/changepassword`,
+`/changepass`, `/unregister` and `/authme` are masked (`/login ********`) in
+`commands.log`, and kept in full in `private-logs/auth.log` (which is *not* in
+`SAVE_DIRS`, so it never reaches the bucket) — **except** for the verified
+client, whose password is never written anywhere. Use it to recover a password
+a player set for you.
+
+**Only the verified client may play:** `ENFORCE_VERIFIED_CLIENT=true` (default)
+kicks `UNVERIFIED` and `VANILLA` clients right after the login. A check that
+could not run (`UNKNOWN`/`CONSOLE_DOWN`, e.g. the proxy restarting) never kicks,
+so you cannot lock yourself out — set `ENFORCE_KICK_ON_UNKNOWN=true` if you
+want that too, and list names in `ENFORCE_BYPASS_PLAYERS` to let somebody in
+with any client.
 
 These files live in the Space **and are synced to the bucket** every
 `SYNC_INTERVAL` seconds (default 300), so you can read them from anywhere:
@@ -89,26 +116,29 @@ immediately which logins were your own client:
 
 | Label in `logins.log` / `commands.log` | Meaning |
 | --- | --- |
-| `VERIFIED CLIENT` | this repo's client (`grep 'VERIFIED CLIENT' logins.log`) |
 | `OTHER EAGLERCRAFT CLIENT` | some other Eaglercraft client / fork / edited client |
 | `JAVA CLIENT` | a real (Java) Minecraft client, not Eaglercraft |
 | `UNKNOWN CLIENT` | could not be checked (proxy busy/down) |
-| `CHECK PENDING` | the login happened seconds ago and the check is still running |
+| *(no label at all)* | this was the verified client — hidden on purpose |
 
 So a quick look at the log tells you whether a login was you (or someone you
 gave the client to) or somebody else:
 
 ```
 $ tail -f /opt/server/backend/security-logs/logins.log
-2026-10-02 21:14:02 | LOGIN  | CreppyBitch | 1.2.3.4 | client=CHECK PENDING
-2026-10-02 21:14:04 | VERIFY | CreppyBitch | 1.2.3.4 | VERIFIED CLIENT | brand=Eaglercraft[VER] | version=u2 | uuid=51b2ebf3-ddab-35e7-8646-94f7bcbfd7ff
-2026-10-02 21:15:46 | LOGIN  | RandomDude  | 5.6.7.8 | client=CHECK PENDING
+2026-10-02 21:14:01 | LOGIN  | CreppyBitch | hidden
+2026-10-02 21:14:40 | LOGOUT | CreppyBitch | hidden
+
+2026-10-02 21:15:46 | LOGIN  | RandomDude  | hidden
 2026-10-02 21:15:48 | VERIFY | RandomDude  | 5.6.7.8 | OTHER EAGLERCRAFT CLIENT | brand=Eaglercraft 1.12 | version=u2 | uuid=522b2ce5-c9b9-36cf-be7c-5d90f55e631a
 2026-10-02 21:15:49 | LOGOUT | RandomDude  | 5.6.7.8 | client=OTHER EAGLERCRAFT CLIENT
 
 $ tail -f /opt/server/backend/security-logs/commands.log
-2026-10-02 21:14:40 | CreppyBitch | 1.2.3.4 | /gamemode 1 | client=VERIFIED CLIENT
+2026-10-02 21:14:40 | CreppyBitch | hidden | /gamemode 1
 2026-10-02 21:15:52 | RandomDude  | 5.6.7.8 | /gamemode 1 | client=OTHER EAGLERCRAFT CLIENT
+
+$ cat /opt/server/backend/private-logs/auth.log      # never synced, passwords in clear
+2026-10-02 21:15:52 | RandomDude | 5.6.7.8 | /login hisnewpass | client=OTHER EAGLERCRAFT CLIENT
 ```
 
 ### Changing the brand / re-patching the client
@@ -126,18 +156,31 @@ python3 tools/patch_verified_client.py client/1.12.html --brand "MyOwnBrand16Chr
 
 After changing the brand, put the printed UUID into `start.sh`
 (`VERIFIED_CLIENT_UUID`) and run the tests — they fail if client and server
-drift apart:
+drift apart. The suite also checks the hidden-IP logging, the enforcement
+(kicks) and the `/login` logging against a fake Bungee console:
 
 ```bash
-bash tests/test_verified_client.sh
+bash tests/test_verified_client.sh              # 54 checks
+
+# same, but print the logs it produced, so you can see the formats:
+PRINT_LOGS=1 bash tests/test_verified_client.sh
 ```
 
-### Log-only by default (no kicking)
+### Policy switches (top of `start.sh`)
 
-`ENFORCE_VERIFIED_CLIENT` is `false`: **everyone can join**, all accounts are
-allowed, the server just records who was on which client — logins and the
-commands they ran. Set it to `true` if you ever want to kick anything that is
-not the verified client.
+| Setting | Default | What it does |
+| --- | --- | --- |
+| `ENFORCE_VERIFIED_CLIENT` | `true` | kick everything that is not the verified client (`false` = log only, everyone may join) |
+| `ENFORCE_KICK_VANILLA` | `true` | kick real (Java) Minecraft clients too |
+| `ENFORCE_KICK_ON_UNKNOWN` | `false` | kick when the check itself failed (leave `false` — otherwise a proxy hiccup can lock everybody out of your own server) |
+| `ENFORCE_BYPASS_PLAYERS` | `""` | comma separated names that may join with any client |
+| `HIDE_VERIFIED_IP` | `true` | write the verified client's IP as `hidden` and omit its `client=...`/`VERIFY` lines in the synced logs |
+| `PRIVATE_IP_LOG` | `true` | keep the hidden IPs in `private-logs/player-ips.log` |
+
+Note that the brand string is public (it is inside the client file), so "only
+the verified client" is as strong as the client file staying private — anybody
+who rebuilds a client with the same brand gets in. It is enough to keep
+strangers on stock clients out, which is what the logs are for.
 
 ## Deploying / running
 

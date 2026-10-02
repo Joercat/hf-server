@@ -156,24 +156,36 @@ DRM mechanism.
    `VERIFIED_CLIENT_BRAND` and the verdict is written to
    `security-logs/client-checks.log` plus a `[CLIENT]` line on the container
    console.
-5. The verdict is cached for the player, so **every later log line carries it**:
+5. The verdict is cached for the player, so **every later log line carries it**
+   — and for the verified client that is deliberately *nothing*:
 
    ```
-   logins.log    DATE | LOGIN  | name | ip | client=CHECK PENDING
-                 DATE | VERIFY | name | ip | VERIFIED CLIENT | brand=… | version=… | uuid=…
-                 DATE | LOGOUT | name | ip | client=VERIFIED CLIENT
-   commands.log  DATE | name | ip | command | client=VERIFIED CLIENT
+   logins.log    DATE | LOGIN  | name | hidden                     <- the verified client
+                 DATE | VERIFY | name | ip | OTHER EAGLERCRAFT CLIENT | brand=… | version=… | uuid=…
+                 DATE | LOGOUT | name | ip | client=OTHER EAGLERCRAFT CLIENT
+   commands.log  DATE | name | hidden | command                    <- the verified client
+                 DATE | name | ip | command | client=JAVA CLIENT
    ```
 
-   Before the check finishes (a second or two) commands are tagged
-   `CHECK PENDING`; `grep 'VERIFIED CLIENT' logins.log` matches only logins from
-   this client (the other labels are `OTHER EAGLERCRAFT CLIENT`, `JAVA CLIENT`
-   and `UNKNOWN CLIENT`, none of which contain that phrase).
-6. Optionally (`ENFORCE_VERIFIED_CLIENT=true`) `UNVERIFIED` players are kicked
-   through RCON. **The default is `false`: everyone can join, everything is
-   only logged.**
+   The verified client gets no `VERIFY` line and no `client=…` tag either, so
+   nothing in the synced logs points back at it. Anybody else is labelled
+   `OTHER EAGLERCRAFT CLIENT`, `JAVA CLIENT` or `UNKNOWN CLIENT`, with their
+   real IP — that is the whole answer to "was this me or somebody else?".
+6. **Enforcement** (`ENFORCE_VERIFIED_CLIENT=true`, the default): every account
+   that is not on the verified client is kicked through RCON right after the
+   login, including real Java Minecraft clients (`ENFORCE_KICK_VANILLA`). A
+   check that never resolved is *not* kicked (`ENFORCE_KICK_ON_UNKNOWN=false`),
+   so a proxy restart can never lock you out of your own server; add names to
+   `ENFORCE_BYPASS_PLAYERS` if somebody may use any client.
+7. **Passwords**: `/login`, `/l`, `/log`, `/register`, `/reg`,
+   `/changepassword`, `/changepass`, `/unregister` and `/authme` are masked in `commands.log` and kept in full in `private-logs/auth.log`, which
+   is **never synced** to the bucket. The verified client's own commands are
+   the one exception: your password is never written anywhere. Commands are
+   queued for a moment when needed, so the verdict is always known before the
+   line is written, and the same command seen twice (Paper and Bungee) is
+   written once.
 
-All four files are copied into `SAVE_DIRS`-driven staging and pushed to the
+`security-logs/` is copied into `SAVE_DIRS`-driven staging and pushed to the
 bucket every `SYNC_INTERVAL` seconds (300 by default):
 
 ```
@@ -183,6 +195,20 @@ hf://buckets/smodusermc/1.12/game-data/security-logs/shared-ips.txt
 
 so `hf buckets cp hf://buckets/smodusermc/1.12/game-data/security-logs/logins.log .`
 or the web UI is enough to read them from outside the Space.
+
+`backend/private-logs/` is **not** in `SAVE_DIRS` and never leaves the Space
+(`start.sh` even warns at startup if `private-logs` ever ends up in the list):
+
+| private file | content |
+| --- | --- |
+| `auth.log` | full `/login`, `/register`, `/changepassword`, … commands of everybody except the verified client |
+| `player-ips.log` | the real IPs that appear as `hidden` in the synced logs |
+| `logins-real-ips.log`, `shared-ips-private.txt` | the same reports as the bucket ones, but with the verified client's IP put back in |
+
+The shared-IP report in the bucket shows the verified client as `hidden`; the
+private copy shows the real value, so the correlation analysis (same IP used by
+several accounts, one account seen from several IPs) is not lost — it just
+stays inside the Space.
 
 Console answers about players that are not Eaglercraft (`That player is not
 using eaglercraft!`) become `VANILLA`; no answer at all becomes `UNKNOWN`, never
@@ -199,16 +225,26 @@ using eaglercraft!`) become `VANILLA`; no answer at all becomes `UNKNOWN`, never
 * asserts they are equal, and that the stock client's UUID is *not* accepted;
 * extracts the detection functions from `start.sh` and drives them against a
   fake BungeeCord console, asserting `VERIFIED` / `UNVERIFIED` / `VANILLA` /
-  `CONSOLE_DOWN` classifications, the login flow, and that the script's own
-  injected console commands are not logged as player commands;
-* asserts that the `VERIFY` line lands in `logins.log`, that commands carry the
-  `client=…` tag (including `CHECK PENDING` before the check resolves), and that
-  `grep 'VERIFIED CLIENT'` really matches nothing but the verified client.
+  `CONSOLE_DOWN` classifications and the login flow;
+* asserts the hiding: the verified client's lines say `hidden`, carry no
+  `client=…` tag and get no `VERIFY` line, while everybody else shows the real
+  IP and their label;
+* asserts the enforcement: non-verified and vanilla clients are kicked, the
+  verified client and `ENFORCE_BYPASS_PLAYERS` are not, and an unresolved check
+  is not kicked unless `ENFORCE_KICK_ON_UNKNOWN=true`;
+* asserts the password logging: a stranger's `/login`, `/register` land in full
+  in `private-logs/auth.log`, the verified client's never do, the same command
+  seen twice is written once, and commands that arrive before the verdict are
+  queued until it is known;
+* asserts that the script's own injected console commands are not logged as
+  player commands, and that the private report keeps the real IPs the synced
+  report hides.
 
 Run it after any change:
 
 ```bash
-bash tests/test_verified_client.sh
+bash tests/test_verified_client.sh               # 54 checks
+PRINT_LOGS=1 bash tests/test_verified_client.sh  # …and dump the logs it built
 ```
 
 ---
