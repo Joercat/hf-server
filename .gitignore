@@ -1,2 +1,14 @@
 __pycache__/
 *.pyc
+
+# The verified client and the pair that identifies it are NOT committed.
+# This repository is public (and so is its git history), and a brand that can be
+# read here can be copied into anybody's client - which is exactly what makes
+# somebody show up as "verified" in the logs. Keep them here or in the bucket:
+#   client/1.12.html        built with tools/setup-verified-client.sh
+#   .verified-client.env    the brand + UUID that go into the Space as secrets
+client/1.12.html
+.verified-client.env
+
+# local scratch
+server-logs/

@@ -106,36 +106,63 @@ OP_USERNAME="CreppyBitch"
 # =============================================
 # VERIFIED CLIENT  (see docs/verified-client.md)
 # =============================================
-# client/1.12.html in this repo is a patched Eaglercraft 1.12 client that
-# reports a custom brand instead of the stock "Eaglercraft 1.12". The brand is
-# turned into the 16 byte "brand UUID" the client sends during the Eagler
-# handshake with
+# The client (built with tools/setup-verified-client.sh) reports a custom brand
+# instead of the stock "Eaglercraft 1.12". The brand becomes the 16 byte "brand
+# UUID" the client sends during the Eagler handshake with
 #
 #     brandUUID = UUID.nameUUIDFromBytes("EaglercraftXClient:" + brand)
 #
-# so the patched client is the only one that arrives with this UUID and the
-# server can tell it apart from other clients / other accounts in the logs.
-# Recompute the UUID after changing the brand:
-#     python3 tools/patch_verified_client.py --print-uuid --brand "<brand>"
-# V2 of the client (and it now needs a username + password before it boots).
-# The first client, brand "Eaglercraft[VER]" (UUID 51b2ebf3-...), is REVOKED:
-# the server only accepts the brand+UUID pair below, so the old file is just
-# another unrecognised client now. To revoke this one too and hand out a fresh
-# client:  python3 tools/patch_verified_client.py --rotate ...
-# Both can be overridden from the Space: give the Space the *secrets*
-# VERIFIED_CLIENT_BRAND / VERIFIED_CLIENT_UUID and the values below (which are
-# readable in this repo) are ignored. That is how you keep the brand out of any
-# public place - see "Keeping the brand secret" in README.md.
-VERIFIED_CLIENT_BRAND="${VERIFIED_CLIENT_BRAND:-EaglercraftX[V2]}"
-VERIFIED_CLIENT_UUID="${VERIFIED_CLIENT_UUID:-355d0b9f-14ce-359f-8c9f-97cc1a7c92ca}"
-# The gate inside the client is what makes the file useless without the
-# credentials (the EPW payload is sealed), so the server cannot check it - it
-# checks the brand above. Change the gate password by rebuilding the client.
+# so the server can tell that one client apart from everybody else and mark
+# those logins in the logs.
+#
+# THIS PAIR IS A SECRET AND IS NOT STORED IN THIS REPOSITORY. This repo is
+# public, so any brand written down here can be copied into somebody else's
+# client - they would then show up as "verified" without ever having your
+# client. Two consequences:
+#
+#   * the pair comes from the environment (Space -> Settings -> Variables and
+#     secrets) or from the git-ignored .verified-client.env next to this
+#     script, and
+#   * every brand that was ever committed here is refused (see
+#     PUBLISHED_CLIENT_BRANDS below), even if somebody configures it.
+#
+# Rotating = tools/setup-verified-client.sh --rotate, then put the printed
+# values into the Space and restart. Nothing in this file has to change.
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)
+if [ -z "${VERIFIED_CLIENT_BRAND:-}" ] && [ -s "$SCRIPT_DIR/.verified-client.env" ]; then
+    # shellcheck disable=SC1091
+    . "$SCRIPT_DIR/.verified-client.env"
+fi
+VERIFIED_CLIENT_BRAND="${VERIFIED_CLIENT_BRAND:-}"
+VERIFIED_CLIENT_UUID="${VERIFIED_CLIENT_UUID:-}"
 
-# true = ONLY the verified client may stay on the server; every other account
-# is kicked right after the login. Set to false to allow everyone and only log.
-ENFORCE_VERIFIED_CLIENT=true
-# also kick real (Java) Minecraft clients - they are not the verified client
+# Brands+UUIDs that have been public at some point (they were committed to this
+# repo, so anybody could have copied them into a client). If one of these is
+# configured the boot log says so loudly and it is not treated as verified: a
+# mark anybody can forge is worse than none.
+PUBLISHED_CLIENT_BRANDS="Eaglercraft 1.12|522b2ce5-c9b9-36cf-be7c-5d90f55e631a Eaglercraft[VER]|51b2ebf3-ddab-35e7-8646-94f7bcbfd7ff EaglercraftX[V2]|355d0b9f-14ce-359f-8c9f-97cc1a7c92ca"
+
+if [ -n "$VERIFIED_CLIENT_BRAND" ] && [ -n "$VERIFIED_CLIENT_UUID" ]; then
+    VERIFIED_CLIENT_CONFIGURED=true
+else
+    VERIFIED_CLIENT_CONFIGURED=false
+fi
+VERIFIED_CLIENT_PUBLISHED=false
+for _pair in $PUBLISHED_CLIENT_BRANDS; do
+    if [ "$VERIFIED_CLIENT_BRAND" = "${_pair%%|*}" ] || [ "$VERIFIED_CLIENT_UUID" = "${_pair##*|}" ]; then
+        VERIFIED_CLIENT_PUBLISHED=true
+    fi
+done
+unset _pair
+
+# true = ONLY the verified client may stay on the server; everybody else is
+# kicked right after the login. DEFAULT IS FALSE: everybody may join with any
+# client and the verified client is only *marked* in the logs (your IP is
+# hidden, your lines carry no client=... tag). Turn it on if you ever want the
+# server to be exclusive.
+ENFORCE_VERIFIED_CLIENT=false
+# also kick real (Java) Minecraft clients - only has an effect while
+# ENFORCE_VERIFIED_CLIENT is true
 ENFORCE_KICK_VANILLA=true
 # do NOT kick when the check itself could not run (proxy busy/restarting).
 # Keeps you from locking yourself out; those logins stay visible as
@@ -899,11 +926,12 @@ flush_pending_auth() {
     while IFS=$'\t' read -r epoch name cmd; do
         v=$(verdict_for "$name")
         ip=$(last_ip_for "$name"); ip="${ip:-unknown}"
-        if [ "$v" = "VERIFIED" ]; then
+        if [ "${VERIFIED_CLIENT_CONFIGURED:-false}" != true ]; then
+            write_auth_masked "$name" "$cmd" "UNCONFIGURED" "$v" "$epoch"
+        elif [ "$v" = "VERIFIED" ]; then
             # the owner: never write the password, but do record that the
-            # command happened (auth.log would otherwise stay empty forever,
-            # because under enforcement nobody else ever gets to type one)
-            echo "$(date -d "@$epoch" '+%F %T') | $name | hidden | ${cmd%% *} ******** | client=VERIFIED CLIENT (password not recorded)" >> "$AUTH_LOG"
+            # command happened, so auth.log shows the capture path working
+            write_auth_masked "$name" "$cmd" "VERIFIED CLIENT" "$v" "$epoch"
         elif [ "$v" != "PENDING" ]; then
             echo "$(date -d "@$epoch" '+%F %T') | $name | $ip | $cmd | client=$(verdict_label "$v")" >> "$AUTH_LOG"
         elif [ $(( $(date +%s) - epoch )) -gt 300 ]; then
@@ -915,12 +943,33 @@ flush_pending_auth() {
     mv "$tmp" "$PENDING_AUTH"
 }
 
+# one masked auth row. Used for the owner's own commands (whose password is
+# never written anywhere) and while the verified client is not configured (when
+# nobody's password can be attributed safely).
+write_auth_masked() {
+    local name="$1" cmd="$2" label="${3:-UNCONFIGURED}" verdict="${4:-UNKNOWN}" epoch="${5:-}" ip="${6:-}"
+    if [ -z "$ip" ]; then
+        if [ "$label" = "VERIFIED CLIENT" ]; then
+            ip="hidden"           # the owner's own address stays out of every log
+        else
+            ip=$(last_ip_for "$name"); ip="${ip:-unknown}"
+        fi
+    fi
+    [ -n "$epoch" ] || epoch=$(date +%s)
+    echo "$(date -d "@$epoch" '+%F %T') | $name | $ip | ${cmd%% *} ******** | client=$label (password not recorded)" >> "$AUTH_LOG"
+}
+
 # mask passwords in the log lines that leave the Space; the full command is
 # kept in private-logs/auth.log instead (except for the verified client, whose
 # password is not written anywhere - its row there is masked as well)
 mask_cmd() {
     local name="$1" cmd="$2" verdict="${3:-UNKNOWN}" ip
     if is_auth_cmd "$cmd"; then
+        if [ "${VERIFIED_CLIENT_CONFIGURED:-false}" != true ]; then
+            # no way to tell the owner's /login from anybody else's - do not
+            # write anybody's password in clear until the pair is configured
+            write_auth_masked "$name" "$cmd" "UNCONFIGURED" "${verdict:-UNKNOWN}"
+        else
         case "${verdict:-UNKNOWN}" in
             VERIFIED)
                 # the owner: the password is never written anywhere, but the
@@ -929,7 +978,7 @@ mask_cmd() {
                 # path works end to end
                 if ! auth_seen_recently "$name" "$cmd"; then
                     record_auth_seen "$name" "$cmd"
-                    echo "$(date '+%F %T') | $name | hidden | ${cmd%% *} ******** | client=VERIFIED CLIENT (password not recorded)" >> "$AUTH_LOG"
+                    write_auth_masked "$name" "$cmd" "VERIFIED CLIENT" VERIFIED
                 fi
                 ;;
             *)
@@ -945,6 +994,7 @@ mask_cmd() {
                         fi ;;
                 esac ;;
         esac
+        fi
         cmd="${cmd%% *} ********"
     fi
     echo "$cmd"
@@ -1205,11 +1255,37 @@ query_client_brand() {
         return 0
     fi
 
-    if [ "$uuid" = "$VERIFIED_CLIENT_UUID" ] || [ "$brand" = "$VERIFIED_CLIENT_BRAND" ]; then
+    if [ "${VERIFIED_CLIENT_CONFIGURED:-false}" = true ] && \
+       [ "${VERIFIED_CLIENT_PUBLISHED:-false}" != true ] && \
+       { [ "$uuid" = "$VERIFIED_CLIENT_UUID" ] || [ "$brand" = "$VERIFIED_CLIENT_BRAND" ]; }; then
         echo "VERIFIED|$brand|$version|$uuid|$mcbrand"
     else
         echo "UNVERIFIED|$brand|$version|$uuid|$mcbrand"
     fi
+}
+
+# Why the configured pair (if any) cannot be trusted - empty when it is fine.
+verified_client_problem() {
+    if [ "$VERIFIED_CLIENT_CONFIGURED" != true ]; then
+        echo "NOT CONFIGURED: set VERIFIED_CLIENT_BRAND and VERIFIED_CLIENT_UUID"
+        echo "  (Space -> Settings -> Variables and secrets, then Restart). Until"
+        echo "  then nobody is marked as the verified client and, because your own"
+        echo "  /login cannot be told apart from anybody else's, every password is"
+        echo "  masked instead of written in clear."
+    elif [ "$VERIFIED_CLIENT_PUBLISHED" = true ]; then
+        echo "PUBLIC BRAND: '$VERIFIED_CLIENT_BRAND' was committed to this repo at some"
+        echo "  point, so anybody can build a client that reports it. It is NOT"
+        echo "  treated as verified. Rotate: bash tools/setup-verified-client.sh --rotate"
+    fi
+}
+
+warn_verified_client_problem() {
+    local problem
+    problem=$(verified_client_problem)
+    [ -n "$problem" ] || return 0
+    echo ""
+    echo "!! VERIFIED CLIENT: $problem" | sed 's/^/!! /'
+    echo ""
 }
 
 check_player_client() {
@@ -1387,6 +1463,15 @@ write_logger_status() {
         echo "client-checks  : $(wc -l < "$CLIENT_LOG" 2>/dev/null || echo 0) rows"
         echo "playerlist     : ${PLAYERLIST_LAST:-not polled yet}"
         echo "real client IPs: $(forward_ip_setting 2>/dev/null || true)"
+        if [ "$VERIFIED_CLIENT_CONFIGURED" = true ]; then
+            echo "verified client: ${VERIFIED_CLIENT_BRAND} (uuid ${VERIFIED_CLIENT_UUID})"
+        else
+            echo "verified client: NOT CONFIGURED (nobody is marked as you)"
+        fi
+        local _vcproblem
+        _vcproblem=$(verified_client_problem)
+        [ -n "$_vcproblem" ] && printf '%s\n' "$_vcproblem" | sed 's/^/  !! /'
+        echo "enforcement    : ENFORCE_VERIFIED_CLIENT=${ENFORCE_VERIFIED_CLIENT:-false} (false = everybody may join)"
         echo "tail of logins.log:"
         tail -3 "$LOGIN_LOG" 2>/dev/null | sed 's/^/  /'
         echo ""
@@ -2001,6 +2086,7 @@ for i in $(seq 1 120); do
 done
 
 # Start security logger (logins/IPs + commands + verified client checks)
+warn_verified_client_problem
 write_logger_status
 start_security_logger
 echo " Security logger PID: $SECLOG_PID"
@@ -2212,8 +2298,16 @@ if [ "$PORT_READY" = true ]; then
     echo "                  + shared-ips.txt, ip-report.log, logger-status.log"
     [ "$SYNC_PRIVATE_LOGS" = true ] && \
         echo "   private-logs/{auth,player-ips,logins-real-ips,ip-report-private}.log"
-    echo " Verified client: $VERIFIED_CLIENT_BRAND  (uuid $VERIFIED_CLIENT_UUID)"
-    echo "   the old Eaglercraft[VER] client is revoked (it is not verified any more)"
+    if [ "$VERIFIED_CLIENT_CONFIGURED" = true ]; then
+        echo " Verified client: $VERIFIED_CLIENT_BRAND  (uuid $VERIFIED_CLIENT_UUID)"
+    else
+        echo " Verified client: NOT CONFIGURED - set VERIFIED_CLIENT_BRAND/_UUID in"
+        echo "                  the Space's Variables and secrets (nobody is marked as you)"
+    fi
+    echo "   everybody may join (ENFORCE_VERIFIED_CLIENT=$ENFORCE_VERIFIED_CLIENT); the"
+    echo "   verified client is only marked in the logs (IP hidden, no client= tag)"
+    echo "   every brand ever committed to the repo (Eaglercraft[VER], EaglercraftX[V2],"
+    echo "   the stock one) is refused - it cannot make anybody 'verified' any more"
     echo "   real client IPs: $(forward_ip_setting 2>/dev/null)"
     echo "   build: $SCRIPT_VERSION"
     echo "============================================"

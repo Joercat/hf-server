@@ -66,6 +66,13 @@ echo
 if hf upload "$SPACE" "$STAGE" . --repo-type space; then
     echo
     echo "ok - the Space will rebuild itself (watch its Logs tab)."
+    echo
+    echo "    REMINDER: the brand/UUID are NOT part of this upload. If the Space"
+    echo "    does not have them yet (Space -> Settings -> Variables and secrets):"
+    echo "      VERIFIED_CLIENT_BRAND / VERIFIED_CLIENT_UUID"
+    echo "    without them nobody is marked as the verified client and every"
+    echo "    password in private-logs/auth.log is masked. The boot log says"
+    echo "    'VERIFIED CLIENT: NOT CONFIGURED' in that case."
     echo "    the console the build/run produces is mirrored to:"
     echo "      $BUCKET/game-data/logs/paper.log"
     echo "      $BUCKET/game-data/logs/bungee.log"

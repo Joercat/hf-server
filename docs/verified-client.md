@@ -44,16 +44,21 @@ The same check for the other official brands proves the algorithm:
 
 So: **change the brand string → change the UUID the client sends.**
 
-The client in this repo is **V2** and uses `EaglercraftX[V2]`:
+The current client carries a brand that is **not written down here**: the
+repository is public and so is its history, so a brand published in it can be
+copied into anybody's client — that somebody would then be marked as the owner
+without ever having the real client.
 
-```
-EaglercraftXClient:EaglercraftX[V2]  ->  355d0b9f-14ce-359f-8c9f-97cc1a7c92ca
-```
+| brand | UUID | state |
+| --- | --- | --- |
+| *(not in this repo)* | *(in `.verified-client.env` / the Space secrets)* | **current** — `start.sh` reads the pair from the environment |
+| `Eaglercraft[VER]` | `51b2ebf3-ddab-35e7-8646-94f7bcbfd7ff` | **burned** — committed to the repo, refused by `PUBLISHED_CLIENT_BRANDS` |
+| `EaglercraftX[V2]` | `355d0b9f-14ce-359f-8c9f-97cc1a7c92ca` | **burned** — same |
+| `Eaglercraft 1.12` (stock) | `522b2ce5-c9b9-36cf-be7c-5d90f55e631a` | never the verified client |
 
-| client | brand | UUID | state |
-| --- | --- | --- | --- |
-| V1 | `Eaglercraft[VER]` | `51b2ebf3-ddab-35e7-8646-94f7bcbfd7ff` | **revoked** — `start.sh` no longer matches it, so it is kicked like any unknown client |
-| stock | `Eaglercraft 1.12` | `522b2ce5-c9b9-36cf-be7c-5d90f55e631a` | never allowed while enforcement is on |
+A burned brand is refused even if somebody puts it into the Space secrets: the
+boot log prints `PUBLIC BRAND` and nobody gets the verified mark. The patcher
+refuses to build with such a name at all (`REVOKED_BRANDS`).
 
 Revoking V1 was a one-line change: `VERIFIED_CLIENT_BRAND`/`VERIFIED_CLIENT_UUID`
 in `start.sh` point at the new pair, and the comparison
@@ -224,9 +229,9 @@ watch `client-checks.log` for logins that are not you.
    on the proxy console and reads the answer back out of `/tmp/bungee.log`:
 
    ```
-   Eagler Client Brand: EaglercraftX[V2]
+   Eagler Client Brand: <your brand>
    Eagler Client Version: u2
-   Eagler Client UUID: 355d0b9f-14ce-359f-8c9f-97cc1a7c92ca
+   Eagler Client UUID: <the UUID of that brand>
    Minecraft Client Brand: EaglercraftX
    ```
 
@@ -341,18 +346,28 @@ using eaglercraft!`) become `VANILLA`; no answer at all becomes `UNKNOWN`, never
 
 `tests/test_verified_client.sh`:
 
-* reads `VERIFIED_CLIENT_UUID` out of `start.sh`,
-* extracts the real brand UUID out of `client/1.12.html` (`--check`),
-* asserts they are equal, and that neither the stock client's UUID nor the
-  revoked V1 brand (`Eaglercraft[VER]`) is accepted any more;
+* reads the configured `VERIFIED_CLIENT_BRAND`/`VERIFIED_CLIENT_UUID` (from the
+  environment or the git-ignored `.verified-client.env`) and asserts that
+  **neither string appears anywhere in the git history** — a public brand can be
+  copied into anybody's client, so a leaked pair means the mark is worthless;
+* extracts the real brand UUID out of `client/1.12.html` (`--check`) and asserts
+  it matches the configured pair, and that `client/1.12.html` is neither tracked
+  by git nor un-ignored;
+* asserts that the burned brands (stock, `Eaglercraft[VER]`, `EaglercraftX[V2]`)
+  are not the verified client: a mock proxy answering with them gets
+  `UNVERIFIED`, and a configured-but-burned pair is refused with `PUBLIC BRAND`;
+* asserts that with no pair configured nobody is marked and every password in
+  `auth.log` is masked (`client=UNCONFIGURED`) instead of written in clear;
 * extracts the detection functions from `start.sh` and drives them against a
   fake BungeeCord console, asserting `VERIFIED` / `UNVERIFIED` / `VANILLA` /
   `CONSOLE_DOWN` classifications and the login flow;
 * asserts the hiding: the verified client's lines say `hidden`, carry no
   `client=…` tag and get no `VERIFY` line, while everybody else shows the real
   IP and their label;
-* asserts the enforcement: non-verified and vanilla clients are kicked, the
-  verified client and `ENFORCE_BYPASS_PLAYERS` are not, and an unresolved check
+* asserts that everybody may join by default (`ENFORCE_VERIFIED_CLIENT=false`:
+  no kicks whatever the client), that turning enforcement on still kicks, that
+  the verified client and `ENFORCE_BYPASS_PLAYERS` are not kicked, and that an
+  unresolved check
   is not kicked unless `ENFORCE_KICK_ON_UNKNOWN=true`;
 * asserts the password logging: a stranger's `/login`, `/register` land in full
   in `private-logs/auth.log`, the verified client's never do, the same command
@@ -398,9 +413,9 @@ using eaglercraft!`) become `VANILLA`; no answer at all becomes `UNKNOWN`, never
 Run it after any change:
 
 ```bash
-bash tests/test_verified_client.sh               # 171 checks
+bash tests/test_verified_client.sh               # 197 checks
 VER_CLIENT_USER=<user> VER_CLIENT_PASS=<password> \
-    bash tests/test_verified_client.sh           # 183 checks (adds the boot test)
+    bash tests/test_verified_client.sh           # 209 checks (adds the boot test)
 PRINT_LOGS=1 bash tests/test_verified_client.sh  # …and dump the logs it built
 
 # just the client: gate + loader (prints every check it made)

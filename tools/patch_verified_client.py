@@ -51,12 +51,18 @@ BRAND_PREFIX = "EaglercraftXClient:"
 EXPECTED_BRAND_LEN = 16                 # the stock brand string is 16 bytes long
 STOCK_BRAND = "Eaglercraft 1.12"
 STOCK_BRAND_UUID = "522b2ce5-c9b9-36cf-be7c-5d90f55e631a"
-# The first verified client ("Eaglercraft[VER]") was handed out and is now
-# revoked: start.sh no longer accepts its brand.  V2 rotates the brand, and
-# --rotate generates another one (with a fresh UUID) any time the client needs
-# to be invalidated again.
-REVOKED_BRANDS = {"Eaglercraft[VER]": "51b2ebf3-ddab-35e7-8646-94f7bcbfd7ff"}
-DEFAULT_BRAND = "EaglercraftX[V2]"
+# Brands that must never identify the verified client again.  They were all
+# committed to this (public) repository at some point, so anybody can read the
+# brand, build their own client with it and show up as "verified" - which is
+# why the current brand lives in .verified-client.env / the Space secrets and
+# is deliberately *not* written down here.
+REVOKED_BRANDS = {
+    "Eaglercraft[VER]": "51b2ebf3-ddab-35e7-8646-94f7bcbfd7ff",
+    "EaglercraftX[V2]": "355d0b9f-14ce-359f-8c9f-97cc1a7c92ca",
+}
+# no default: a brand has to be chosen (--brand) or generated (--rotate), so a
+# rebuild can never silently fall back to a name that is already public
+DEFAULT_BRAND = None
 
 # where the gate and the sealed payload live in the built HTML
 SEALED_MARKER = b"window.__verSealed = \""
@@ -562,6 +568,8 @@ def main():
     args = ap.parse_args()
 
     if args.print_uuid:
+        if not args.brand:
+            ap.error("--print-uuid needs --brand")
         print(f"brand     : {args.brand!r}")
         print(f"brandUUID : {brand_uuid(args.brand)}")
         print(f"stock     : {STOCK_BRAND_UUID}  ({STOCK_BRAND!r})")
@@ -577,11 +585,17 @@ def main():
                 break
         print(f"rotated brand : {args.brand!r}")
         print(f"new UUID      : {brand_uuid(args.brand)}")
-        print(f"  -> update start.sh:  VERIFIED_CLIENT_BRAND=\"{args.brand}\"")
-        print(f"                        VERIFIED_CLIENT_UUID=\"{brand_uuid(args.brand)}\"")
+        print("  -> keep this pair out of git. On the Space it goes into")
+        print("     Settings -> Variables and secrets (start.sh reads it from there):")
+        print(f"        VERIFIED_CLIENT_BRAND = {args.brand}")
+        print(f"        VERIFIED_CLIENT_UUID  = {brand_uuid(args.brand)}")
+        print("     locally: bash tools/setup-verified-client.sh --env-file .verified-client.env")
         if not args.html:
             return
 
+    if not args.brand and not args.check:
+        ap.error("pass --brand \"<16 chars>\" (or --rotate for a fresh random one); "
+                 "there is no default on purpose, see REVOKED_BRANDS")
     if not args.html:
         ap.error("a client HTML file is required (or use --print-uuid)")
     html = open(args.html, "rb").read()
@@ -618,6 +632,12 @@ def main():
                       f"start.sh no longer accepts it")
         return
 
+    if args.brand and args.brand in REVOKED_BRANDS and not args.check:
+        raise SystemExit(
+            f"refusing brand {args.brand!r}: it is public (revoked) and anybody could\n"
+            f"copy it into their own client. Pick another name, or use --rotate to\n"
+            f"generate one that has never appeared in this repository.")
+
     if args.gate_user and not args.gate_pass:
         import getpass
         args.gate_pass = getpass.getpass("gate password: ")
@@ -634,7 +654,9 @@ def main():
         print("     gate      : login required (username + password, not stored in the file)")
     else:
         print("     (no --gate-user/--gate-pass: built WITHOUT the login gate)")
-    print("     -> put both values in start.sh (VERIFIED_CLIENT_BRAND/_UUID)")
+    print("     -> keep this pair OUT of git: it goes into the Space secrets")
+    print("        VERIFIED_CLIENT_BRAND / VERIFIED_CLIENT_UUID (setup-verified-client.sh")
+    print("        does that part for you)")
 
 
 if __name__ == "__main__":

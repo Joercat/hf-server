@@ -28,39 +28,70 @@ check_at_least(){ if [ "${2:-0}" -ge "${3:-1}" ] 2>/dev/null; then ok "$1"; else
 
 # --------------------------------------------------------------------------- #
 echo "== 1. client <-> start.sh consistency =="
-# the literal may be an override ("${VERIFIED_CLIENT_UUID:-<uuid>}") or plain
-EXPECTED_UUID=$(grep -oP '^VERIFIED_CLIENT_UUID="(\$\{VERIFIED_CLIENT_UUID:-)?\K[^"}]+' "$ROOT/start.sh")
-CLIENT_INFO=$(python3 "$ROOT/tools/patch_verified_client.py" --check "$ROOT/client/1.12.html" 2>&1)
-CLIENT_UUID=$(sed -n 's/.*brandUUID *: *//p' <<<"$CLIENT_INFO" | head -1)
-CLIENT_BRAND=$(sed -n "s/.*brand *: *'\(.*\)'.*/\1/p" <<<"$CLIENT_INFO" | head -1)
-echo "  client brand : $CLIENT_BRAND"
-echo "  client uuid  : $CLIENT_UUID"
-echo "  start.sh     : $EXPECTED_UUID"
-check "client brand UUID matches VERIFIED_CLIENT_UUID in start.sh" "$CLIENT_UUID" "$EXPECTED_UUID"
-check "start.sh guards against an empty UUID" "$([ -n "$EXPECTED_UUID" ] && echo yes)" "yes"
+# The brand/UUID are a secret: they come from the environment (the Space passes
+# them as secrets) or from the git-ignored .verified-client.env, never from a
+# literal in the repository.
+[ -z "${VERIFIED_CLIENT_BRAND:-}" ] && [ -s "$ROOT/.verified-client.env" ] && \
+    . "$ROOT/.verified-client.env"
+EXPECTED_BRAND="${VERIFIED_CLIENT_BRAND:-}"
+EXPECTED_UUID="${VERIFIED_CLIENT_UUID:-}"
 
-# the stock client must NOT be accepted as verified
-STOCK=$(python3 "$ROOT/tools/patch_verified_client.py" --print-uuid --brand "Eaglercraft 1.12" |
-        sed -n 's/^brandUUID *: *//p')
-if [ "$STOCK" = "$EXPECTED_UUID" ]; then
-    bad "stock client brand must differ from the verified one"
+check "the brand/UUID are configured (env or .verified-client.env)" \
+      "$([ -n "$EXPECTED_BRAND" ] && [ -n "$EXPECTED_UUID" ] && echo yes)" "yes"
+echo "  brand        : $EXPECTED_BRAND"
+echo "  uuid         : $EXPECTED_UUID"
+
+# ... and that pair must never have been public
+if command -v git >/dev/null 2>&1 && git -C "$ROOT" rev-parse --git-dir >/dev/null 2>&1; then
+    HITS=""
+    [ -n "$EXPECTED_BRAND" ] && HITS=$(git -C "$ROOT" log --all --format=%h -S"$EXPECTED_BRAND" 2>/dev/null | head -3)
+    [ -n "$EXPECTED_UUID" ] && HITS="$HITS $(git -C "$ROOT" log --all --format=%h -S"$EXPECTED_UUID" 2>/dev/null | head -3)"
+    check "the configured brand/UUID never appear in git history" "$(echo $HITS | tr -d ' ')" ""
 else
-    ok "stock client ($STOCK) is not the verified client"
+    echo "  skip - not a git checkout, cannot check the history"
 fi
 
-# ... and so must the retired first client, otherwise it would still be let in
-OLDCLIENT=$(python3 "$ROOT/tools/patch_verified_client.py" --print-uuid --brand "Eaglercraft[VER]" |
-            sed -n 's/^brandUUID *: *//p')
-if [ "$OLDCLIENT" = "$EXPECTED_UUID" ]; then
-    bad "the revoked client (Eaglercraft[VER]) must not be the verified one any more"
-else
-    ok "the revoked client (Eaglercraft[VER] -> $OLDCLIENT) is no longer verified"
+# the client itself must not be committed either (it carries the brand)
+if command -v git >/dev/null 2>&1 && git -C "$ROOT" rev-parse --git-dir >/dev/null 2>&1; then
+    check "client/1.12.html is not tracked by git" \
+          "$(git -C "$ROOT" ls-files --error-unmatch client/1.12.html >/dev/null 2>&1 && echo tracked || echo untracked)" \
+          "untracked"
+    check "…and is ignored" \
+          "$(git -C "$ROOT" check-ignore -q client/1.12.html && echo ignored || echo not-ignored)" "ignored"
 fi
-if [ "$CLIENT_BRAND" = "Eaglercraft[VER]" ]; then
-    bad "the released client must not use the revoked brand"
+
+if [ ! -s "$ROOT/client/1.12.html" ]; then
+    echo "  skip - client/1.12.html is not built here (tools/setup-verified-client.sh)"
 else
-    ok "the released client uses the new brand ($CLIENT_BRAND)"
+    CLIENT_INFO=$(python3 "$ROOT/tools/patch_verified_client.py" --check "$ROOT/client/1.12.html" 2>&1)
+    CLIENT_UUID=$(sed -n 's/.*brandUUID *: *//p' <<<"$CLIENT_INFO" | head -1)
+    CLIENT_BRAND=$(sed -n "s/.*brand *: *'\(.*\)'.*/\1/p" <<<"$CLIENT_INFO" | head -1)
+    echo "  client brand : $CLIENT_BRAND"
+    echo "  client uuid  : $CLIENT_UUID"
+    check "the client reports the configured brand" "$CLIENT_BRAND" "$EXPECTED_BRAND"
+    check "…and the configured UUID" "$CLIENT_UUID" "$EXPECTED_UUID"
+    check "the client carries the login gate" \
+          "$(grep -c 'verified-client gate' "$ROOT/client/1.12.html")" "1"
+
+    for BURNED in "Eaglercraft 1.12" "Eaglercraft[VER]" "EaglercraftX[V2]"; do
+        if [ "$BURNED" = "$EXPECTED_BRAND" ]; then
+            bad "the client must not use the revoked brand '$BURNED'"
+        else
+            ok "revoked brand '$BURNED' is not the verified client"
+        fi
+    done
+    if [ "$CLIENT_BRAND" = "EaglercraftX[V2]" ] || [ "$CLIENT_BRAND" = "Eaglercraft[VER]" ]; then
+        bad "the released client uses a brand that is public in this repo"
+    else
+        ok "the released client uses a brand that is not in this repo"
+    fi
 fi
+
+# a brand that is already public must be refused by the builder
+REFUSED=$(python3 "$ROOT/tools/patch_verified_client.py" --brand "Eaglercraft[VER]" \
+          /dev/null --output /tmp/should-not-exist.html 2>&1)
+check "the builder refuses a public (revoked) brand" \
+      "$(grep -c 'refusing brand' <<<"$REFUSED")" "1"
 
 # --------------------------------------------------------------------------- #
 echo "== 2. start.sh detection helpers =="
@@ -82,8 +113,13 @@ export AUTH_SEEN="$WORK/auth-seen.tsv"
 export PRIV_DIR="$WORK/private"
 export SEC_DIR="$WORK/security"
 mkdir -p "$PRIV_DIR" "$SEC_DIR"
-export VERIFIED_CLIENT_BRAND="Eaglercraft[VER]"
-export VERIFIED_CLIENT_UUID="51b2ebf3-ddab-35e7-8646-94f7bcbfd7ff"
+export VERIFIED_CLIENT_BRAND="TestBrand[...]"   # never in this repo: the tests
+export VERIFIED_CLIENT_UUID="$(python3 "$ROOT/tools/patch_verified_client.py" \
+        --print-uuid --brand "TestBrand[...]" | sed -n 's/^brandUUID *: *//p')"
+export VERIFIED_CLIENT_CONFIGURED=true
+export VERIFIED_CLIENT_PUBLISHED=false
+PUBLISHED_CLIENT_BRANDS=$(sed -n 's/^PUBLISHED_CLIENT_BRANDS="\(.*\)"$/\1/p' "$ROOT/start.sh")
+export PUBLISHED_CLIENT_BRANDS
 export BUNGEE_CONSOLE="$FIFO"
 export BUNGEE_PID_FILE="$PIDFILE"
 export BUNGEE_CONSOLE_OK=true
@@ -112,9 +148,10 @@ extract() { awk "/^$1\(\) \{/,/^\}/" "$ROOT/start.sh"; }
 FUNCS="$WORK/funcs.sh"
 for f in strip_colours bungee_console bungee_alive query_client_brand check_player_client \
          is_real_ip record_ip last_ip_for ips_for ip_report_body write_logger_status \
-         mask_cmd is_auth_cmd queue_auth auth_seen_recently record_auth_seen \
+         mask_cmd write_auth_masked is_auth_cmd queue_auth auth_seen_recently record_auth_seen \
          flush_pending_auth ip_field hide_ip_for client_field forward_ip_setting \
          set_forward_ip_in_listeners read_forward_ip_state write_forward_ip_state \
+         verified_client_problem warn_verified_client_problem \
          forward_ip_start_line forward_ip_was_refused apply_forward_ip_choice \
          bungee_restart discover_forward_ip_header forward_ip_probe_once \
          write_forward_ip_probe_py ensure_forward_ip_probe_py \
@@ -163,7 +200,7 @@ vanilla_answer() { printf '12:00:00 [INFO] That player is not using eaglercraft!
 login() { handle_paper_line "[12:00:01 INFO]: $1[/$2:5555] logged in with entity id 42 at (0.0, 0.0, 0.0)"; }
 played() { handle_paper_line "[12:00:09 INFO]: $1 issued server command: $2"; }
 
-brand_answer "Eaglercraft[VER]" "51b2ebf3-ddab-35e7-8646-94f7bcbfd7ff"
+brand_answer "$VERIFIED_CLIENT_BRAND" "$VERIFIED_CLIENT_UUID"
 check "our client is VERIFIED" "$(query_client_brand CreppyBitch | cut -d'|' -f1)" "VERIFIED"
 
 stock_answer
@@ -179,7 +216,7 @@ echo $MOCK_PID > "$PIDFILE"
 
 # --------------------------------------------------------------------------- #
 echo "== 3. the verified client is hidden, everybody else is logged =="
-brand_answer "Eaglercraft[VER]" "51b2ebf3-ddab-35e7-8646-94f7bcbfd7ff"
+brand_answer "$VERIFIED_CLIENT_BRAND" "$VERIFIED_CLIENT_UUID"
 login CreppyBitch 1.2.3.4
 sleep 4.5
 played CreppyBitch "/gamemode 1"
@@ -225,6 +262,21 @@ check "unresolved check is logged as UNKNOWN" \
       "$(grep -c '| VERIFY | Ghost | hidden | UNKNOWN CLIENT |' "$LOGIN_LOG")" "1"
 check "unresolved check does not kick" "$(kick_count Ghost)" "0"
 echo $MOCK_PID > "$PIDFILE"
+
+# the clients handed out before (and public in the git history) are just "some
+# other Eaglercraft client" now - they cannot make anybody look like the owner
+brand_answer "Eaglercraft[VER]" "51b2ebf3-ddab-35e7-8646-94f7bcbfd7ff"
+login OldV1 8.8.8.1
+sleep 4.5
+check "the revoked V1 client is not verified" \
+      "$(grep -c '| VERIFY | OldV1 | 8.8.8.1 | OTHER EAGLERCRAFT CLIENT | brand=Eaglercraft\[VER\] |' "$LOGIN_LOG")" "1"
+brand_answer "EaglercraftX[V2]" "355d0b9f-14ce-359f-8c9f-97cc1a7c92ca"
+login OldV2 8.8.8.2
+sleep 4.5
+check "the revoked V2 client is not verified either" \
+      "$(grep -c '| VERIFY | OldV2 | 8.8.8.2 | OTHER EAGLERCRAFT CLIENT | brand=EaglercraftX\[V2\] |' "$LOGIN_LOG")" "1"
+check "…and nothing in the logs calls either of them the verified client" \
+      "$(grep -c 'VERIFIED CLIENT' "$LOGIN_LOG")" "0"
 
 # policy units
 before=$(wc -l < "$WORK/kicks")
@@ -291,6 +343,81 @@ check "the Paper+Bungee duplicate is written only once" \
       "$(grep -c 'strangerpass' "$AUTH_LOG")" "1"
 
 # --------------------------------------------------------------------------- #
+# --------------------------------------------------------------------------- #
+echo "== 4b. everybody may join; only a real, secret brand counts as verified =="
+check "start.sh ships with enforcement OFF (everybody can join)" \
+      "$(grep -c '^ENFORCE_VERIFIED_CLIENT=false' "$ROOT/start.sh")" "1"
+check "…and the kick switch is still there for later" \
+      "$(grep -c '^ENFORCE_VERIFIED_CLIENT=' "$ROOT/start.sh")" "1"
+
+: > "$WORK/kicks"
+ENFORCE_VERIFIED_CLIENT=false
+enforce_client_policy Somebody UNVERIFIED
+enforce_client_policy Somebody VANILLA
+enforce_client_policy Somebody UNKNOWN
+check "with enforcement off nobody is kicked, whatever client they use" \
+      "$(wc -l < "$WORK/kicks" | tr -d ' ')" "0"
+
+ENFORCE_VERIFIED_CLIENT=true
+enforce_client_policy Somebody UNVERIFIED
+check "turning it on still kicks (the switch works both ways)" \
+      "$(grep -c 'kick Somebody' "$WORK/kicks")" "1"
+ENFORCE_VERIFIED_CLIENT=false
+: > "$WORK/kicks"
+
+# a brand that was committed to this (public) repo can be copied by anybody,
+# so it must not be treated as the verified client any more
+ENFORCE_VERIFIED_CLIENT=true
+for pair in "Eaglercraft[VER]" "EaglercraftX[V2]"; do
+    VERIFIED_CLIENT_BRAND="$pair"
+    VERIFIED_CLIENT_UUID=$(python3 "$ROOT/tools/patch_verified_client.py" --print-uuid --brand "$pair" |
+                           sed -n 's/^brandUUID *: *//p')
+    VERIFIED_CLIENT_CONFIGURED=true
+    VERIFIED_CLIENT_PUBLISHED=false
+    for _p in $PUBLISHED_CLIENT_BRANDS; do
+        if [ "$VERIFIED_CLIENT_BRAND" = "${_p%%|*}" ] || [ "$VERIFIED_CLIENT_UUID" = "${_p##*|}" ]; then
+            VERIFIED_CLIENT_PUBLISHED=true
+        fi
+    done
+    check "a public brand ($pair) is recognised as public" "$VERIFIED_CLIENT_PUBLISHED" "true"
+    brand_answer "$pair" "$VERIFIED_CLIENT_UUID"
+    check "…and even when configured it is NOT verified" \
+          "$(query_client_brand PublicGuy | cut -d'|' -f1)" "UNVERIFIED"
+    check "…and the boot log explains it" \
+          "$(grep -c 'PUBLIC BRAND' <<<"$(verified_client_problem)")" "1"
+done
+
+# an unconfigured server must not pretend anything is verified
+VERIFIED_CLIENT_BRAND=""; VERIFIED_CLIENT_UUID=""
+VERIFIED_CLIENT_CONFIGURED=false; VERIFIED_CLIENT_PUBLISHED=false
+check "without a configured pair the boot log says so" \
+      "$(grep -c 'NOT CONFIGURED' <<<"$(verified_client_problem)")" "1"
+
+# ... and then no password is attributed: everything is masked in auth.log
+: > "$AUTH_LOG"; : > "$AUTH_SEEN"; : > "$PENDING_AUTH"; : > "$VERDICT_CACHE"
+record_ip Somebody 9.9.9.9 paper
+mask_cmd Somebody "/login hunter2" UNKNOWN > /dev/null
+check "unconfigured: the password is not written in clear" "$(grep -c 'hunter2' "$AUTH_LOG")" "0"
+check "…but the command is still recorded (masked)" "$(grep -c '| /login \*\*\*\*\*\*\*\* |' "$AUTH_LOG")" "1"
+check "…and marked as unconfigured" "$(grep -c 'client=UNCONFIGURED' "$AUTH_LOG")" "1"
+printf '%s\t%s\t%s\n' "$(date +%s)" QueuedGuy "/login queuedpw" >> "$PENDING_AUTH"
+set_verdict QueuedGuy UNVERIFIED
+flush_pending_auth
+check "…and a command queued earlier is masked too" \
+      "$(grep -c '| QueuedGuy | .* | /login \*\*\*\*\*\*\*\* | client=UNCONFIGURED' "$AUTH_LOG")" "1"
+check "…still without the password" "$(grep -c 'queuedpw' "$AUTH_LOG")" "0"
+
+# back to the normal test configuration
+export VERIFIED_CLIENT_BRAND="TestBrand[...]"
+export VERIFIED_CLIENT_UUID="$(python3 "$ROOT/tools/patch_verified_client.py" \
+        --print-uuid --brand "TestBrand[...]" | sed -n 's/^brandUUID *: *//p')"
+export VERIFIED_CLIENT_CONFIGURED=true
+export VERIFIED_CLIENT_PUBLISHED=false
+PUBLISHED_CLIENT_BRANDS=$(sed -n 's/^PUBLISHED_CLIENT_BRANDS="\(.*\)"$/\1/p' "$ROOT/start.sh")
+export PUBLISHED_CLIENT_BRANDS
+ENFORCE_VERIFIED_CLIENT=true
+: > "$WORK/kicks"
+
 echo "== 5. reports =="
 report_shared_ips
 check "the synced shared-IP report hides the verified client's IP" \
