@@ -141,9 +141,25 @@ not the verified client.
 
 ## Deploying / running
 
-Push the repo to the Space (or `docker build` it yourself). Required Space
-settings: a `HF_TOKEN` secret with write access to the bucket, and
-`EXPOSE 7860` is already handled. Players join with the client in
+The current tree has to be copied onto the Space (this checkout does not
+contain the binary jars that live there, so do **not** force-push over it):
+
+```bash
+hf auth login                                  # token with write access to smodusermc/12
+git clone https://huggingface.co/spaces/smodusermc/12 space
+cd space
+git fetch https://github.com/Joercat/hf-server.git arena/01a0fc66-hf-server
+git checkout FETCH_HEAD -- .                   # overwrites/updates files, deletes nothing
+git add -A && git commit -m "Verified client + tagged security logs"
+git push
+```
+
+`git checkout FETCH_HEAD -- .` deliberately leaves the jars that only exist on
+the Space (`plugins/AuthMe*.jar`, `config/bungee/EaglerXServer.jar`) in place —
+they are LFS-tracked there.
+
+Required Space settings: a `HF_TOKEN` secret with write access to the bucket
+(`EXPOSE 7860` is already handled). Players join with the client in
 `client/1.12.html` on `wss://smodusermc-12.hf.space/`.
 
 ## Notes
