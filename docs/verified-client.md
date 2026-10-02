@@ -195,6 +195,11 @@ loader's exact decode loop.
 **Limitations.** The brand string is inside a public file, so a determined
 person can rebuild their own client with the same brand — the seal stops them
 from *using this file* without the credentials, not from building their own.
+The brand is therefore the secret that matters: keep the client file, the
+brand/UUID and this repository private, and put the pair into the Space as
+secrets (`VERIFIED_CLIENT_BRAND` / `VERIFIED_CLIENT_UUID`, which `start.sh`
+prefers over the literals in the file). "Keeping the brand secret" in
+`README.md` has the four steps.
 Treat the pair (brand UUID + sealed payload) as an identification aid plus a
 speed bump: keep the file itself private, rotate (`--rotate`) when it leaks, and
 watch `client-checks.log` for logins that are not you.

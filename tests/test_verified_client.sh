@@ -28,7 +28,8 @@ check_at_least(){ if [ "${2:-0}" -ge "${3:-1}" ] 2>/dev/null; then ok "$1"; else
 
 # --------------------------------------------------------------------------- #
 echo "== 1. client <-> start.sh consistency =="
-EXPECTED_UUID=$(grep -oP '^VERIFIED_CLIENT_UUID="\K[^"]+' "$ROOT/start.sh")
+# the literal may be an override ("${VERIFIED_CLIENT_UUID:-<uuid>}") or plain
+EXPECTED_UUID=$(grep -oP '^VERIFIED_CLIENT_UUID="(\$\{VERIFIED_CLIENT_UUID:-)?\K[^"}]+' "$ROOT/start.sh")
 CLIENT_INFO=$(python3 "$ROOT/tools/patch_verified_client.py" --check "$ROOT/client/1.12.html" 2>&1)
 CLIENT_UUID=$(sed -n 's/.*brandUUID *: *//p' <<<"$CLIENT_INFO" | head -1)
 CLIENT_BRAND=$(sed -n "s/.*brand *: *'\(.*\)'.*/\1/p" <<<"$CLIENT_INFO" | head -1)

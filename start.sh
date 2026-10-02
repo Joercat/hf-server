@@ -122,8 +122,12 @@ OP_USERNAME="CreppyBitch"
 # the server only accepts the brand+UUID pair below, so the old file is just
 # another unrecognised client now. To revoke this one too and hand out a fresh
 # client:  python3 tools/patch_verified_client.py --rotate ...
-VERIFIED_CLIENT_BRAND="EaglercraftX[V2]"
-VERIFIED_CLIENT_UUID="355d0b9f-14ce-359f-8c9f-97cc1a7c92ca"
+# Both can be overridden from the Space: give the Space the *secrets*
+# VERIFIED_CLIENT_BRAND / VERIFIED_CLIENT_UUID and the values below (which are
+# readable in this repo) are ignored. That is how you keep the brand out of any
+# public place - see "Keeping the brand secret" in README.md.
+VERIFIED_CLIENT_BRAND="${VERIFIED_CLIENT_BRAND:-EaglercraftX[V2]}"
+VERIFIED_CLIENT_UUID="${VERIFIED_CLIENT_UUID:-355d0b9f-14ce-359f-8c9f-97cc1a7c92ca}"
 # The gate inside the client is what makes the file useless without the
 # credentials (the EPW payload is sealed), so the server cannot check it - it
 # checks the brand above. Change the gate password by rebuilding the client.

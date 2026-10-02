@@ -365,6 +365,36 @@ account. It lists one line per account/address/source:
 Placeholders (`unknown`, `hidden`) are never treated as an address, which is
 what used to make unrelated accounts look like they shared one.
 
+### Keeping the brand secret (optional, but read this)
+
+The brand UUID is the only thing the server checks, and the brand string is
+inside the client file. Two things follow:
+
+* anybody who *has* your client file and knows the credentials can play — that
+  is the point;
+* anybody who knows the **brand string** does not need your file at all: they
+  can build their own client with the same brand (the patcher is in this repo)
+  and walk in.
+
+So "only the verified client" really means "only people who know the brand".
+This repository is public, and `start.sh` shipped the brand in plain text, so
+treat the current pair as public. To make it private again:
+
+1. rotate: `python3 tools/patch_verified_client.py client/1.12.html --rotate`
+   (new random brand, new UUID, new credentials) — this also prints the two
+   values to paste;
+2. give the Space the pair as **secrets** (Space → Settings → Variables and
+   secrets): `VERIFIED_CLIENT_BRAND` and `VERIFIED_CLIENT_UUID`. `start.sh`
+   prefers them over the literals in the file, so nothing public needs to
+   change after that;
+3. keep the rotated client out of git (`.gitignore` it or keep the repo
+   private) and hand it out from the bucket;
+4. put the old brand into `REVOKED_BRANDS` in the patcher so it can never be
+   reused.
+
+Without step 1 the pair is already published, so nobody can be locked out by
+rotating later — old clients simply stop matching, exactly like V1 did.
+
 ## What actually has to go into the Space
 
 **Two files**, everything else in this repo is for development:
