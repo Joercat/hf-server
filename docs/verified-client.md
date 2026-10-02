@@ -44,11 +44,61 @@ The same check for the other official brands proves the algorithm:
 
 So: **change the brand string → change the UUID the client sends.**
 
-The patched client in this repo uses `Eaglercraft[VER]`:
+The client in this repo is **V2** and uses `EaglercraftX[V2]`:
 
 ```
-EaglercraftXClient:Eaglercraft[VER]  ->  51b2ebf3-ddab-35e7-8646-94f7bcbfd7ff
+EaglercraftXClient:EaglercraftX[V2]  ->  355d0b9f-14ce-359f-8c9f-97cc1a7c92ca
 ```
+
+| client | brand | UUID | state |
+| --- | --- | --- | --- |
+| V1 | `Eaglercraft[VER]` | `51b2ebf3-ddab-35e7-8646-94f7bcbfd7ff` | **revoked** — `start.sh` no longer matches it, so it is kicked like any unknown client |
+| stock | `Eaglercraft 1.12` | `522b2ce5-c9b9-36cf-be7c-5d90f55e631a` | never allowed while enforcement is on |
+
+Revoking V1 was a one-line change: `VERIFIED_CLIENT_BRAND`/`VERIFIED_CLIENT_UUID`
+in `start.sh` point at the new pair, and the comparison
+(`query_client_brand()` → `uuid == $VERIFIED_CLIENT_UUID || brand == $VERIFIED_CLIENT_BRAND`)
+simply stops matching. Nothing in the old file can restore it — the server does
+not care what the file contains, only what brand UUID arrives during the
+handshake.
+
+### The login gate (V2 and later)
+
+V2 does not boot until a username and a password are entered. The part that
+makes that real — rather than a screen somebody can skip — is *where the game
+payload lives*: the EPW is **sealed with AES-256-GCM** and stored as
+`window.__verSealed = "<base64>"` in the page. The key is derived in the browser
+from the credentials with PBKDF2-SHA512 (1,200,000 iterations, random salt +
+random IV, both stored next to the ciphertext):
+
+```
+key        = PBKDF2-SHA512(password = user + "\u0000" + pass, salt, 1200000, 32)
+plaintext  = AES-256-GCM-open(key, iv, sealed)      ->  the EPW container
+```
+
+The gate runs *before* the client's bootstrap: it replaces `window.main` (the
+only thing that starts the game) with itself, so
+
+* `main()` before the login does nothing at all — there is no plaintext EPW in
+  the page to boot from, and the file's own `assetsURI` is gone;
+* wrong username **and** wrong password are both rejected, and the failure
+  counter locks the form for 30 s after five attempts;
+* on success the EPW is decrypted, checked for the `EAG$` magic, turned into a
+  `data:` URI with `FileReader`, `main()` is called and the gate removes itself
+  and the splash screen.
+
+What this does and does not give you:
+
+* somebody who has the file **cannot play without the credentials** — they
+  would have to break PBKDF2-SHA512 (1.2 M iterations) or brute-force the
+  password; patching the gate script out does not help, because the payload in
+  their copy is still sealed;
+* the credentials are never written into the file: rebuilding with
+  `--gate-user/--gate-pass` derives a fresh salt, and `--check`/the verifier
+  assert that neither string appears in the file;
+* it is still client-side: a copy of the *decrypted* EPW can be shared, and the
+  server cannot see the gate at all (it only sees the brand UUID, which is why
+  revocation stays possible). Change the credentials by rebuilding/rotating.
 
 ---
 
@@ -143,9 +193,11 @@ validates the result with `decompress_component()` — a re-implementation of th
 loader's exact decode loop.
 
 **Limitations.** The brand string is inside a public file, so a determined
-person can rebuild their own client with the same brand. This system is an
-identification aid ("is this the client I handed out?"), not an anti-cheat or
-DRM mechanism.
+person can rebuild their own client with the same brand — the seal stops them
+from *using this file* without the credentials, not from building their own.
+Treat the pair (brand UUID + sealed payload) as an identification aid plus a
+speed bump: keep the file itself private, rotate (`--rotate`) when it leaks, and
+watch `client-checks.log` for logins that are not you.
 
 ---
 
@@ -167,9 +219,9 @@ DRM mechanism.
    on the proxy console and reads the answer back out of `/tmp/bungee.log`:
 
    ```
-   Eagler Client Brand: Eaglercraft[VER]
+   Eagler Client Brand: EaglercraftX[V2]
    Eagler Client Version: u2
-   Eagler Client UUID: 51b2ebf3-ddab-35e7-8646-94f7bcbfd7ff
+   Eagler Client UUID: 355d0b9f-14ce-359f-8c9f-97cc1a7c92ca
    Minecraft Client Brand: EaglercraftX
    ```
 
@@ -204,9 +256,35 @@ DRM mechanism.
    `/changepassword`, `/changepass`, `/unregister` and `/authme` are masked in
    `commands.log` and kept in full in `private-logs/auth.log`. The verified
    client's own commands are the one exception: your password is never written
-   anywhere. Commands are queued for a moment when needed, so the verdict is
-   always known before the line is written, and the same command seen twice
-   (Paper and Bungee) is written once.
+   anywhere — its row there is
+
+   ```
+   DATE | <name> | hidden | /login ******** | client=VERIFIED CLIENT (password not recorded)
+   ```
+
+   i.e. the file still shows that a `/login` happened and still proves the
+   capture path works, without storing the password and without exposing your
+   IP. (Without that row `auth.log` would look dead while everything works,
+   because under enforcement nobody else ever gets the chance to type one.)
+   Commands are queued for a moment when needed, so the verdict is always known
+   before the line is written, and the same command seen twice (Paper and
+   Bungee) is written once.
+8. **IPs**: the login line carries whatever address the game sees. Behind the
+   Hugging Face ingress that is the proxy, so `listeners.yml` is written with
+   `forward_ip` + `forward_ip_header` — and because the plugin disconnects
+   connections *without* that header, the header is proven first: `start.sh`
+   probes each candidate through the public URL after startup, keeps the first
+   one that both completes the upgrade and does not produce the plugin's
+   "Connected without … header, disconnecting" line, and remembers it in
+   `private-logs/forward-ip.state` (synced to the bucket). See the "IPs"
+   section in `README.md`. The per-account result is written to
+   `security-logs/ip-report.log` (and, with your own addresses included, to
+   `private-logs/ip-report-private.log`).
+9. **Logger status**: `security-logs/logger-status.log` is refreshed every
+   `LOG_STATUS_INTERVAL` (60) s: line counts, the login/logout counters, the
+   last RCON `list` answer, the current `forward_ip` setting and the last few
+   raw console lines the parsers see. "It is not logging logins" can be
+   answered from the bucket with that file alone.
 
 ## 7. Getting the logs out of the Space
 
@@ -260,7 +338,8 @@ using eaglercraft!`) become `VANILLA`; no answer at all becomes `UNKNOWN`, never
 
 * reads `VERIFIED_CLIENT_UUID` out of `start.sh`,
 * extracts the real brand UUID out of `client/1.12.html` (`--check`),
-* asserts they are equal, and that the stock client's UUID is *not* accepted;
+* asserts they are equal, and that neither the stock client's UUID nor the
+  revoked V1 brand (`Eaglercraft[VER]`) is accepted any more;
 * extracts the detection functions from `start.sh` and drives them against a
   fake BungeeCord console, asserting `VERIFIED` / `UNVERIFIED` / `VANILLA` /
   `CONSOLE_DOWN` classifications and the login flow;
@@ -277,10 +356,31 @@ using eaglercraft!`) become `VANILLA`; no answer at all becomes `UNKNOWN`, never
 * asserts that the script's own injected console commands are not logged as
   player commands, and that the private report keeps the real IPs the synced
   report hides;
-* **boots the client's own `loader.wasm`** against `client/1.12.html` in Node
-  (`tools/run_epw_loader.mjs`) and requires `LOADER VERDICT: OK`, plus a
-  negative control (a corrupted CRC must be rejected) — this is the check that
-  catches the "EPW file is invalid / Try again later" class of bugs;
+* **runs the real login gate and boots the client's own `loader.wasm`**: with
+  `VER_CLIENT_USER`/`VER_CLIENT_PASS` set it calls
+  `tools/verify_gated_client.mjs` (no boot before the login, wrong username and
+  wrong password rejected, the payload unseals and the file's own loader accepts
+  it, plaintext credentials absent from the file), then boots
+  `tools/run_epw_loader.mjs` against the unsealed container and requires
+  `LOADER VERDICT: OK`, plus a negative control (a corrupted CRC must be
+  rejected) — this is the check that catches the "EPW file is invalid / Try
+  again later" class of bugs. Without the credentials it prints a clear
+  `skip -` line instead of pretending to pass;
+* asserts the owner's own `/login` shows up in `private-logs/auth.log` with the
+  password masked and the IP hidden (and that nobody's password is ever in a
+  log line it should not be in), so "auth.log is empty" cannot silently return;
+* asserts the IP bookkeeping: placeholders are never treated as an address, the
+  newest real address wins, every sighting keeps its source, the report lists
+  one line per account/address/source, and the synced report leaves the
+  owner's addresses out while the private one keeps them;
+* asserts the forwarded-IP discovery against a fake proxy: a header the plugin
+  refuses is *not* trusted even when the probe succeeds, a working header is
+  saved for the next boot, and no header working ends as `off` rather than as a
+  guess;
+* asserts the helper copies embedded in `start.sh` (`bucket_sync.py`,
+  `forward_ip_probe.py`) are byte-identical to `tools/` and still valid Python;
+* asserts `security-logs/logger-status.log` reports the counters, the last
+  RCON `list` answer and the raw console lines;
 * asserts the tool enforces the loader's 32 MiB dictionary limit;
 * logs a login from every console format the server might use (modern Paper,
   old Paper, bare, proxy-only) and only once when several report it;
@@ -293,9 +393,13 @@ using eaglercraft!`) become `VANILLA`; no answer at all becomes `UNKNOWN`, never
 Run it after any change:
 
 ```bash
-bash tests/test_verified_client.sh               # 124 checks
+bash tests/test_verified_client.sh               # 171 checks
+VER_CLIENT_USER=<user> VER_CLIENT_PASS=<password> \
+    bash tests/test_verified_client.sh           # 183 checks (adds the boot test)
 PRINT_LOGS=1 bash tests/test_verified_client.sh  # …and dump the logs it built
-node tools/run_epw_loader.mjs client/1.12.html   # just boot the client's loader
+
+# just the client: gate + loader (prints every check it made)
+node tools/verify_gated_client.mjs client/1.12.html --user <user> --pass <password>
 ```
 
 ---
@@ -303,13 +407,32 @@ node tools/run_epw_loader.mjs client/1.12.html   # just boot the client's loader
 ## 6. Changing the marker
 
 ```bash
+# rotate: new random brand, new UUID and new login credentials in one go
+python3 tools/patch_verified_client.py client/1.12.html --rotate
+
+# or pick the brand yourself (must be exactly 16 ASCII characters)
 python3 tools/patch_verified_client.py client/1.12.html --brand "Something16Chars"
-# -> prints the new brandUUID
-# put it into start.sh:
-#   VERIFIED_CLIENT_BRAND="Something16Chars"
-#   VERIFIED_CLIENT_UUID="<printed uuid>"
-bash tests/test_verified_client.sh   # must pass
 ```
+
+Both print the new brand UUID. Either way, put the pair into `start.sh` —
+`--rotate` prints the two lines to paste — and add the *old* brand to the
+`REVOKED_BRANDS` list in `tools/patch_verified_client.py`, which is what keeps a
+future build from reusing a burned name:
+
+```
+VERIFIED_CLIENT_BRAND="Something16Chars"
+VERIFIED_CLIENT_UUID="<printed uuid>"
+```
+
+Then hand out the new file (or put it in the bucket) and run:
+
+```bash
+VER_CLIENT_USER=<user> VER_CLIENT_PASS=<password> bash tests/test_verified_client.sh
+```
+
+The old client stops being accepted the moment the Space runs the new value —
+it is not "blocked", it simply stops matching, which is the one thing a copy of
+the old file cannot undo.
 
 Note that the brand also shows up in the client's main menu and in the F3 debug
 screen (`Minecraft 1.12.2 (<brand> u2)`), which is a handy way for players to

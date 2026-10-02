@@ -32,7 +32,9 @@ pull logs                  # raw paper.log / bungee.log, if they are synced
 echo
 for f in security-logs/logins.log security-logs/commands.log \
          security-logs/client-checks.log security-logs/shared-ips.txt \
-         private-logs/auth.log private-logs/player-ips.log; do
+         security-logs/ip-report.log security-logs/logger-status.log \
+         private-logs/auth.log private-logs/player-ips.log \
+         private-logs/ip-report-private.log private-logs/logins-real-ips.log; do
     [ -s "$OUT/$f" ] && printf ' %-45s %s lines\n' "$f" "$(wc -l < "$OUT/$f")"
 done
 
@@ -42,5 +44,7 @@ Read them with, for example:
   grep 'OTHER EAGLERCRAFT CLIENT' $OUT/security-logs/logins.log   # who else logged in
   tail -n 50 $OUT/security-logs/commands.log                      # last commands
   cat $OUT/private-logs/auth.log                                  # /login lines in full
+  cat $OUT/security-logs/ip-report.log                           # every IP per account
+  cat $OUT/security-logs/logger-status.log                       # is the logger seeing joins?
   cat $OUT/private-logs/player-ips.log                            # IPs behind "hidden"
 EOF

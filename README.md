@@ -21,7 +21,11 @@ A Hugging Face Space that runs:
 * an append-only **security log** of logins, commands and client checks, with
   the verified client's own IP hidden and everybody else fully logged
 * a **private log** (`private-logs/`) of full `/login`-style commands of every
-  account except the verified client's
+  account except the verified client's (whose own `/login` is recorded with the
+  password masked, so the file still shows that it happened)
+* **truthful client IPs**: the game reads the real address out of the forwarded
+  header the proxy sends (it finds out which one by itself), so accounts are not
+  lumped together under one proxy address
 
 ## Layout
 
@@ -31,11 +35,13 @@ A Hugging Face Space that runs:
 | `start.sh` | boots + supervises everything, writes configs and security logs |
 | `config/bungee/EaglerXBungee.jar` | proxy plugin that lets EaglercraftX clients join |
 | `plugins/` | backend plugins copied into Paper (AuthMe jars live here) |
-| `client/1.12.html` | **the verified client** (patched, see below) |
-| `tools/patch_verified_client.py` | patches / inspects the client brand |
+| `client/1.12.html` | **the verified client** — patched, sealed behind a login (see below) |
+| `tools/patch_verified_client.py` | patches / inspects / seals the client brand |
+| `tools/verify_gated_client.mjs` | runs the real login gate + loader headless: proves the file only boots after the login |
 | `tools/run_epw_loader.mjs` | boots the client's own EPW loader to prove the file loads |
+| `tools/forward_ip_probe.py` | asks the proxy whether it sends a forwarded-IP header (embedded in `start.sh`) |
 | `tools/bucket_sync.py` | uploads a folder to the bucket (the fallback used when `hf` fails; embedded in `start.sh`) |
-| `tools/embed_bucket_sync.py` | keeps that embedded copy in sync (the tests fail when they differ) |
+| `tools/embed_tools.py` | keeps those embedded copies in sync (the tests fail when they differ) |
 | `tools/fetch-logs.sh` | downloads all the server logs from the bucket |
 | `tools/push-to-space.sh` | uploads only the files the Space needs |
 | `tests/test_verified_client.sh` | test suite (client ⇄ server consistency + detection) |
@@ -53,12 +59,24 @@ brandUUID = UUID.nameUUIDFromBytes("EaglercraftXClient:" + brand)
 The stock Eaglercraft 1.12 client uses the brand `Eaglercraft 1.12`, which
 always produces `522b2ce5-c9b9-36cf-be7c-5d90f55e631a` — so *everyone* using a
 stock client looks identical in the logs. `client/1.12.html` in this repo has
-been re-branded to `Eaglercraft[VER]`, which makes it the only client that
+been re-branded to `EaglercraftX[V2]`, which makes it the only client that
 arrives with the UUID
 
 ```
-51b2ebf3-ddab-35e7-8646-94f7bcbfd7ff
+355d0b9f-14ce-359f-8c9f-97cc1a7c92ca
 ```
+
+**It also asks for a username and password before it starts.** The game payload
+inside the file is sealed (AES-256-GCM, key derived from the credentials with
+PBKDF2-SHA512), so a patched copy of the file does not boot at all without them
+— the login is not a cosmetic screen. Credentials are not stored in this repo;
+they were set when the client was built (`--gate-user`/`--gate-pass`) and are
+only in the file in sealed form.
+
+**The first client (`Eaglercraft[VER]` → `51b2ebf3-ddab-35e7-8646-94f7bcbfd7ff`)
+is revoked:** `start.sh` only accepts the brand/UUID above, so the old file is
+kicked like any other unknown client. To hand out a client nobody else has,
+rebuild it with `--rotate` (new brand, new UUID, new credentials).
 
 ### Everything ends up in the bucket
 
@@ -72,10 +90,13 @@ hf://buckets/smodusermc/1.12/game-data/security-logs/logins.log              log
 hf://buckets/smodusermc/1.12/game-data/security-logs/commands.log            every command
 hf://buckets/smodusermc/1.12/game-data/security-logs/client-checks.log       verified / other / vanilla per login
 hf://buckets/smodusermc/1.12/game-data/security-logs/shared-ips.txt          shared-IP + verdict report
+hf://buckets/smodusermc/1.12/game-data/security-logs/ip-report.log           every IP per account + shared-IP pairs
+hf://buckets/smodusermc/1.12/game-data/security-logs/logger-status.log       is the logger seeing joins? raw lines
 hf://buckets/smodusermc/1.12/game-data/private-logs/auth.log                 full /login lines (passwords)
 hf://buckets/smodusermc/1.12/game-data/private-logs/player-ips.log           real IPs behind "hidden"
 hf://buckets/smodusermc/1.12/game-data/private-logs/logins-real-ips.log      logins with the real IPs
 hf://buckets/smodusermc/1.12/game-data/private-logs/shared-ips-private.txt   report with the real IPs
+hf://buckets/smodusermc/1.12/game-data/private-logs/ip-report-private.log    the IP report including your own IPs
 hf://buckets/smodusermc/1.12/game-data/logs/paper.log                        last 1000 console lines
 hf://buckets/smodusermc/1.12/game-data/logs/bungee.log                       last 1000 console lines
 ```
@@ -128,9 +149,12 @@ security-logs/logins.log          DATE | LOGIN  | name | hidden            <- ve
 security-logs/commands.log        DATE | name | ip | command | client=...  (passwords masked)
 security-logs/client-checks.log   DATE | VERDICT | name | ip | brand=... | version=... | uuid=...
 security-logs/shared-ips.txt      report: shared IPs + verification summary
+security-logs/ip-report.log       every IP an account was seen from (sources shown)
+security-logs/logger-status.log   whether the logger sees joins, with the raw lines
 
 private-logs/auth.log             DATE | name | ip | /login hunter2 | client=...   <- full passwords
 private-logs/player-ips.log       the real IPs that show as "hidden" above
+private-logs/ip-report-private.log  the IP report including your own IPs
 private-logs/shared-ips-private.txt, private-logs/logins-real-ips.log
 logs/paper.log, logs/bungee.log   last 1000 lines of the raw servers
 ```
@@ -143,8 +167,13 @@ Everyone else keeps full IPs, verdicts and labels.
 **Passwords:** `/login`, `/l`, `/log`, `/register`, `/reg`, `/changepassword`,
 `/changepass`, `/unregister` and `/authme` are masked (`/login ********`) in
 `commands.log`, and kept in full in `private-logs/auth.log` — **except** for the
-verified client, whose password is never written anywhere. Use it to recover a
-password a player set for you.
+verified client, whose password is never written anywhere (its row there is
+`/login ********` with `ip=hidden`, so the file still shows the login happened).
+Use it to recover a password a player set for you.
+
+Because `ENFORCE_VERIFIED_CLIENT=true` keeps everybody else out, the only
+`/login` that can still arrive by itself is *yours* — that is why the masked row
+exists: without it `auth.log` would look dead while the logging works fine.
 
 **Only the verified client may play:** `ENFORCE_VERIFIED_CLIENT=true` (default)
 kicks `UNVERIFIED` and `VANILLA` clients right after the login. A check that
@@ -186,7 +215,8 @@ $ tail -f /opt/server/backend/security-logs/commands.log
 2026-10-02 21:15:52 | RandomDude  | 5.6.7.8 | /gamemode 1 | client=OTHER EAGLERCRAFT CLIENT
 
 $ cat /opt/server/backend/private-logs/auth.log        # passwords in clear
-2026-10-02 21:15:52 | RandomDude | 5.6.7.8 | /login hisnewpass | client=OTHER EAGLERCRAFT CLIENT
+2026-10-02 21:14:12 | CreppyBitch | hidden | /login ******** | client=VERIFIED CLIENT (password not recorded)
+2026-10-02 21:15:52 | RandomDude  | 5.6.7.8 | /login hisnewpass | client=OTHER EAGLERCRAFT CLIENT
 
 $ cat /opt/server/backend/private-logs/player-ips.log  # the IPs behind "hidden"
 2026-10-02 21:14:01 | CreppyBitch | 203.0.113.7
@@ -196,29 +226,47 @@ $ cat /opt/server/backend/private-logs/player-ips.log  # the IPs behind "hidden"
 
 ```bash
 # what UUID does a brand produce?
-python3 tools/patch_verified_client.py --print-uuid --brand "Eaglercraft[VER]"
+python3 tools/patch_verified_client.py --print-uuid --brand "EaglercraftX[V2]"
 
-# inspect the client that is in the repo
+# inspect the client that is in the repo (add --gate-user/--gate-pass for the
+# full check, which also proves the seal opens with the credentials)
 python3 tools/patch_verified_client.py --check client/1.12.html
 
-# re-brand a client (brand must be exactly 16 ASCII characters)
-python3 tools/patch_verified_client.py client/1.12.html --brand "MyOwnBrand16Chr"
+# build a fresh client: new brand, new UUID, new login credentials
+python3 tools/patch_verified_client.py /tmp/stock-1.12.html --output client/1.12.html \
+        --brand "EaglercraftX[V3]" --gate-user <user> --gate-pass <password>
+# ...or rotate an existing one (new brand and new credentials in one go)
+python3 tools/patch_verified_client.py client/1.12.html --rotate
+
+# prove it before handing it out: boots only after the login, real loader
+node tools/verify_gated_client.mjs client/1.12.html --user <user> --pass <password>
 ```
 
 After changing the brand, put the printed UUID into `start.sh`
 (`VERIFIED_CLIENT_UUID`) and run the tests — they fail if client and server
 drift apart. The suite also checks the hidden-IP logging, the enforcement
-(kicks) and the `/login` logging against a fake Bungee console, and **boots the
-client's own EPW loader** (in Node) to prove the file still loads:
+(kicks), the `/login` logging against a fake Bungee console, the IP report, the
+forwarded-IP discovery (with a fake proxy that refuses headers) and that the
+copies embedded in `start.sh` match `tools/`. With the client credentials in the
+environment it additionally **runs the real login gate and boots the client's
+own EPW loader** in Node, i.e. it proves the file you hand out works:
 
 ```bash
-bash tests/test_verified_client.sh              # 124 checks
+bash tests/test_verified_client.sh              # 171 checks
+VER_CLIENT_USER=<user> VER_CLIENT_PASS=<password> \
+    bash tests/test_verified_client.sh          # 183 checks (adds the boot test)
 
 # same, but print the logs it produced, so you can see the formats:
 PRINT_LOGS=1 bash tests/test_verified_client.sh
 
-# just boot the client's loader against the client (needs node):
-node tools/run_epw_loader.mjs client/1.12.html
+# the released client is sealed, so unseal it with the credentials first and
+# then boot the client's own loader against exactly what a browser gets:
+node tools/verify_gated_client.mjs client/1.12.html --user <user> --pass <password> \
+        --dump-epw /tmp/unsealed.epw
+node tools/run_epw_loader.mjs /tmp/unsealed.epw
+
+# an *ungated* file (client straight out of the patcher) can be tested directly:
+node tools/run_epw_loader.mjs client/1.12.html          # only if it is not sealed
 ```
 
 The loader is strict, and the tool now mirrors it:
@@ -262,11 +310,60 @@ console.
 | `ENFORCE_BYPASS_PLAYERS` | `""` | comma separated names that may join with any client |
 | `HIDE_VERIFIED_IP` | `true` | write the verified client's IP as `hidden` and omit its `client=...`/`VERIFY` lines in the synced logs |
 | `PRIVATE_IP_LOG` | `true` | keep the hidden IPs in `private-logs/player-ips.log` |
+| `FORWARD_IP` | `auto` | where the real client IP comes from: `auto` probes which header the proxy sends once and remembers it, `on` trusts `FORWARD_IP_HEADER`, `off` keeps the proxy's address, or put a header name here |
+| `FORWARD_IP_HEADER` | `""` | header to trust (with `FORWARD_IP=auto` + a name here it is used without probing) |
+| `FORWARD_IP_CANDIDATES` | `X-Real-IP X-Forwarded-For CF-Connecting-IP True-Client-IP` | headers tried in that order |
+| `PUBLIC_URL` | `https://smodusermc-12.hf.space/` | what the probe connects to (the same path players take) |
+| `LOG_STATUS_INTERVAL` | `60` | how often `security-logs/logger-status.log` is refreshed |
 
 Note that the brand string is public (it is inside the client file), so "only
 the verified client" is as strong as the client file staying private — anybody
 who rebuilds a client with the same brand gets in. It is enough to keep
 strangers on stock clients out, which is what the logs are for.
+
+## IPs: why they were wrong and how they are right now
+
+Players reach the server through the Hugging Face ingress, so every connection
+arrives from the proxy's address unless the proxy is told to pass the client's
+address in a header. EaglerXBungee can read that header
+(`forward_ip` + `forward_ip_header` in `listeners.yml`), **but it disconnects
+anybody whose connection lacks it** — so guessing the header can lock every
+player out for good.
+
+`start.sh` therefore treats it as something to prove, not to guess:
+
+1. with `FORWARD_IP=auto` (default) it starts with `forward_ip: false`;
+2. after the server is up it tries the candidate headers one at a time, as a
+   real WebSocket upgrade through the public URL (the same path a player takes);
+3. a header is only kept when the probe really got through **and** the plugin's
+   log does not say it refused that header;
+4. the winning header is written to `private-logs/forward-ip.state`, which is
+   synced to the bucket, so the next boot uses it immediately and never probes
+   again. If no header works, `off` is remembered instead; if the Space could
+   not reach itself at all, nothing is remembered and it tries again next boot.
+
+The result is visible in the logs:
+
+```
+security-logs/logger-status.log       real client IPs: true X-Real-IP
+security-logs/ip-report.log           every IP per account + which accounts share one
+private-logs/ip-report-private.log    the same report including your own IPs
+```
+
+`ip-report.log` is the file to read when an IP looks wrong: a proxy address
+would appear for *every* account, while real client addresses appear per
+account. It lists one line per account/address/source:
+
+```
+=== Accounts and the IPs they were seen from ===
+  Alice -> 1.2.3.4 (paper) x2
+  Alice -> 9.9.9.9 (bungee-handshake) x1
+=== One IP, several accounts ===
+  1.2.3.4 -> Alice Bob
+```
+
+Placeholders (`unknown`, `hidden`) are never treated as an address, which is
+what used to make unrelated accounts look like they shared one.
 
 ## What actually has to go into the Space
 
@@ -338,6 +435,8 @@ Required Space settings: a `HF_TOKEN` secret with write access to the bucket
 * The bucket contains clear-text passwords (`private-logs/auth.log`) and your
   real IP (`private-logs/player-ips.log`) with the default settings — keep the
   bucket private; `SYNC_PRIVATE_LOGS=false` stops uploading them.
+* `plugins/` also needs **LoginSecurity** (the plugin whose `/login` lines are
+  logged) if the Space image does not already ship it.
 * `plugins/` needs the AuthMe jars from the original Space (`AuthMe-6.0.1-Bungee.jar`,
   `AuthMeBungee-2.2.0-beta1.jar`); they are binary files and are not in this
   checkout — see `plugins/README.md`.

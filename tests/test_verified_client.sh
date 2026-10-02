@@ -47,6 +47,20 @@ else
     ok "stock client ($STOCK) is not the verified client"
 fi
 
+# ... and so must the retired first client, otherwise it would still be let in
+OLDCLIENT=$(python3 "$ROOT/tools/patch_verified_client.py" --print-uuid --brand "Eaglercraft[VER]" |
+            sed -n 's/^brandUUID *: *//p')
+if [ "$OLDCLIENT" = "$EXPECTED_UUID" ]; then
+    bad "the revoked client (Eaglercraft[VER]) must not be the verified one any more"
+else
+    ok "the revoked client (Eaglercraft[VER] -> $OLDCLIENT) is no longer verified"
+fi
+if [ "$CLIENT_BRAND" = "Eaglercraft[VER]" ]; then
+    bad "the released client must not use the revoked brand"
+else
+    ok "the released client uses the new brand ($CLIENT_BRAND)"
+fi
+
 # --------------------------------------------------------------------------- #
 echo "== 2. start.sh detection helpers =="
 WORK=$(mktemp -d)
@@ -65,7 +79,8 @@ export VERDICT_CACHE="$WORK/client-verdicts.txt"
 export PENDING_AUTH="$WORK/pending-auth.tsv"
 export AUTH_SEEN="$WORK/auth-seen.tsv"
 export PRIV_DIR="$WORK/private"
-mkdir -p "$PRIV_DIR"
+export SEC_DIR="$WORK/security"
+mkdir -p "$PRIV_DIR" "$SEC_DIR"
 export VERIFIED_CLIENT_BRAND="Eaglercraft[VER]"
 export VERIFIED_CLIENT_UUID="51b2ebf3-ddab-35e7-8646-94f7bcbfd7ff"
 export BUNGEE_CONSOLE="$FIFO"
@@ -82,6 +97,7 @@ export SYNC_CONSOLE_LOGS=false   # turned on in section 6
 export VERIFIED_CLIENT_KICK_MESSAGE="This server only allows the verified client."
 export ONLINE_STATE="$WORK/online-players.txt"
 export PLAYERLIST_POLL=1
+export SCRIPT_VERSION="test"
 export BUCKET_METHOD="auto"
 export BUCKET_SYNC_PY="$WORK/bucket_sync.py"
 export BUCKET_VIA=""
@@ -94,8 +110,13 @@ touch "$BLOG" "$CLIENT_LOG" "$LOGIN_LOG" "$CMD_LOG" "$AUTH_LOG" "$IP_MAP_FILE"
 extract() { awk "/^$1\(\) \{/,/^\}/" "$ROOT/start.sh"; }
 FUNCS="$WORK/funcs.sh"
 for f in strip_colours bungee_console bungee_alive query_client_brand check_player_client \
-         last_ip_for mask_cmd is_auth_cmd queue_auth auth_seen_recently record_auth_seen \
-         flush_pending_auth ip_field hide_ip_for client_field \
+         is_real_ip record_ip last_ip_for ips_for ip_report_body write_logger_status \
+         mask_cmd is_auth_cmd queue_auth auth_seen_recently record_auth_seen \
+         flush_pending_auth ip_field hide_ip_for client_field forward_ip_setting \
+         set_forward_ip_in_listeners read_forward_ip_state write_forward_ip_state \
+         forward_ip_start_line forward_ip_was_refused apply_forward_ip_choice \
+         bungee_restart discover_forward_ip_header forward_ip_probe_once \
+         write_forward_ip_probe_py ensure_forward_ip_probe_py \
          set_verdict verdict_for verdict_label is_bypassed enforce_client_policy \
          shared_report_body report_shared_ips hf_push_logs hf_push_saves \
          is_online mark_online mark_offline record_login record_logout \
@@ -382,17 +403,43 @@ check "nothing in the repo references a client file at runtime" \
       "$(grep -c '/opt/server/client' "$ROOT/start.sh" "$ROOT/Dockerfile" | grep -c ':0$')" "2"
 
 # --------------------------------------------------------------------------- #
-echo "== 8. the client really boots: its own EPW loader must accept the file =="
-if command -v node >/dev/null 2>&1; then
-    LOADER_OUT=$(node "$ROOT/tools/run_epw_loader.mjs" "$ROOT/client/1.12.html" 2>&1); LOADER_RC=$?
-    check "the client's own loader.wasm accepts the patched client" "$LOADER_RC" "0"
+echo "== 8. the client really boots (gate + its own EPW loader) =="
+# The client that ships is gated: its EPW is sealed and only unseals with the
+# credentials. Those are never stored in the repo, so this section runs the
+# full end-to-end check when they are supplied (VER_CLIENT_USER/VER_CLIENT_PASS)
+# and says so plainly when they are not - it must never look "passed" while
+# nothing was tested.
+if ! command -v node >/dev/null 2>&1; then
+    echo "  skip - node is not installed (cannot run the client's own EPW loader)"
+elif [ -z "${VER_CLIENT_USER:-}" ] || [ -z "${VER_CLIENT_PASS:-}" ]; then
+    echo "  skip - set VER_CLIENT_USER / VER_CLIENT_PASS to run the boot test"
+    echo "         node tools/verify_gated_client.mjs client/1.12.html --user U --pass P"
+else
+    UNSEALED="$WORK/unsealed.epw"
+    VERIFY_OUT=$(node "$ROOT/tools/verify_gated_client.mjs" "$ROOT/client/1.12.html" \
+                    --user "$VER_CLIENT_USER" --pass "$VER_CLIENT_PASS" \
+                    --dump-epw "$UNSEALED" 2>&1)
+    VERIFY_RC=$?
+    check "the gate + the client's own loader boot the released client" "$VERIFY_RC" "0"
+    check "…every end-to-end check passed" "$(grep -c 'ALL CHECKS PASSED' <<<"$VERIFY_OUT")" "1"
+    check "…no boot before the credentials are accepted" \
+          "$(grep -c 'the game does not boot before login' <<<"$VERIFY_OUT")" "1"
+    check "…the wrong username is rejected" "$(grep -c 'a wrong username is rejected' <<<"$VERIFY_OUT")" "1"
+    check "…the wrong password is rejected" "$(grep -c 'a wrong password is rejected' <<<"$VERIFY_OUT")" "1"
+    check "…plaintext credentials are not in the file" \
+          "$(grep -c 'the plaintext password is not in the file' <<<"$VERIFY_OUT")" "1"
+
+    # the unsealed container is what a player's browser ends up with: the
+    # client's own loader must still accept it
+    LOADER_OUT=$(node "$ROOT/tools/run_epw_loader.mjs" "$UNSEALED" 2>&1); LOADER_RC=$?
+    check "the unsealed EPW is accepted by the client's own loader.wasm" "$LOADER_RC" "0"
     check "…and reports success" "$(grep -c 'resultSuccess *: true' <<<"$LOADER_OUT")" "1"
     check "…after decompressing classes.wasm" \
           "$(grep -c 'Decompressing classes.wasm\.\.\.$' <<<"$LOADER_OUT")" "1"
     check "…and both asset EPKs" "$(grep -c 'Decompressing assets EPK' <<<"$LOADER_OUT")" "2"
 
     # negative control: a corrupted container must be rejected by the same test
-    node "$ROOT/tools/run_epw_loader.mjs" "$ROOT/client/1.12.html" --dump-epw "$WORK/epw.bin" >/dev/null 2>&1
+    cp "$UNSEALED" "$WORK/epw.bin"
     python3 - "$WORK/epw.bin" <<'PY'
 import struct, sys
 p = sys.argv[1]
@@ -403,8 +450,6 @@ PY
     BAD_OUT=$(node "$ROOT/tools/run_epw_loader.mjs" "$WORK/epw.bin" 2>&1); BAD_RC=$?
     check "a corrupted EPW is rejected by the same test" "$([ "$BAD_RC" -ne 0 ] && echo yes)" "yes"
     check "…with the loader's checksum error" "$(grep -c 'invalid checksum' <<<"$BAD_OUT")" "1"
-else
-    echo "  skip - node is not installed (cannot run the client's own EPW loader)"
 fi
 
 # the tool must know the loader's hard limits (this is what broke the first build:
@@ -450,7 +495,7 @@ handle_paper_line "[15:04:11] [Server thread/INFO]: ModernGuy[/10.0.0.1:5000] lo
 handle_paper_line "[15:04:11 INFO]: OldGuy[/10.0.0.4:5004] logged in with entity id 43 at (0.0, 0.0, 0.0)"
 check "a modern Paper login line is logged" "$(grep -c '| LOGIN | ModernGuy |' "$LOGIN_LOG")" "1"
 check "…and the IP is recorded (hidden in the row until the check resolves)" \
-      "$(grep -c '^ModernGuy	10\.0\.0\.1$' "$IP_MAP")" "1"
+      "$(grep -c '^ModernGuy	10\.0\.0\.1	paper	' "$IP_MAP")" "1"
 check "the older Paper format still works" "$(grep -c '| LOGIN | OldGuy |' "$LOGIN_LOG")" "1"
 
 # (b) no console prefix at all (other log backends / log formats)
@@ -463,7 +508,9 @@ check "the proxy handshake alone is not a login yet" "$(grep -c '| LOGIN | Proxy
 handle_bungee_line "[15:04:13 INFO] ProxyGuy[/10.0.0.3:5002] <-> ServerConnector [lobby] has connected"
 check "a proxy-only login is logged" "$(grep -c '| LOGIN | ProxyGuy |' "$LOGIN_LOG")" "1"
 check "…with the IP from the proxy" \
-      "$(grep '^ProxyGuy	10\.0\.0\.3$' "$IP_MAP" | sort -u | wc -l | tr -d ' ')" "1"
+      "$(awk -F'\t' '$1=="ProxyGuy"{print $2}' "$IP_MAP" | sort -u | wc -l | tr -d ' ')" "1"
+check "…and the handshake row says where it came from" \
+      "$(grep -c '^ProxyGuy	10\.0\.0\.3	bungee-handshake	' "$IP_MAP")" "1"
 
 # (d) the same join seen by everything stays one row
 handle_paper_line "[15:04:13] [Server thread/INFO]: ProxyGuy[/10.0.0.3:5002] logged in with entity id 9"
@@ -617,6 +664,252 @@ if [ "${PRINT_LOGS:-0}" = "1" ]; then
     echo "############ private-logs/player-ips.log   (the IPs hidden above)"
     sort -u "$IP_MAP_FILE"
 fi
+
+
+# --------------------------------------------------------------------------- #
+echo "== 11. the owner's own /login is recorded (masked) so auth.log fills =="
+: > "$AUTH_LOG"; : > "$AUTH_SEEN"; : > "$PENDING_AUTH"
+: > "$VERDICT_CACHE"; : > "$IP_MAP"
+set_verdict CreppyBitch VERIFIED
+printf '%s\t%s\n' CreppyBitch 1.2.3.4 >> "$IP_MAP"
+
+# (a) verdict already known - the masked row is written straight away
+mask_cmd CreppyBitch "/login hunter2" VERIFIED > /dev/null
+check "the owner's /login reaches auth.log" "$(grep -c '| CreppyBitch |' "$AUTH_LOG")" "1"
+check "…with the password masked" "$(grep -c '| /login \*\*\*\*\*\*\*\* |' "$AUTH_LOG")" "1"
+check "…and never in clear" "$(grep -c 'hunter2' "$AUTH_LOG")" "0"
+check "…with the IP hidden (auth.log is synced)" \
+      "$(grep -c '| CreppyBitch | hidden |' "$AUTH_LOG")" "1"
+check "…and it is marked as the verified client" \
+      "$(grep -c 'client=VERIFIED CLIENT (password not recorded)' "$AUTH_LOG")" "1"
+
+# (b) verdict still pending when the command is typed
+: > "$AUTH_LOG"; : > "$AUTH_SEEN"; : > "$PENDING_AUTH"
+mask_cmd CreppyBitch "/login swordfish" PENDING > /dev/null
+check "a pending /login waits in the queue" "$(wc -l < "$PENDING_AUTH" | tr -d ' ')" "1"
+set_verdict CreppyBitch VERIFIED
+flush_pending_auth
+check "…and is written (masked) once the verdict resolves" \
+      "$(grep -c '| /login \*\*\*\*\*\*\*\* |' "$AUTH_LOG")" "1"
+check "…without the password" "$(grep -c 'swordfish' "$AUTH_LOG")" "0"
+check "…and the queue is empty again" "$(wc -l < "$PENDING_AUTH" | tr -d ' ')" "0"
+
+# (c) somebody else's /login still keeps the full line (that is the point of it)
+record_ip Ghost 1.2.3.4 paper
+mask_cmd Ghost "/login hunter2" UNVERIFIED > /dev/null
+check "another player's /login is kept in full" "$(grep -c '| Ghost | 1.2.3.4 | /login hunter2 |' "$AUTH_LOG")" "1"
+
+# --------------------------------------------------------------------------- #
+echo "== 12. IPs are truthful =="
+: > "$IP_MAP"; : > "$IP_MAP_FILE"
+record_ip Alice 1.2.3.4 paper
+record_ip Alice 9.9.9.9 bungee-handshake
+record_ip Bob 1.2.3.4 paper
+record_ip Carol unknown "rcon list"
+record_ip Carol 5.5.5.5 paper
+check "a placeholder is not a real address" "$(is_real_ip unknown && echo yes || echo no)" "no"
+check "…and cannot overtake a real one" "$(last_ip_for Carol)" "5.5.5.5"
+check "the newest real address wins" "$(last_ip_for Alice)" "9.9.9.9"
+check "every sighting is kept with its source" \
+      "$(awk -F'\t' '$1=="Alice"{print $3}' "$IP_MAP" | sort | tr '\n' ',' )" "bungee-handshake,paper,"
+check "the private IP log lists them too" "$(grep -c 'Alice' "$IP_MAP_FILE")" "2"
+
+ip_report_body "$IP_MAP" "$SEC_DIR/ip-report.log" no
+check "the report names both Alice IPs, with where each came from" \
+      "$(grep -c '^  Alice -> 1.2.3.4 (paper) x1$' "$SEC_DIR/ip-report.log")$(grep -c '^  Alice -> 9.9.9.9 (bungee-handshake) x1$' "$SEC_DIR/ip-report.log")" "11"
+check "…and flags the account pair behind one IP" \
+      "$(grep -c '^  1.2.3.4 -> Alice Bob$' "$SEC_DIR/ip-report.log")" "1"
+check "…but never 'unknown' as an address" "$(grep -c 'unknown' "$SEC_DIR/ip-report.log")" "0"
+
+# the synced copy must not carry the owner's addresses
+: > "$IP_MAP"
+record_ip CreppyBitch 7.7.7.7 paper
+record_ip Alice 1.2.3.4 paper
+: > "$VERDICT_CACHE"; set_verdict CreppyBitch VERIFIED
+ip_report_body "$IP_MAP" "$SEC_DIR/ip-report.log" yes
+check "the synced IP report has the other players" "$(grep -c 'Alice' "$SEC_DIR/ip-report.log")" "1"
+check "…and not the owner" "$(grep -c 'CreppyBitch\|7\.7\.7\.7' "$SEC_DIR/ip-report.log")" "0"
+ip_report_body "$IP_MAP" "$PRIV_DIR/ip-report-private.log" no
+check "the private IP report still has the owner (that is how you check it)" \
+      "$(grep -c '^  CreppyBitch -> 7.7.7.7 (paper) x1$' "$PRIV_DIR/ip-report-private.log")" "1"
+check "an empty map still produces a report" \
+      "$( : > "$WORK/empty-map.tsv"; ip_report_body "$WORK/empty-map.tsv" "$WORK/empty-report.txt" no; grep -c 'no IPs recorded yet' "$WORK/empty-report.txt" )" \
+      "1"
+
+# --------------------------------------------------------------------------- #
+echo "== 13. real client IPs: the header is proven before it is trusted =="
+LISTENERS="$WORK/listeners.yml"
+cat > "$LISTENERS" <<'YML'
+listener_01:
+  address: 0.0.0.0:8081
+  forward_ip: false
+  forward_ip_header: X-Real-IP
+  default_server: default
+YML
+find_listeners_yml() { echo "$LISTENERS"; }
+FORWARD_IP_STATE="$WORK/forward-ip.state"
+FORWARD_IP_CANDIDATES="X-Real-IP X-Forwarded-For"
+PUBLIC_URL="http://localhost:1/"
+: > "$FORWARD_IP_STATE"
+
+set_forward_ip_in_listeners true X-Forwarded-For
+check "the header can be switched on" "$(sed -n 's/.*forward_ip: *//p' "$LISTENERS")" "true"
+check "…and the header name with it" "$(sed -n 's/.*forward_ip_header: *//p' "$LISTENERS")" "X-Forwarded-For"
+check "forward_ip_setting reads it back" "$(forward_ip_setting)" "true X-Forwarded-For"
+set_forward_ip_in_listeners false X-Real-IP
+check "…and back off" "$(forward_ip_setting)" "false X-Real-IP"
+
+# the plugin closes connections when the header is missing - the probe must
+# recognise that in the Bungee log, not just trust the exit code
+: > "$BLOG"
+printf '[INFO] Player[/1.2.3.4:5555] <-> InitialHandler has connected\n' >> "$BLOG"
+forward_ip_start_line
+printf '[INFO] Connected without X-Real-IP header, disconnecting...\n' >> "$BLOG"
+check "the plugin's refusal is recognised" "$(forward_ip_was_refused && echo yes || echo no)" "yes"
+forward_ip_start_line
+printf '[INFO] Player[/1.2.3.4:5555] <-> InitialHandler has connected\n' >> "$BLOG"
+check "…and a normal join is not mistaken for a refusal" "$(forward_ip_was_refused && echo yes || echo no)" "no"
+
+# a saved answer is used without probing
+echo "CF-Connecting-IP" > "$FORWARD_IP_STATE"
+FORWARD_IP=auto; FORWARD_IP_HEADER=""; FORWARD_IP_DECISION=""
+apply_forward_ip_choice
+check "a remembered header is applied on the next boot" "$(forward_ip_setting)" "true CF-Connecting-IP"
+check "…and nothing is probed again" "$FORWARD_IP_DECISION" ""
+
+# nothing worked last time -> stay on the safe setting
+echo "off" > "$FORWARD_IP_STATE"
+FORWARD_IP=auto; FORWARD_IP_HEADER=""; FORWARD_IP_DECISION=""
+apply_forward_ip_choice
+check "a known-bad header is not retried blindly" "$(forward_ip_setting)" "false X-Real-IP"
+check "…and the failure is remembered" "$(cat "$FORWARD_IP_STATE")" "off"
+
+# FORWARD_IP=off and =on are honoured
+FORWARD_IP=off; FORWARD_IP_HEADER=""; FORWARD_IP_DECISION=""
+apply_forward_ip_choice
+check "FORWARD_IP=off keeps the proxy address" "$(forward_ip_setting)" "false X-Real-IP"
+FORWARD_IP=on; FORWARD_IP_HEADER="X-Forwarded-For"; FORWARD_IP_DECISION=""
+apply_forward_ip_choice
+check "FORWARD_IP=on + a header name trusts it without a probe" "$(forward_ip_setting)" "true X-Forwarded-For"
+
+# the discovery loop. The fake proxy answers the probe and logs the plugin's own
+# refusal line at the moment of the connection, exactly like EaglerXBungee does.
+cat > "$WORK/fake-probe.py" <<'PY'
+import os, sys
+with open(os.environ.get("FAKE_PROBE_LOG", "/dev/null"), "a") as fh:
+    fh.write("probe\n")
+header = ""
+for line in open(os.environ.get("FAKE_LISTENERS", "/dev/null")).read().splitlines():
+    if "forward_ip_header:" in line:
+        header = line.split(":", 1)[1].strip()
+refused = header in os.environ.get("FAKE_REFUSE", "").split(",")
+if refused:
+    with open(os.environ["FAKE_BLOG"], "a") as fh:
+        fh.write("[INFO] Connected without %s header, disconnecting...\n" % header)
+sys.exit(0 if header and header == os.environ.get("FAKE_PROBE_ACCEPT", "") else 1)
+PY
+export FAKE_PROBE_LOG="$WORK/probe.log" FAKE_LISTENERS="$LISTENERS" FAKE_BLOG="$BLOG"
+FORWARD_IP_PROBE_PY="$WORK/fake-probe.py"
+bungee_restart() { : > "$BLOG"; return 0; }   # the stub proxy comes straight back
+
+# (a) no candidate works -> the safe setting stays and is remembered
+FAKE_PROBE_ACCEPT="NoSuchHeader"; FAKE_REFUSE=""; export FAKE_PROBE_ACCEPT FAKE_REFUSE
+: > "$FAKE_PROBE_LOG"; : > "$FORWARD_IP_STATE"
+FORWARD_IP=auto; FORWARD_IP_HEADER=""; FORWARD_IP_DECISION=""
+discover_forward_ip_header >/dev/null 2>&1
+check "every candidate was tried" "$(wc -l < "$FAKE_PROBE_LOG" | tr -d ' ')" "2"
+check "…none of them was trusted" "$(cat "$FORWARD_IP_STATE")" "off"
+check "…leaving the safe setting in place" "$(forward_ip_setting)" "false X-Real-IP"
+
+# (b) the proxy really sends the second one -> it is saved and used
+FAKE_PROBE_ACCEPT="X-Forwarded-For"; FAKE_REFUSE=""; export FAKE_PROBE_ACCEPT FAKE_REFUSE
+: > "$FAKE_PROBE_LOG"; : > "$FORWARD_IP_STATE"
+FORWARD_IP=auto; FORWARD_IP_HEADER=""; FORWARD_IP_DECISION=""
+discover_forward_ip_header >/dev/null 2>&1
+check "a header the proxy does send is saved" "$(cat "$FORWARD_IP_STATE")" "X-Forwarded-For"
+check "…and switched on for real" "$(forward_ip_setting)" "true X-Forwarded-For"
+check "…so it will not be probed again" "$FORWARD_IP_DECISION" "done"
+
+# (c) the probe answers, but the plugin refuses that header anyway: this is the
+# trap that would disconnect every player, so it must never be trusted
+FAKE_PROBE_ACCEPT="X-Real-IP"; FAKE_REFUSE="X-Real-IP"; export FAKE_PROBE_ACCEPT FAKE_REFUSE
+: > "$FAKE_PROBE_LOG"; : > "$FORWARD_IP_STATE"
+FORWARD_IP=auto; FORWARD_IP_HEADER=""; FORWARD_IP_DECISION=""
+discover_forward_ip_header >/dev/null 2>&1
+check "a header the plugin refuses is not trusted, even when the probe passes" \
+      "$(cat "$FORWARD_IP_STATE")" "off"
+check "…and the listeners file is left safe" "$(forward_ip_setting)" "false X-Real-IP"
+
+# --------------------------------------------------------------------------- #
+echo "== 14. the tools embedded in start.sh cannot drift from tools/ =="
+python3 - "$ROOT" <<'PY'
+import pathlib, sys
+root = pathlib.Path(sys.argv[1])
+s = (root / "start.sh").read_text()
+def extract(marker):
+    tag = "<<'%s'\n" % marker
+    i = s.index(tag) + len(tag)
+    j = s.index("\n%s\n" % marker, i)
+    return s[i:j] + "\n"
+bad = []
+for name, marker in [("bucket_sync.py", "BUCKET_SYNC_PY_EOF"),
+                     ("forward_ip_probe.py", "FORWARD_IP_PROBE_EOF")]:
+    if extract(marker) != (root / "tools" / name).read_text():
+        bad.append(name)
+print("MISMATCH:" + ",".join(bad) if bad else "OK")
+PY
+check "bucket_sync.py + forward_ip_probe.py in start.sh match tools/" \
+      "$(python3 - "$ROOT" <<'PY'
+import pathlib, sys
+root = pathlib.Path(sys.argv[1])
+s = (root / "start.sh").read_text()
+def extract(marker):
+    tag = "<<'%s'\n" % marker
+    i = s.index(tag) + len(tag)
+    j = s.index("\n%s\n" % marker, i)
+    return s[i:j] + "\n"
+bad = [n for n, m in [("bucket_sync.py", "BUCKET_SYNC_PY_EOF"),
+                      ("forward_ip_probe.py", "FORWARD_IP_PROBE_EOF")]
+       if extract(m) != (root / "tools" / n).read_text()]
+print("MISMATCH:" + ",".join(bad) if bad else "OK")
+PY
+)" "OK"
+check "the embedded probe is valid Python" \
+      "$(python3 - "$ROOT" <<'PY'
+import pathlib, sys
+root = pathlib.Path(sys.argv[1])
+s = (root / "start.sh").read_text()
+tag = "<<'FORWARD_IP_PROBE_EOF'\n"
+i = s.index(tag) + len(tag)
+j = s.index("\nFORWARD_IP_PROBE_EOF\n", i)
+src = s[i:j] + "\n"
+try:
+    compile(src, "probe", "exec")
+    print("OK")
+except SyntaxError as e:
+    print("SYNTAX:" + str(e))
+PY
+)" "OK"
+
+# --------------------------------------------------------------------------- #
+echo "== 15. logger status says why a log may be empty =="
+BLOG="$WORK/bungee.log"
+export ONLINE_STATE="$WORK/online-state.txt"
+printf 'Alice\n' > "$ONLINE_STATE"
+printf '[12:00:00 INFO]: Alice[/1.2.3.4:5555] logged in with entity id 42\n' > /tmp/paper.log
+printf '[12:00:01 INFO] Alice[/1.2.3.4:5555] <-> InitialHandler has connected\n' > "$BLOG"
+printf '%s | LOGIN | Alice | 1.2.3.4\n' "$(date '+%F %T')" > "$LOGIN_LOG"
+printf 'x | Alice | 1.2.3.4 | /login pw | client=OTHER EAGLERCRAFT CLIENT\n' >> "$CMD_LOG"
+PLAYERLIST_LAST="18:00:00 got: There are 1 of a max 20 players online: Alice"
+FORWARD_IP="auto"; FORWARD_IP_HEADER=""; SEC_DIR="$WORK/security"; PRIVATE_IP_LOG=true
+write_logger_status
+STATUS="$SEC_DIR/logger-status.log"
+check "the status file is written" "$([ -s "$STATUS" ] && echo yes)" "yes"
+check "…with the paper line count" "$(grep -c '^paper.log      : 1 lines' "$STATUS")" "1"
+check "…the login count" "$(grep -c '^logins.log     : 1 logins, 0 logouts' "$STATUS")" "1"
+check "…the last player-list answer" "$(grep -c '^playerlist     : 18:00:00 got: There are 1' "$STATUS")" "1"
+check "…the forward_ip setting" "$(grep -c '^real client IPs: ' "$STATUS")" "1"
+check_at_least "…and the raw lines the parser sees" "$(grep -c 'Alice\[\|logged in with entity id' "$STATUS")" "1"
 
 echo
 echo "passed: $PASS  failed: $FAIL"

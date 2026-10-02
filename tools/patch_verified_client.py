@@ -37,6 +37,7 @@ import argparse
 import base64
 import hashlib
 import lzma
+import os
 import re
 import struct
 import sys
@@ -50,6 +51,19 @@ BRAND_PREFIX = "EaglercraftXClient:"
 EXPECTED_BRAND_LEN = 16                 # the stock brand string is 16 bytes long
 STOCK_BRAND = "Eaglercraft 1.12"
 STOCK_BRAND_UUID = "522b2ce5-c9b9-36cf-be7c-5d90f55e631a"
+# The first verified client ("Eaglercraft[VER]") was handed out and is now
+# revoked: start.sh no longer accepts its brand.  V2 rotates the brand, and
+# --rotate generates another one (with a fresh UUID) any time the client needs
+# to be invalidated again.
+REVOKED_BRANDS = {"Eaglercraft[VER]": "51b2ebf3-ddab-35e7-8646-94f7bcbfd7ff"}
+DEFAULT_BRAND = "EaglercraftX[V2]"
+
+# where the gate and the sealed payload live in the built HTML
+SEALED_MARKER = b"window.__verSealed = \""
+GATE_MARKER = b"/* verified-client gate */"
+GATE_TEMPLATE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gate.template.js")
+PBKDF2_ITERATIONS = 1200000
+SEALED_NAME = "window.__verSealed"
 
 # The EPW loader (loader.wasm -> main.c) decompresses every component with
 #     xz_dec_init(XZ_DYNALLOC, 33554432)
@@ -356,6 +370,58 @@ def decode_assets_uri(html):
     return start, end, base64.b64decode(html[start:end])
 
 
+def decode_sealed(html):
+    """(start, end, ciphertext) of the sealed payload in a gated client."""
+    pos = html.find(SEALED_MARKER)
+    if pos < 0:
+        raise SystemExit("could not find the sealed payload (is this a gated client?)")
+    start = pos + len(SEALED_MARKER)
+    end = html.find(b'"', start)
+    if end < 0:
+        raise SystemExit("unterminated sealed payload")
+    return start, end, base64.b64decode(html[start:end])
+
+
+def gate_params(html):
+    """The Pbkdf2/GCM parameters the gate carries, for --check and tests."""
+    text = html.decode("utf-8", "replace")
+    m = re.search(r"var ITER = (\d+);\s*var SALT = \"([0-9a-f]+)\", IV = \"([0-9a-f]+)\";", text)
+    if not m:
+        return None
+    return {"iterations": int(m.group(1)), "salt": bytes.fromhex(m.group(2)),
+            "iv": bytes.fromhex(m.group(3))}
+
+
+def unseal_client(html, user, password):
+    """Decrypt a gated client exactly like the browser gate does."""
+    import aesgcm
+    params = gate_params(html)
+    if not params:
+        raise SystemExit("could not read the gate parameters out of the HTML")
+    _, _, sealed = decode_sealed(html)
+    key = aesgcm.pbkdf2_key(user, password, params["salt"], params["iterations"])
+    try:
+        return aesgcm.open_(key, params["iv"], sealed)
+    except ValueError as exc:
+        raise SystemExit(f"could not unseal the client: {exc}")
+
+
+def build_gate(new_brand, encrypted, salt, iv, iterations, verbose=True):
+    """Return the gate <script> block with the parameters substituted in."""
+    template = open(GATE_TEMPLATE, "r", encoding="utf-8").read()
+    for token, value in (("%ITER%", str(iterations)),
+                         ("%SALT%", salt.hex()),
+                         ("%IV%", iv.hex()),
+                         ("%BRAND%", new_brand),
+                         ("%UUID%", str(brand_uuid(new_brand)))):
+        template = template.replace(token, value)
+    if "%" in template.replace("%%", ""):
+        leftover = re.findall(r"%[A-Za-z]+%", template)
+        if leftover:
+            raise SystemExit(f"unsubstituted placeholder(s) in the gate: {leftover}")
+    return (b"<script>/* verified-client gate */\n" + template.encode("utf-8") + b"</script>\n")
+
+
 def read_brand(wasm):
     m = BRAND_POOL_RE.search(wasm)
     return m.group(1).decode("ascii") if m else None
@@ -364,7 +430,7 @@ def read_brand(wasm):
 # --------------------------------------------------------------------------- #
 # the patch
 # --------------------------------------------------------------------------- #
-def patch_html(html, new_brand, verbose=True):
+def patch_html(html, new_brand, user=None, password=None, verbose=True):
     if len(new_brand) != EXPECTED_BRAND_LEN:
         raise SystemExit(f"--brand must be exactly {EXPECTED_BRAND_LEN} ASCII characters "
                          f"(got {len(new_brand)})")
@@ -372,7 +438,10 @@ def patch_html(html, new_brand, verbose=True):
         new_brand_b = new_brand.encode("ascii")
     except UnicodeEncodeError:
         raise SystemExit("--brand must be plain ASCII")
+    if (user is None) != (password is None):
+        raise SystemExit("--gate-user and --gate-pass must be given together")
 
+    uri_pos = html.find(ASSETS_URI_MARKER)
     start, end, decoded = decode_assets_uri(html)
     data = bytearray(decoded)
     header = parse_header(data)
@@ -435,8 +504,41 @@ def patch_html(html, new_brand, verbose=True):
     if read_brand(check) != new_brand:
         raise SystemExit("internal error: patched brand not found after rebuild")
 
-    out_html = html[:start] + base64.b64encode(bytes(rebuilt)) + html[end:]
+    if user is None:
+        out_html = html[:start] + base64.b64encode(bytes(rebuilt)) + html[end:]
+        if verbose:
+            print(f"[+] html  : {len(html)} -> {len(out_html)} bytes")
+        return out_html
+
+    # ---- seal the payload behind the login gate -------------------------- #
+    import aesgcm
+    salt, iv = os.urandom(16), os.urandom(12)
+    key = aesgcm.pbkdf2_key(user, password, salt, PBKDF2_ITERATIONS)
+    sealed = aesgcm.seal(key, iv, bytes(rebuilt))
+    if aesgcm.open_(key, iv, sealed) != bytes(rebuilt):
+        raise SystemExit("internal error: the sealed payload does not round-trip")
+
+    out_html = (html[:uri_pos] + SEALED_MARKER + base64.b64encode(sealed) +
+                html[end:])
+    gate = build_gate(new_brand, sealed, salt, iv, PBKDF2_ITERATIONS, verbose)
+    for close in (b"</body>", b"</html>"):
+        pos = out_html.rfind(close)
+        if pos >= 0:
+            out_html = out_html[:pos] + gate + out_html[pos:]
+            break
+    else:
+        out_html += gate
+
+    # paranoia: the plaintext EPW must not be recoverable from the file
+    if base64.b64encode(bytes(rebuilt))[100:200] in out_html:
+        raise SystemExit("internal error: the plaintext payload is still in the HTML")
+    if (user + password).encode() in out_html or password.encode() in out_html:
+        raise SystemExit("internal error: the credentials ended up in the HTML")
     if verbose:
+        print(f"[+] sealed: {len(rebuilt)} -> {len(sealed)} bytes, "
+              f"PBKDF2-SHA512 x{PBKDF2_ITERATIONS}")
+        print(f"[+] gate  : login required (payload AES-256-GCM sealed, "
+              f"credentials not stored)")
         print(f"[+] html  : {len(html)} -> {len(out_html)} bytes")
     return out_html
 
@@ -445,8 +547,13 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("html", nargs="?", help="client HTML file (e.g. client/1.12.html)")
-    ap.add_argument("--brand", default="Eaglercraft[VER]",
+    ap.add_argument("--brand", default=DEFAULT_BRAND,
                     help="new client brand, exactly 16 ASCII characters (default: %(default)r)")
+    ap.add_argument("--rotate", action="store_true",
+                    help="pick a random new brand (new UUID) so every existing copy "
+                         "stops being accepted; prints what to put in start.sh")
+    ap.add_argument("--gate-user", help="username the client asks for before it boots")
+    ap.add_argument("--gate-pass", help="password for that username (not stored in the client)")
     ap.add_argument("--output", help="write to this file instead of patching in place")
     ap.add_argument("--print-uuid", action="store_true",
                     help="only print the UUID a brand produces, then exit")
@@ -460,12 +567,41 @@ def main():
         print(f"stock     : {STOCK_BRAND_UUID}  ({STOCK_BRAND!r})")
         return
 
+    if args.rotate:
+        import random
+        import string
+        while True:
+            suffix = "".join(random.choice(string.ascii_lowercase + string.digits) for _ in range(2))
+            args.brand = f"EaglercraftX[{suffix}]"
+            if args.brand not in REVOKED_BRANDS:
+                break
+        print(f"rotated brand : {args.brand!r}")
+        print(f"new UUID      : {brand_uuid(args.brand)}")
+        print(f"  -> update start.sh:  VERIFIED_CLIENT_BRAND=\"{args.brand}\"")
+        print(f"                        VERIFIED_CLIENT_UUID=\"{brand_uuid(args.brand)}\"")
+        if not args.html:
+            return
+
     if not args.html:
         ap.error("a client HTML file is required (or use --print-uuid)")
     html = open(args.html, "rb").read()
 
     if args.check:
-        start, end, data = decode_assets_uri(html)
+        if gate_params(html):
+            if args.gate_user and args.gate_pass:
+                data = unseal_client(html, args.gate_user, args.gate_pass)
+                print("    gate      : sealed payload unlocked with the given credentials")
+            else:
+                text = html.decode("utf-8", "replace")
+                m = re.search(r'brand: "([^"]*)", uuid: "([^"]*)"', text)
+                brand = m.group(1) if m else "?"
+                print("    gate      : payload is sealed (login required)")
+                print(f"    brand     : {brand!r}")
+                print(f"    brandUUID : {m.group(2) if m else '?'}")
+                print("    (pass --gate-user/--gate-pass to verify the sealed payload too)")
+                return
+        else:
+            data = decode_assets_uri(html)[2]
         try:
             header = validate_epw(data, verbose=True)
         except ValueError as exc:
@@ -476,9 +612,17 @@ def main():
         print(f"    brand     : {brand!r}")
         print(f"    brandUUID : {brand_uuid(brand) if brand else '?'}")
         print(f"    stock     : {STOCK_BRAND_UUID}  ({STOCK_BRAND!r})")
+        for old_brand, old_uuid in REVOKED_BRANDS.items():
+            if brand == old_brand:
+                print(f"    REVOKED   : this is the old client ({old_uuid}) - "
+                      f"start.sh no longer accepts it")
         return
 
-    out_html = patch_html(html, args.brand)
+    if args.gate_user and not args.gate_pass:
+        import getpass
+        args.gate_pass = getpass.getpass("gate password: ")
+
+    out_html = patch_html(html, args.brand, args.gate_user, args.gate_pass)
     target = args.output or args.html
     with open(target, "wb") as fh:
         fh.write(out_html)
@@ -486,7 +630,11 @@ def main():
     print(f"[ok] wrote {target}")
     print(f"     brand     : {args.brand}")
     print(f"     brandUUID : {brand_uuid(args.brand)}")
-    print("     -> put that UUID in start.sh as VERIFIED_CLIENT_UUID to switch detection on")
+    if args.gate_user:
+        print("     gate      : login required (username + password, not stored in the file)")
+    else:
+        print("     (no --gate-user/--gate-pass: built WITHOUT the login gate)")
+    print("     -> put both values in start.sh (VERIFIED_CLIENT_BRAND/_UUID)")
 
 
 if __name__ == "__main__":

