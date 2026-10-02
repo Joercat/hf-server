@@ -12,6 +12,8 @@
 # What it does:
 #   1. finds a stock Eaglercraft 1.12 client (git history / --stock FILE),
 #   2. rebuilds client/1.12.html with the new brand + the login gate,
+#   2b. optimises its assets for low-end machines (the end portal texture and
+#      the animation frame counts - see tools/optimize_client.py),
 #   3. writes .verified-client.env (the brand + UUID; git-ignored),
 #   4. bakes the pair into start.sh *obfuscated* (XOR + base64, like the client
 #      hides the brand behind a PBKDF2 verifier), so the server works without
@@ -35,6 +37,7 @@ GATE_PASS=""
 OUT="client/1.12.html"
 ENV_FILE=".verified-client.env"
 UPLOAD=false
+OPTIMIZE=true
 BUCKET="${BUCKET:-hf://buckets/smodusermc/1.12}"
 
 while [ $# -gt 0 ]; do
@@ -42,6 +45,7 @@ while [ $# -gt 0 ]; do
         --brand) BRAND="$2"; shift 2 ;;
         --rotate) ROTATE=true; shift ;;
         --stock) STOCK="$2"; shift 2 ;;
+        --no-optimize) OPTIMIZE=false; shift ;;
         --gate-user) GATE_USER="$2"; shift 2 ;;
         --gate-pass) GATE_PASS="$2"; shift 2 ;;
         --output) OUT="$2"; shift 2 ;;
@@ -121,10 +125,33 @@ echo "  new brand    : $NEW_BRAND"
 echo "  new UUID     : $NEW_UUID"
 
 # --------------------------------------------------------------------------- #
+# 2b. optimise the assets for low-end machines
+# --------------------------------------------------------------------------- #
+# The build above starts from the stock client, whose assets are not optimised:
+# the end portal texture is 256x256 (drawn in several full-screen alpha passes)
+# and the animated blocks carry 32-frame strips.  Doing this here means every
+# rebuilt client is optimised by construction, which the test suite asserts.
+if [ "$OPTIMIZE" = true ]; then
+    echo "Optimising the client assets (low-end devices)"
+    OPT_OUT="${OUT}.optimizing"
+    if python3 tools/optimize_client.py "$OUT" --user "$GATE_USER" --pass "$GATE_PASS" \
+            --output "$OPT_OUT" 2>&1 | sed 's/^/  /'; then
+        mv -f "$OPT_OUT" "$OUT"
+    else
+        rm -f "$OPT_OUT"
+        echo "  warning: the optimisation step failed - the client itself is fine,"
+        echo "           re-run it later with: python3 tools/optimize_client.py $OUT"
+    fi
+fi
+
+# --------------------------------------------------------------------------- #
 # 3. remember the pair locally (never committed)
 # --------------------------------------------------------------------------- #
 cat > "$ENV_FILE" <<EOF
 # Identity of the verified client (read by start.sh, tests and tools).
+# VER_CLIENT_USER / VER_CLIENT_PASS are what the gate asks for; they are here so
+# that the local tools (optimize_client.py, the tests) work without flags.  This
+# file is git-ignored - never commit it and never upload it anywhere.
 # NEVER committed: the repository is public and a public brand can be copied
 # into somebody else's client.
 #
@@ -133,6 +160,8 @@ cat > "$ENV_FILE" <<EOF
 # them in the environment and this file is not needed there at all.
 VERIFIED_CLIENT_BRAND="$NEW_BRAND"
 VERIFIED_CLIENT_UUID="$NEW_UUID"
+VER_CLIENT_USER="$GATE_USER"
+VER_CLIENT_PASS="$GATE_PASS"
 EOF
 echo "  wrote        : $ENV_FILE  (git-ignored)"
 

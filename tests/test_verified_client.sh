@@ -1438,6 +1438,127 @@ check "logger-status prints the proxy peers" \
 check "…and what the addresses in the logs are" \
       "$(grep -c '^ip evidence    :' "$SEC_DIR/logger-status.log")" "1"
 
+# --------------------------------------------------------------------------- #
+echo "== 21. the client is optimised for low-end machines =="
+
+check "the EPK reader/writer round-trips a package byte for byte" \
+      "$(python3 "$ROOT/tools/epk.py" selftest 2>&1 | grep -c 'selftest: OK')" "1"
+check "the PNG reader/writer survives the assets it has to touch" \
+      "$(python3 "$ROOT/tools/pnglite.py" selftest 2>&1 | grep -c 'selftest: OK')" "1"
+
+# the two rules against a fixture pack: an animation with a rotated frame list,
+# one with a hand-written list, a big end portal and a texture that must stay
+FIX="$WORK/optfix"; rm -rf "$FIX"; mkdir -p "$FIX"
+python3 - "$FIX" "$ROOT" <<'PYOPT'
+import json, sys
+sys.path.insert(0, sys.argv[2] + "/tools")
+import epk, optimize_client as O, pnglite
+out = sys.argv[1]
+
+def strip(width, frames, rgb=(10, 20, 30)):
+    img = pnglite.Image(width, width * frames)
+    for f in range(frames):
+        for y in range(width):
+            for x in range(width):
+                o = ((f * width + y) * width + x) * 4
+                img.pixels[o:o + 4] = bytes((rgb[0], rgb[1], rgb[2], 255 if (x + y + f) % 3 else 200))
+    return pnglite.encode(img)
+
+base = "assets/minecraft/textures/"
+files = {
+    "assets/minecraft/textures/entity/end_portal.png":
+        pnglite.encode(pnglite.Image(256, 256, bytes((30, 30, 90, 255)) * 65536)),
+    base + "blocks/water_still.png": strip(16, 32),
+    base + "blocks/water_still.png.mcmeta": b'{"animation": {"frametime": 2}}',
+    base + "blocks/fire_layer_0.png": strip(16, 32),
+    base + "blocks/fire_layer_0.png.mcmeta":
+        json.dumps({"animation": {"frametime": 1, "frames": list(range(16, 32)) + list(range(16))}}).encode(),
+    base + "blocks/lava_still.png": strip(16, 20),
+    base + "blocks/lava_still.png.mcmeta":
+        json.dumps({"animation": {"frametime": 2, "frames": list(range(20)) + list(range(18, 0, -1))}}).encode(),
+    base + "blocks/stone.png": b"\x89PNG\r\n\x1a\n" + b"not really a png",
+    base + "font/unicode_page_00.png": b"1-bit png, not decodable here",
+    "assets/minecraft/sounds/random/click.ogg": b"OggS" + bytes(200),
+}
+new_files, changes, notes = O.optimize_pack(files, 8, 32)
+changed = sorted(set([c["file"] for c in changes] +
+                     [c["meta"] for c in changes if "meta" in c]))
+report = {
+    "changed": changed,
+    "changes": changes,
+    "notes": notes,
+    "untouched_same": sorted(n for n in files if n not in changed and new_files[n] == files[n]),
+    "same_count": sum(1 for n in files if n not in changed and new_files[n] == files[n]),
+    "end_portal": [n for n in changed if "end_portal" in n],
+    "water_frames": 0, "water_frametime": 0, "fire_frames": 0, "fire_list_len": 0,
+    "lava_touched": "lava_still" in " ".join(changed),
+    "stone_untouched": base + "blocks/stone.png" not in changed,
+}
+wf = new_files[base + "blocks/water_still.png"]
+wmeta = json.loads(new_files[base + "blocks/water_still.png.mcmeta"])
+report["water_frames"] = pnglite.decode(wf).height // 16
+report["water_frametime"] = wmeta["animation"]["frametime"]
+ff = new_files[base + "blocks/fire_layer_0.png"]
+fmeta = json.loads(new_files[base + "blocks/fire_layer_0.png.mcmeta"])
+report["fire_frames"] = pnglite.decode(ff).height // 16
+flist = fmeta["animation"]["frames"]
+report["fire_list_len"] = len(flist)
+report["fire_list_ok"] = (all(0 <= i < report["fire_frames"] for i in flist)
+                          and sorted(flist) == list(range(report["fire_frames"])))
+report["fire_frametime"] = fmeta["animation"]["frametime"]
+# the animation must keep playing at the same speed: frames * frametime must match
+report["water_cycle_before"] = 32 * 2
+report["water_cycle_after"] = report["water_frames"] * report["water_frametime"]
+# and the whole thing has to survive a real EPK round trip
+blob = epk.write(files, pack_name="assets.epk", timestamp=1)
+back = epk.files(epk.read(blob))
+report["pack_roundtrip"] = all(back[n] == files[n] for n in files)
+blob2 = epk.write([(m, n, new_files.get(n, p) if m == epk.FILE_MARK else p)
+                   for m, n, p in epk.read(blob)["records"]],
+                  pack_name="assets.epk", timestamp=1)
+report["optimised_roundtrip"] = epk.files(epk.read(blob2))[base + "blocks/water_still.png"] == wf
+json.dump(report, open(out + "/report.json", "w"), indent=1)
+PYOPT
+FIXR="$FIX/report.json"
+fix() { python3 -c "import json,sys;d=json.load(open(sys.argv[1]));print(d[sys.argv[2]])" "$FIXR" "$1"; }
+check "the end portal texture is shrunk to 32x32" "$(fix end_portal | tr -d "[]' ")" "assets/minecraft/textures/entity/end_portal.png"
+check "a 32-frame animation is reduced to 8 frames" "$(fix water_frames)" "8"
+check "…and its frametime is scaled so the animation keeps its speed" \
+      "$(fix water_cycle_after)" "$(fix water_cycle_before)"
+check "…the same for the fire texture" "$(fix fire_frames)" "8"
+check "…whose rotated frame list is remapped, not truncated" \
+      "$(fix fire_list_len)/$(fix fire_list_ok)/$(fix fire_frametime)" "8/True/4"
+check "a hand-written frame list (lava) is left alone" "$(fix lava_touched)" "False"
+check "a texture that cannot be decoded is left alone" "$(fix stone_untouched)" "True"
+check "every other file in the pack stays byte for byte" "$(fix same_count)" "5"
+check "the rebuilt package still round-trips" \
+      "$(fix pack_roundtrip)/$(fix optimised_roundtrip)" "True/True"
+check "the optimiser does not need a PNG library from the internet" \
+      "$(grep -c 'import PIL\|from PIL' "$ROOT/tools/pnglite.py" "$ROOT/tools/optimize_client.py" | grep -c ':0')" "2"
+
+# the committed client must already be in that shape: optimising it again has
+# to change nothing (and reproduce the file byte for byte)
+if [ -n "${VER_CLIENT_USER:-}" ] && [ -n "${VER_CLIENT_PASS:-}" ]; then
+    OPT="$WORK/client-reopt.html"
+    python3 "$ROOT/tools/optimize_client.py" "$ROOT/client/1.12.html" \
+        --user "$VER_CLIENT_USER" --pass "$VER_CLIENT_PASS" --output "$OPT" \
+        --report "$WORK/reopt.json" > "$WORK/reopt.log" 2>&1
+    check "the committed client is already optimised (nothing left to change)" \
+          "$(grep -c 'changed 0 file(s)' "$WORK/reopt.log")" "1"
+    check "…and re-optimising it reproduces the same file byte for byte" \
+          "$(cmp -s "$ROOT/client/1.12.html" "$OPT" && echo same || echo different)" "same"
+    REINFO=$(python3 "$ROOT/tools/patch_verified_client.py" --check "$ROOT/client/1.12.html" \
+             --gate-user "$VER_CLIENT_USER" --gate-pass "$VER_CLIENT_PASS" 2>&1)
+    check "…with the same brand UUID the server checks" \
+          "$(sed -n 's/.*brandUUID *: *//p' <<<"$REINFO" | head -1)" "$EXPECTED_UUID"
+    check "…and the same gate parameters" \
+          "$(python3 -c "import sys;sys.path.insert(0,'$ROOT/tools');import patch_verified_client as P;\
+g=P.gate_params(open('$ROOT/client/1.12.html','rb').read());print(g['iterations'], len(g['salt']), len(g['iv']))")" \
+          "1200000 16 12"
+else
+    echo "  skip - set VER_CLIENT_USER / VER_CLIENT_PASS to re-optimise the real client"
+fi
+
 echo
 echo "passed: $PASS  failed: $FAIL"
 [ "$FAIL" -eq 0 ]

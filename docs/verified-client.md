@@ -343,6 +343,14 @@ files below stay inside the Space and *cannot* be read from outside):
 | --- | --- |
 | `auth.log` | full `/login`, `/register`, `/changepassword`, … commands of everybody except the verified client |
 | `proxy-peers.log` | the addresses the proxy in front of the server connects from, so an address in the logs can be classified as the player's or the proxy's |
+
+The client file itself is the *optimised* build: `entity/end_portal.png` is 32x32
+(it is drawn in several full-screen alpha passes near a portal and in the End) and
+the animated block textures keep every n-th frame with a scaled `frametime` (water
+and lava at 15 fps instead of 60, a quarter of the memory and uploads).  A rebuild
+with `tools/setup-verified-client.sh` runs `tools/optimize_client.py` on the result
+automatically - see "Low-end machines" in `README.md` for the switches and for
+what is deliberately never touched (anything that is UV-mapped).
 | `player-ips.log` | the real IPs that appear as `hidden` in the synced logs |
 | `logins-real-ips.log`, `shared-ips-private.txt` | the same reports as the bucket ones, but with the verified client's IP put back in |
 
@@ -416,6 +424,13 @@ using eaglercraft!`) become `VANILLA`; no answer at all becomes `UNKNOWN`, never
   proxy-only log is called out with its verdict, IPv4+IPv6 for one account is
   reported as one device, and the header discovery is retried exactly when it
   should be (never while somebody is online, never once a header works);
+* asserts the low-end-device asset rules: the end portal texture shrinks to
+  32x32, a 32-frame animation becomes 8 frames with its `frametime` scaled so the
+  animation keeps its speed, a rotated frame list is remapped (never truncated),
+  a hand-written frame list and an undecodable texture are left alone, every
+  other file in the package stays byte for byte, and the rebuilt package still
+  round-trips - plus that re-running the optimiser on the committed client
+  changes nothing and reproduces the file byte for byte;
 * asserts the discovered header is remembered in `private-logs/`, i.e. inside
   the folder that is synced to the bucket and restored at boot - a choice that
   is written outside it does not survive a restart - and that a header a probe

@@ -39,6 +39,8 @@ A Hugging Face Space that runs:
 | `tools/setup-verified-client.sh` | one command to build/rotate it, re-bake the pair into `start.sh` and print the secrets |
 | `tools/patch_verified_client.py` | patches / inspects / seals the client brand |
 | `tools/verify_gated_client.mjs` | runs the real login gate + loader headless: proves the file only boots after the login |
+| `tools/optimize_client.py` | shrinks the two things that cost frames on weak machines (end portal texture, animation frames) and re-seals the client |
+| `tools/epk.py` / `tools/pnglite.py` | the EPK package and PNG readers/writers that optimiser needs (no external libraries) |
 | `tools/run_epw_loader.mjs` | boots the client's own EPW loader to prove the file loads |
 | `tools/forward_ip_probe.py` | asks the proxy whether it sends a forwarded-IP header (embedded in `start.sh`) |
 | `tools/proxy_peers.py` | the addresses of the proxy that sits in front of the game port, from the kernel's own tables (embedded in `start.sh`) |
@@ -290,7 +292,9 @@ some point is refused by the patcher (`REVOKED_BRANDS`) and by the server
 appears in the git history: `git log --all -S"<brand>"` must be empty. The suite also checks the hidden-IP logging, the enforcement
 (kicks), the `/login` logging against a fake Bungee console, the IP report, the
 forwarded-IP discovery (with a fake proxy that refuses headers), the proxy-peer
-evidence (against a fixture of the kernel's own tables), the auth-filter
+evidence (against a fixture of the kernel's own tables), the low-end-device asset
+rules (end portal + animation frames, with the untouched files compared byte for
+byte), the auth-filter
 patch (its rule table, a fixture jar it patches and a real JVM loads, the
 `javap` rollback and the switch), the masking of the bucket's console copies,
 the per-account addresses, and that the copies embedded in `start.sh` match
@@ -299,9 +303,9 @@ environment it additionally **runs the real login gate and boots the client's
 own EPW loader** in Node, i.e. it proves the file you hand out works:
 
 ```bash
-bash tests/test_verified_client.sh              # 280 checks
+bash tests/test_verified_client.sh              # 290 checks
 VER_CLIENT_USER=<user> VER_CLIENT_PASS=<password> \
-    bash tests/test_verified_client.sh          # 295 checks (adds the boot test)
+    bash tests/test_verified_client.sh          # 309 checks (adds the boot test)
 
 # same, but print the logs it produced, so you can see the formats:
 PRINT_LOGS=1 bash tests/test_verified_client.sh
@@ -534,6 +538,72 @@ only in the Space secrets and delete the baked blob.
 If the Space ever loses the pair, the boot log and
 `security-logs/logger-status.log` say `NOT CONFIGURED`, nobody is marked as you,
 and `auth.log` masks every password until it is set again.
+
+### Low-end machines (4 GB Chromebooks and friends)
+
+Two things in the shipped assets were measurably expensive on weak GPUs, and both
+are fixed *inside the client file* — no setting to change, nothing to remember,
+the same login and the same brand:
+
+**1. The end portal / End sky texture** (`entity/end_portal.png`) shipped as
+256x256 (256 KiB). That texture is not drawn once: the portal block — and the End
+sky — is rendered as **several full-screen alpha-blended passes** stacked on top
+of each other, each with its own texture matrix scrolling the starfield, sampled
+straight through the pixel shader over the whole tile it covers. On a Chromebook
+that fill rate (and the texture cache misses from zooming into a 256x256 texture)
+is the single biggest cost of standing near a portal or being in the End, which is
+exactly the reported "it lags really bad when the portal is in render distance".
+It is a soft noise field, so it is now **32x32**: 1/64th of the memory, and the
+passes sample from L1 instead of thrashing. The animation is unchanged.
+
+**2. Animated texture strips.** Water, lava, fire, the nether portal, sea lantern
+and command blocks shipped as 32/20/16-frame strips (16x16 each). Every frame is
+uploaded to the GPU as its own layer and re-uploaded on a timer, which is what
+produces the periodic hitch when water or lava fills the screen. Animation is
+*time based*, so `tools/optimize_client.py` keeps every n-th frame and multiplies
+that texture's `frametime` by n: water and lava now animate at 15 fps instead of
+60 — on a 4 GB machine that is already below 60 — with a quarter of the memory
+and a quarter of the upload work. Lists that are hand-written (lava's ping-pong,
+the prismarine flicker) are **left alone**, and everything else in the package is
+copied byte for byte.
+
+```bash
+# what it would change (nothing is written)
+python3 tools/optimize_client.py client/1.12.html --dry-run
+
+# re-optimise the committed client in place (credentials from .verified-client.env)
+python3 tools/optimize_client.py client/1.12.html --output /tmp/c.html && mv /tmp/c.html client/1.12.html
+
+# keep 8 frames per animation (default), or 4 for an even weaker machine
+python3 tools/optimize_client.py client/1.12.html --frames 4
+# leave the end portal texture alone
+python3 tools/optimize_client.py client/1.12.html --end-portal 0
+
+# a resource pack instead: same two rules, pack stays a pack
+python3 tools/optimize_client.py --pack mypack.epk -o mypack.optimized.epk
+```
+
+The tool re-seals the payload with the **same salt, IV and iterations**, so the
+same username/password keeps working and the brand (and therefore the server's
+verification) is untouched. `tools/setup-verified-client.sh` runs it
+automatically after a rebuild (`--no-optimize` skips it), and the test suite
+asserts that the committed client is already in that shape: optimising it again
+has to reproduce the same file byte for byte.
+
+What is deliberately **not** touched, and why: every texture that is mapped by
+UV coordinates (blocks, items, entities, GUI, the font) has to keep its exact
+pixel grid, so re-scaling it would corrupt the game; the sounds are already
+compressed; and the gameplay settings (`render distance`, `fancy/fast graphics`,
+`smooth lighting`, `particles`, `clouds`, `max framerate`, `music`) belong to you
+and are one click away in the client's own *Options* screen — those still matter
+more than anything in the file. Two things worth knowing on a 4 GB machine:
+
+* a **custom texture pack** is the biggest remaining lever, because the client
+  decodes, decompresses and re-uploads every texture of a pack when it loads it;
+  run the tool on the pack itself (`--pack`) before handing it out, and prefer
+  packs whose `entity/end_portal.png` is not huge;
+* if the game still hitches with a pack loaded, it is the pack load, not the
+  server: the pack is decoded on the machine, once per load.
 
 ## What actually has to go into the Space
 
