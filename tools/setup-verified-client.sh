@@ -3,11 +3,11 @@
 # Build (or rotate) the verified client, in one command, and print exactly what
 # has to go where.
 #
-#   bash tools/setup-verified-client.sh --brand "EaglercraftX[SV]" \
-#        --gate-user sllab --gate-pass 'secret'
-#   bash tools/setup-verified-client.sh --rotate --gate-user sllab --gate-pass 'secret'
-#   bash tools/setup-verified-client.sh --rotate --gate-user sllab          # asks for the password
-#   bash tools/setup-verified-client.sh --rotate --gate-user sllab --upload # + puts it in the bucket
+#   bash tools/setup-verified-client.sh --brand "AnotherBrand16Ch" \
+#        --gate-user <user> --gate-pass '<password>' 
+#   bash tools/setup-verified-client.sh --rotate --gate-user <user> --gate-pass '<password>' 
+#   bash tools/setup-verified-client.sh --rotate --gate-user <user>         # asks for the password
+#   bash tools/setup-verified-client.sh --rotate --gate-user <user> --upload  # + puts it in the bucket
 #
 # What it does:
 #   1. finds a stock Eaglercraft 1.12 client (git history / --stock FILE),
@@ -61,7 +61,7 @@ fi
 # --------------------------------------------------------------------------- #
 find_stock() {
     if [ -n "$STOCK" ]; then
-        [ -s "$STOCK" ] || { echo "ERROR: $STOCK does not exist"; exit 1; }
+        [ -s "$STOCK" ] || { echo "ERROR: $STOCK does not exist" >&2; exit 1; }
         printf '%s' "$STOCK"; return 0
     fi
     if [ -s /tmp/stock-1.12.html ]; then printf '%s' /tmp/stock-1.12.html; return 0; fi
@@ -73,7 +73,7 @@ find_stock() {
         git show "$sha:client/1.12.html" > /tmp/stock-1.12.html 2>/dev/null \
             && [ -s /tmp/stock-1.12.html ] \
             && ! grep -q "verified-client gate" /tmp/stock-1.12.html \
-            && { echo "  stock client : from git $sha"; printf '%s' /tmp/stock-1.12.html; return 0; }
+            && { echo "  stock client : from git $sha" >&2; printf '%s' /tmp/stock-1.12.html; return 0; }
     fi
     return 1
 }
@@ -83,6 +83,13 @@ STOCK_FILE=$(find_stock) || {
     echo "       Pass one with --stock <file> (an unpatched client/1.12.html)."
     exit 1
 }
+
+if grep -q "verified-client gate" "$STOCK_FILE" 2>/dev/null; then
+    echo "ERROR: $STOCK_FILE already carries the login gate."
+    echo "       Build from an unpatched client (--stock FILE), i.e. one that still"
+    echo "       has the plain assetsURI data URI the patcher rewrites."
+    exit 1
+fi
 
 # --------------------------------------------------------------------------- #
 # 2. build

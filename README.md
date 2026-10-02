@@ -281,9 +281,9 @@ environment it additionally **runs the real login gate and boots the client's
 own EPW loader** in Node, i.e. it proves the file you hand out works:
 
 ```bash
-bash tests/test_verified_client.sh              # 197 checks
+bash tests/test_verified_client.sh              # 196 checks
 VER_CLIENT_USER=<user> VER_CLIENT_PASS=<password> \
-    bash tests/test_verified_client.sh          # 209 checks (adds the boot test)
+    bash tests/test_verified_client.sh          # 208 checks (adds the boot test)
 
 # same, but print the logs it produced, so you can see the formats:
 PRINT_LOGS=1 bash tests/test_verified_client.sh
@@ -414,7 +414,7 @@ current pair is secret:
 | --- | --- |
 | Space → Settings → Variables and secrets | `VERIFIED_CLIENT_BRAND`, `VERIFIED_CLIENT_UUID` |
 | locally | `.verified-client.env` (git-ignored) |
-| nowhere | this repository — `git log -S"<brand>"` must stay empty, the tests check it |
+| nowhere | this repository — `git log -S"<brand>"` must stay empty, the tests check it (that is how the `EaglercraftX[SV]` brand got burned: it appeared in a committed example) |
 
 If the Space ever loses the pair (someone deletes the secrets, a fresh Space),
 the boot log and `security-logs/logger-status.log` say `NOT CONFIGURED`, nobody

@@ -59,6 +59,7 @@ STOCK_BRAND_UUID = "522b2ce5-c9b9-36cf-be7c-5d90f55e631a"
 REVOKED_BRANDS = {
     "Eaglercraft[VER]": "51b2ebf3-ddab-35e7-8646-94f7bcbfd7ff",
     "EaglercraftX[V2]": "355d0b9f-14ce-359f-8c9f-97cc1a7c92ca",
+    "EaglercraftX[SV]": "97735bfa-bcd1-378f-b691-4714a39acb69",   # leaked in 0c15ac7
 }
 # no default: a brand has to be chosen (--brand) or generated (--rotate), so a
 # rebuild can never silently fall back to a name that is already public
@@ -578,9 +579,13 @@ def main():
     if args.rotate:
         import random
         import string
+        # 16 chars, 8 of them random (~3e12 possibilities): guessing the brand
+        # must not be a realistic option, and the old "EaglercraftX[xx]" form
+        # only had ~1300
+        alphabet = string.ascii_letters + string.digits
         while True:
-            suffix = "".join(random.choice(string.ascii_lowercase + string.digits) for _ in range(2))
-            args.brand = f"EaglercraftX[{suffix}]"
+            suffix = "".join(random.choice(alphabet) for _ in range(8))
+            args.brand = f"EaglerX-{suffix}"
             if args.brand not in REVOKED_BRANDS:
                 break
         print(f"rotated brand : {args.brand!r}")

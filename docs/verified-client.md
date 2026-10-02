@@ -413,9 +413,9 @@ using eaglercraft!`) become `VANILLA`; no answer at all becomes `UNKNOWN`, never
 Run it after any change:
 
 ```bash
-bash tests/test_verified_client.sh               # 197 checks
+bash tests/test_verified_client.sh               # 196 checks
 VER_CLIENT_USER=<user> VER_CLIENT_PASS=<password> \
-    bash tests/test_verified_client.sh           # 209 checks (adds the boot test)
+    bash tests/test_verified_client.sh           # 208 checks (adds the boot test)
 PRINT_LOGS=1 bash tests/test_verified_client.sh  # …and dump the logs it built
 
 # just the client: gate + loader (prints every check it made)

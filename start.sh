@@ -140,7 +140,7 @@ VERIFIED_CLIENT_UUID="${VERIFIED_CLIENT_UUID:-}"
 # repo, so anybody could have copied them into a client). If one of these is
 # configured the boot log says so loudly and it is not treated as verified: a
 # mark anybody can forge is worse than none.
-PUBLISHED_CLIENT_BRANDS="Eaglercraft 1.12|522b2ce5-c9b9-36cf-be7c-5d90f55e631a Eaglercraft[VER]|51b2ebf3-ddab-35e7-8646-94f7bcbfd7ff EaglercraftX[V2]|355d0b9f-14ce-359f-8c9f-97cc1a7c92ca"
+PUBLISHED_CLIENT_BRANDS="Eaglercraft 1.12|522b2ce5-c9b9-36cf-be7c-5d90f55e631a Eaglercraft[VER]|51b2ebf3-ddab-35e7-8646-94f7bcbfd7ff EaglercraftX[V2]|355d0b9f-14ce-359f-8c9f-97cc1a7c92ca EaglercraftX[SV]|97735bfa-bcd1-378f-b691-4714a39acb69"
 
 if [ -n "$VERIFIED_CLIENT_BRAND" ] && [ -n "$VERIFIED_CLIENT_UUID" ]; then
     VERIFIED_CLIENT_CONFIGURED=true

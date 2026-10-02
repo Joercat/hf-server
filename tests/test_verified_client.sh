@@ -36,8 +36,13 @@ echo "== 1. client <-> start.sh consistency =="
 EXPECTED_BRAND="${VERIFIED_CLIENT_BRAND:-}"
 EXPECTED_UUID="${VERIFIED_CLIENT_UUID:-}"
 
-check "the brand/UUID are configured (env or .verified-client.env)" \
-      "$([ -n "$EXPECTED_BRAND" ] && [ -n "$EXPECTED_UUID" ] && echo yes)" "yes"
+if [ -z "$EXPECTED_BRAND" ] || [ -z "$EXPECTED_UUID" ]; then
+    echo "  skip - no brand configured (that is a valid, safe state: start.sh"
+    echo "         then marks nobody as the verified client)."
+    echo "         To test the full system: bash tools/setup-verified-client.sh \\"
+    echo "             --brand \"<16 chars>\" --gate-user <user> --gate-pass <pass>"
+    echo "         or set VERIFIED_CLIENT_BRAND / VERIFIED_CLIENT_UUID."
+else
 echo "  brand        : $EXPECTED_BRAND"
 echo "  uuid         : $EXPECTED_UUID"
 
@@ -59,6 +64,8 @@ if command -v git >/dev/null 2>&1 && git -C "$ROOT" rev-parse --git-dir >/dev/nu
     check "…and is ignored" \
           "$(git -C "$ROOT" check-ignore -q client/1.12.html && echo ignored || echo not-ignored)" "ignored"
 fi
+
+fi   # end: brand configured
 
 if [ ! -s "$ROOT/client/1.12.html" ]; then
     echo "  skip - client/1.12.html is not built here (tools/setup-verified-client.sh)"
