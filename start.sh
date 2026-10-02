@@ -660,9 +660,23 @@ record_logout() {
 # Safety net: ask the server itself who is online (RCON `list`)
 # -------------------------------------------------------------
 playerlist_names() {   # pull the names out of a `list` answer
-    sed -n 's/.*players online[:]* *//p' | tr ',' '\n' \
-        | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' \
-        | grep -E '^[A-Za-z0-9_.-]{1,16}$'
+    # `There are 2 of a max 20 players online: Steve, Alex` - with or without
+    # colour codes, and with whatever wording the server uses as long as the
+    # names follow the last colon
+    strip_colours 2>/dev/null | awk '
+        {
+            line = $0
+            if (line ~ /players online/) {
+                sub(/.*players online:?[[:space:]]*/, "", line)
+            } else if (line ~ /:[[:space:]]*[A-Za-z0-9_.-]/) {
+                sub(/^[^:]*:[[:space:]]*/, "", line)
+            } else next
+            n = split(line, names, /,[[:space:]]*/)
+            for (i = 1; i <= n; i++)
+                # no {1,16} interval: the awk Debian ships (mawk) lacks them
+                if (names[i] ~ /^[A-Za-z0-9_.-]+$/ && length(names[i]) <= 16)
+                    print names[i]
+        }'
 }
 
 playerlist_check() {
@@ -671,7 +685,7 @@ playerlist_check() {
     # RCON unreachable or an answer we do not understand: never guess, or a
     # hiccup would log everybody out at once
     [ -n "$raw" ] || return 0
-    case "$raw" in *"players online"*) ;; *) return 0 ;; esac
+    case "$raw" in *"players online"*|*"There are"*) ;; *) return 0 ;; esac
     names=$(printf '%s\n' "$raw" | playerlist_names)
     [ "${PLAYERLIST_DEBUG:-false}" = true ] && \
         echo "[LOG] playerlist: $(printf '%s' "$names" | tr '\n' ' ')"

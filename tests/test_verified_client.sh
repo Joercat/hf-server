@@ -477,7 +477,8 @@ handle_paper_line "[15:10:01 INFO]: ModernGuy left the game"
 check "…and the duplicate 'left the game' does not" "$(grep -c '| LOGOUT | ModernGuy |' "$LOGIN_LOG")" "1"
 
 # (f) the safety net: the server itself is asked who is online
-mc_command() { printf '%s' "There are 2 of a max 20 players online: RconGuy, A_b-c"; }
+# colour codes and a different wording must not hide anybody
+mc_command() { printf '%s' "There are 2 of a max 20 players online: §aRconGuy§r, A_b-c"; }
 check "the player list is parsed" "$(mc_command 'list' | playerlist_names | tr '\n' ' ')" "RconGuy A_b-c "
 PLOUT=$(playerlist_check 2>&1)
 check "a player the logs never showed still gets a LOGIN row" \
