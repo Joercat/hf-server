@@ -80,6 +80,21 @@ SYNC_CONSOLE_LOGS="${SYNC_CONSOLE_LOGS:-true}"
 CONSOLE_LOG_LINES="${CONSOLE_LOG_LINES:-1000}"
 FULL_STAGING="/tmp/hf-staging"
 LOG_STAGING="/tmp/hf-log-staging"
+
+# How the bucket is written: `auto` tries the hf CLI first and falls back to
+# the Python API (huggingface_hub ships in the image), `cli` / `python` force
+# one of them. A write probe runs at boot and says clearly which one works and
+# what to do when neither does.
+BUCKET_METHOD="${BUCKET_METHOD:-auto}"
+BUCKET_SYNC_PY="${BUCKET_SYNC_PY:-/tmp/bucket_sync.py}"
+BUCKET_VIA=""
+BUCKET_ERROR=""
+# Every login is seen by the proxy, by Paper and by the RCON player list; the
+# name is marked online so only the first of them writes a LOGIN row.
+ONLINE_STATE="${ONLINE_STATE:-/tmp/online-players.txt}"
+# how often the RCON player list is polled as the safety net for logins that
+# never showed up in a log line (a different Paper version, a rotated file, ...)
+PLAYERLIST_POLL="${PLAYERLIST_POLL:-20}"
 IDLE_MODE=false
 
 # =============================================
@@ -589,24 +604,115 @@ mask_cmd() {
     echo "$cmd"
 }
 
+# -------------------------------------------------------------
+# One login = one LOGIN row
+# -------------------------------------------------------------
+# The same join is reported by the proxy (`<-> ServerConnector [..] has
+# connected`), by the game server (`logged in with entity id`) and by the
+# polled RCON player list. Whichever of them arrives first writes the row; the
+# others see the name marked online and stay quiet. This also means a login is
+# still logged if a log line never appears, which is what makes the log
+# trustworthy on a server whose console format we cannot control.
+is_online() {
+    local f="${ONLINE_STATE:-/tmp/online-players.txt}"
+    [ -s "$f" ] || return 1
+    grep -qxF "$1" "$f" 2>/dev/null
+}
+
+mark_online() {
+    local f="${ONLINE_STATE:-/tmp/online-players.txt}"
+    is_online "$1" || printf '%s\n' "$1" >> "$f"
+}
+
+mark_offline() {
+    local f="${ONLINE_STATE:-/tmp/online-players.txt}" tmp
+    [ -f "$f" ] || return 0
+    tmp="${f}.tmp"
+    grep -vxF "$1" "$f" > "$tmp" 2>/dev/null
+    mv "$tmp" "$f"
+}
+
+# $1 name, $2 ip, $3 where it was seen (paper|bungee|rcon list)
+record_login() {
+    local name="$1" ip="${2:-unknown}" src="${3:-?}" ipmap="${IP_MAP:-/tmp/client-ips.txt}"
+    printf '%s\t%s\n' "$name" "$ip" >> "$ipmap"
+    if is_online "$name"; then
+        return 0                     # this join is already in logins.log
+    fi
+    mark_online "$name"
+    echo "$(date '+%F %T') | LOGIN | $name | $(ip_field "$name" "$ip" PENDING)${LOGIN_CLIENT_FIELD:-}" >> "$LOGIN_LOG"
+    set_verdict "$name" PENDING
+    echo "[LOG] LOGIN  $name (seen by $src)"
+    check_player_client "$name" "$ip" &
+}
+
+record_logout() {
+    local name="$1" src="${2:-?}" v ip
+    is_online "$name" || return 0
+    mark_offline "$name"
+    v=$(verdict_for "$name")
+    ip=$(last_ip_for "$name")
+    echo "$(date '+%F %T') | LOGOUT | $name | $(ip_field "$name" "${ip:-unknown}" "$v")$(client_field "$v")" >> "$LOGIN_LOG"
+    echo "[LOG] LOGOUT $name (seen by $src)"
+}
+
+# -------------------------------------------------------------
+# Safety net: ask the server itself who is online (RCON `list`)
+# -------------------------------------------------------------
+playerlist_names() {   # pull the names out of a `list` answer
+    sed -n 's/.*players online[:]* *//p' | tr ',' '\n' \
+        | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' \
+        | grep -E '^[A-Za-z0-9_.-]{1,16}$'
+}
+
+playerlist_check() {
+    local raw names name ip
+    raw=$(mc_command "list" 2>/dev/null)
+    # RCON unreachable or an answer we do not understand: never guess, or a
+    # hiccup would log everybody out at once
+    [ -n "$raw" ] || return 0
+    case "$raw" in *"players online"*) ;; *) return 0 ;; esac
+    names=$(printf '%s\n' "$raw" | playerlist_names)
+    [ "${PLAYERLIST_DEBUG:-false}" = true ] && \
+        echo "[LOG] playerlist: $(printf '%s' "$names" | tr '\n' ' ')"
+    while IFS= read -r name; do
+        [ -n "$name" ] || continue
+        if ! is_online "$name"; then
+            ip=$(last_ip_for "$name"); ip="${ip:-unknown}"
+            echo "[LOG] $name is online without a LOGIN row - logging it now"
+            record_login "$name" "$ip" "rcon list"
+        fi
+    done <<< "$names"
+    if [ -s "${ONLINE_STATE:-/tmp/online-players.txt}" ]; then
+        while IFS= read -r name; do
+            [ -n "$name" ] || continue
+            grep -qxF "$name" <<< "$names" || record_logout "$name" "rcon list"
+        done < "${ONLINE_STATE:-/tmp/online-players.txt}"
+    fi
+}
+
+playerlist_loop() {
+    while true; do
+        sleep "${PLAYERLIST_POLL:-20}"
+        playerlist_check || true
+    done
+}
+
+# Paper's console format has changed over the years
+#   [12:00:00 INFO]: Steve[/1.2.3.4:5555] logged in with entity id 42 at (...)
+#   [12:00:00] [Server thread/INFO]: Steve[/1.2.3.4:5555] logged in with entity id 42
+# so the patterns match the payload only and never the prefix. Anything the
+# patterns miss is still caught by the RCON player list (see playerlist_check).
 handle_paper_line() {
-    local line="${1%$'\r'}" NOW name ip cmd
-    # Paper writes:  [12:00:00 INFO]: Steve[/1.2.3.4:5555] logged in with entity id 42 at (...)
-    # (the original pattern was missing the closing bracket, so logins were never recorded)
-    local LOGIN_RE='^\[[0-9:]+ INFO\]: ([A-Za-z0-9_.-]+)\[/(.+):[0-9]+\] logged in with entity id'
-    local CMD_RE='^\[[0-9:]+ INFO\]: ([A-Za-z0-9_.-]+) issued server command: (.*)$'
-    local LEAVE_RE='^\[[0-9:]+ INFO\]: ([A-Za-z0-9_.-]+) left the game'
+    local line="${1%$'\r'}" name ip cmd v NOW
+    local LOGIN_RE='([A-Za-z0-9_.-]{1,16})\[/([^]]+):[0-9]+\] logged in with entity id'
+    local CMD_RE='([A-Za-z0-9_.-]{1,16}) issued server command: (.*)$'
+    local LEAVE_RE='([A-Za-z0-9_.-]{1,16}) (left the game|lost connection)'
     NOW=$(date '+%F %T')
 
     if [[ "$line" =~ $LOGIN_RE ]]; then
         name="${BASH_REMATCH[1]}"; ip="${BASH_REMATCH[2]}"
-        printf '%s\t%s\n' "$name" "$ip" >> "$IP_MAP"
-        # the IP is hidden until we know whose client it is (see hide_ip_for)
-        echo "$NOW | LOGIN | $name | $(ip_field "$name" "$ip" PENDING)${LOGIN_CLIENT_FIELD:-}" >> "$LOGIN_LOG"
-        set_verdict "$name" PENDING
-        # ask the proxy which client this player is using (runs in the background,
-        # it appends the "VERIFY" line to logins.log once it knows)
-        check_player_client "$name" "$ip" &
+        record_login "$name" "$ip" paper
     elif [[ "$line" =~ $CMD_RE ]]; then
         name="${BASH_REMATCH[1]}"
         v=$(verdict_for "$name")
@@ -614,18 +720,33 @@ handle_paper_line() {
         ip=$(last_ip_for "$name")
         echo "$NOW | $name | $(ip_field "$name" "${ip:-unknown}" "$v") | $cmd$(client_field "$v")" >> "$CMD_LOG"
     elif [[ "$line" =~ $LEAVE_RE ]]; then
-        name="${BASH_REMATCH[1]}"
-        v=$(verdict_for "$name")
-        ip=$(last_ip_for "$name")
-        echo "$NOW | LOGOUT | $name | $(ip_field "$name" "${ip:-unknown}" "$v")$(client_field "$v")" >> "$LOGIN_LOG"
+        record_logout "${BASH_REMATCH[1]}" paper
     fi
 }
 
+# BungeeCord is the other source of logins (and the only one that sees the IP
+# before the player is even through):
+#   [12:00:00 INFO] Steve[/1.2.3.4:5555] <-> InitialHandler has connected
+#   [12:00:00 INFO] [UserConnection] Steve[/1.2.3.4:5555] <-> ServerConnector [lobby] has connected
+#   [12:00:00 INFO] Steve executed command: /login hunter2
 handle_bungee_line() {
-    local line="${1%$'\r'}" NOW name ip cmd
+    local line="${1%$'\r'}" name ip cmd v NOW
+    local JOIN_RE='([A-Za-z0-9_.-]{1,16})\[/([^]]+):[0-9]+\] <-> ServerConnector \[?[^]]*\]? has connected'
+    local SEEN_RE='([A-Za-z0-9_.-]{1,16})\[/([^]]+):[0-9]+\] <-> InitialHandler has connected'
+    local QUIT_RE='([A-Za-z0-9_.-]{1,16})\[/([^]]+):[0-9]+\] <-> UpstreamBridge has disconnected'
     local BC_RE='([A-Za-z0-9_.-]+)\]? executed command: (.*)$'
     NOW=$(date '+%F %T')
-    if [[ "$line" =~ $BC_RE ]]; then
+
+    if [[ "$line" =~ $JOIN_RE ]]; then
+        name="${BASH_REMATCH[1]}"; ip="${BASH_REMATCH[2]}"
+        record_login "$name" "$ip" bungee
+    elif [[ "$line" =~ $SEEN_RE ]]; then
+        # not a login yet (the handshake can still fail) - remember the IP so
+        # whoever reports the actual join can log it
+        printf '%s\t%s\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" >> "$IP_MAP"
+    elif [[ "$line" =~ $QUIT_RE ]]; then
+        record_logout "${BASH_REMATCH[1]}" bungee
+    elif [[ "$line" =~ $BC_RE ]]; then
         name="${BASH_REMATCH[1]}"
         # don't log commands that this script itself injects into the console
         [[ "$name" == "CONSOLE" || "$name" == "Console" || "$name" == "client-brand" ]] && return
@@ -644,13 +765,13 @@ start_security_logger() {
     pkill -f "tail -n0 -F /tmp/" 2>/dev/null
     [ -n "$SECLOG_PID" ] && kill "$SECLOG_PID" 2>/dev/null
 
+    # no grep pre-filter: a line the filter would have dropped is a login that
+    # never gets logged, and the handlers already ignore everything else
     (
         tail -n0 -F /tmp/paper.log 2>/dev/null \
-            | grep --line-buffered -E 'logged in with entity id|issued server command|left the game' \
             | while IFS= read -r l; do handle_paper_line "$l"; done &
 
         tail -n0 -F /tmp/bungee.log 2>/dev/null \
-            | grep --line-buffered 'executed command:' \
             | while IFS= read -r l; do handle_bungee_line "$l"; done &
 
         wait
@@ -881,8 +1002,339 @@ hf_authenticate() {
 }
 
 hf_ensure_bucket() {
-    local BUCKET_ID=$(echo "$HF_BUCKET_HANDLE" | sed 's|hf://buckets/||')
+    local BUCKET_ID
+    BUCKET_ID=$(echo "$HF_BUCKET_HANDLE" | sed 's|hf://buckets/||')
     hf buckets create "$BUCKET_ID" --exist-ok 2>/dev/null
+    ensure_bucket_sync_py
+    python3 "$BUCKET_SYNC_PY" --create "$BUCKET_ID" >/dev/null 2>&1 || true
+}
+
+# >>> embedded bucket_sync.py (generated from tools/bucket_sync.py) >>>
+write_bucket_sync_py() {
+    mkdir -p "$(dirname "$BUCKET_SYNC_PY")" 2>/dev/null
+    cat > "$BUCKET_SYNC_PY" <<'BUCKET_SYNC_PY_EOF'
+#!/usr/bin/env python3
+"""
+bucket_sync.py - copy a local directory into a Hugging Face *bucket*.
+
+Why this exists: everything the server logs is meant to be readable from the
+bucket, but the upload happens from inside the Space and the `hf` CLI there can
+fail for reasons the Space itself can only report (missing CLI, read-only
+token, an older CLI without `hf buckets`, ...).  This script is the fallback:
+it needs nothing but `huggingface_hub`, which the Space image already installs.
+
+usage:
+    bucket_sync.py <local_dir> <bucket_id> <prefix> [--delete] [--token TOKEN]
+    bucket_sync.py --probe <bucket_id> [--prefix P] [--token TOKEN]
+    bucket_sync.py --whoami  [--token TOKEN]
+
+`bucket_id` is `namespace/name` (the part after `hf://buckets/`), `prefix` is
+the folder inside the bucket (may be empty).
+
+It prints exactly one summary line that start.sh logs:
+
+    bucket-sync: uploaded=3 skipped=2 deleted=1 bytes=4096 prefix=game-data method=batch
+
+Exit code 0 = the bucket is up to date, 1 = something failed (the reason is
+printed to stderr as well, so it shows up in the Space logs).
+"""
+
+import argparse
+import os
+import sys
+from pathlib import Path
+
+SUMMARY_PREFIX = "bucket-sync:"
+
+
+def log(msg):
+    print(msg, flush=True)
+
+
+def fail(msg, code=1):
+    print(f"bucket-sync: ERROR {msg}", file=sys.stderr, flush=True)
+    raise SystemExit(code)
+
+
+def load_api(token=None):
+    try:
+        from huggingface_hub import HfApi
+    except Exception as exc:  # pragma: no cover - only when the image is broken
+        fail(f"huggingface_hub is not installed ({exc}). "
+             f"pip install 'huggingface_hub[cli]' in the image")
+    try:
+        return HfApi(token=token)
+    except Exception as exc:
+        fail(f"could not create the Hub client ({exc})")
+
+
+def whoami(api):
+    try:
+        info = api.whoami()
+    except Exception as exc:
+        fail(f"the token is not usable ({exc.__class__.__name__}: {exc})")
+    name = info.get("name") or info.get("user") or "?"
+    role = "?"
+    auth = info.get("auth") or {}
+    access = (auth.get("accessToken") or {}) if isinstance(auth, dict) else {}
+    if isinstance(access, dict):
+        role = access.get("role") or role
+    log(f"{SUMMARY_PREFIX} user={name} token_role={role}")
+    return name, role
+
+
+def iter_local(root):
+    for dirpath, _dirnames, filenames in os.walk(root):
+        for name in sorted(filenames):
+            path = Path(dirpath) / name
+            try:
+                size = path.stat().st_size
+            except OSError:
+                continue
+            yield path.relative_to(root).as_posix(), path, size
+
+
+def join(prefix, rel):
+    return f"{prefix}/{rel}" if prefix else rel
+
+
+def strip_prefix(path, prefix):
+    if prefix and path.startswith(prefix + "/"):
+        return path[len(prefix) + 1:]
+    return path
+
+
+def list_remote(api, bucket_id, prefix):
+    """{relative path: size} of what is already in the bucket under prefix."""
+    try:
+        tree = api.list_bucket_tree(bucket_id, prefix=prefix or None, recursive=True)
+    except TypeError:                      # older signature
+        tree = api.list_bucket_tree(bucket_id, recursive=True)
+    except Exception as exc:
+        fail(f"could not list the bucket ({exc.__class__.__name__}: {exc}). "
+             f"Does the token have write access to {bucket_id}?")
+    out = {}
+    for item in tree:
+        path = getattr(item, "path", None) or getattr(item, "file_path", None)
+        size = getattr(item, "size", None)
+        if path is None or size is None:   # folders have no size
+            continue
+        out[strip_prefix(path, prefix)] = size
+    return out
+
+
+def batch(api, bucket_id, add, delete):
+    if api is not None and hasattr(api, "batch_bucket_files"):
+        api.batch_bucket_files(bucket_id, add=add or None, delete=delete or None)
+        return "batch"
+    try:
+        from huggingface_hub import batch_bucket_files as fn
+    except Exception:
+        fn = None
+    if fn is not None:
+        fn(bucket_id, add=add or None, delete=delete or None)
+        return "batch"
+    # last resort: the directory sync of huggingface_hub >= 1.5
+    if hasattr(api, "sync_bucket"):
+        return "sync"
+    fail("this huggingface_hub has no bucket upload API - "
+         "upgrade it (`pip install -U 'huggingface_hub[cli]'`)")
+
+
+def cmd_sync(args):
+    api = load_api(args.token)
+    root = Path(args.local_dir)
+    if not root.is_dir():
+        fail(f"{root} is not a directory")
+
+    local = {rel: size for rel, _path, size in iter_local(root)}
+    remote = list_remote(api, args.bucket_id, args.prefix)
+
+    add = [(str(path), join(args.prefix, rel), size)
+           for rel, path, size in iter_local(root)
+           if remote.get(rel) != size]
+    delete = [join(args.prefix, rel) for rel in remote
+              if args.delete and rel not in local]
+
+    method = "batch"
+    if add or delete:
+        method = batch(api, args.bucket_id, [(src, dst) for src, dst, _size in add], delete)
+        if method == "sync":               # fallback for other library versions
+            api.sync_bucket(str(root), f"hf://buckets/{args.bucket_id}"
+                            + (f"/{args.prefix}" if args.prefix else ""),
+                            delete=args.delete)
+    log(f"{SUMMARY_PREFIX} uploaded={len(add)} skipped={len(local) - len(add)} "
+        f"deleted={len(delete)} bytes={sum(size for _s, _d, size in add)} "
+        f"prefix={args.prefix or '.'} method={method}")
+    return 0
+
+
+def cmd_probe(args):
+    api = load_api(args.token)
+    whoami(api)
+    marker = join(args.prefix, ".write-probe")
+    try:
+        api.batch_bucket_files(args.bucket_id, add=[(b"probe", marker)])
+        api.batch_bucket_files(args.bucket_id, delete=[marker])
+    except Exception as exc:
+        fail(f"no write access to {args.bucket_id} ({exc.__class__.__name__}: {exc})")
+    log(f"{SUMMARY_PREFIX} probe ok - {args.bucket_id} is writable")
+    return 0
+
+
+def cmd_create(args):
+    api = load_api(args.token)
+    try:
+        api.create_bucket(args.bucket_id, private=True, exist_ok=True)
+    except Exception as exc:
+        log(f"{SUMMARY_PREFIX} could not create {args.bucket_id} "
+            f"({exc.__class__.__name__}: {exc}) - assuming it exists")
+        return 0
+    log(f"{SUMMARY_PREFIX} bucket {args.bucket_id} ready")
+    return 0
+
+
+def cmd_whoami(args):
+    whoami(load_api(args.token))
+    return 0
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(add_help=True)
+    ap.add_argument("local_dir", nargs="?")
+    ap.add_argument("bucket_id", nargs="?")
+    ap.add_argument("prefix", nargs="?", default="")
+    ap.add_argument("--delete", action="store_true",
+                    help="also remove bucket files that are not local anymore")
+    ap.add_argument("--probe", action="store_true",
+                    help="only test that the token can write to the bucket")
+    ap.add_argument("--create", action="store_true",
+                    help="only make sure the bucket exists")
+    ap.add_argument("--whoami", action="store_true",
+                    help="print the token's user and role, then exit")
+    ap.add_argument("--token", default=os.environ.get("HF_TOKEN") or None)
+    args = ap.parse_args(argv)
+
+    # --probe/--create take the bucket id as their only argument, so it can
+    # land in either position
+    if args.whoami:
+        return cmd_whoami(args)
+    if args.probe or args.create:
+        args.bucket_id = args.bucket_id or args.local_dir
+        if not args.bucket_id:
+            ap.error("--probe/--create need a bucket id (namespace/name)")
+        return cmd_probe(args) if args.probe else cmd_create(args)
+    if not args.local_dir or not args.bucket_id:
+        ap.error("local_dir and bucket_id are required (or use --probe/--whoami)")
+    return cmd_sync(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+BUCKET_SYNC_PY_EOF
+}
+ensure_bucket_sync_py() {
+    [ -s "$BUCKET_SYNC_PY" ] || write_bucket_sync_py
+}
+# <<< embedded bucket_sync.py <<<
+
+bucket_py() {   # run the embedded bucket uploader (tools/bucket_sync.py)
+    ensure_bucket_sync_py
+    python3 "$BUCKET_SYNC_PY" "$@" 2>&1
+}
+
+# hf://buckets/ns/name/game-data -> "ns/name", and the part after it on stdout
+bucket_id_of() {
+    printf '%s' "${1#hf://buckets/}" | cut -d/ -f1,2
+}
+
+bucket_prefix_of() {
+    printf '%s' "${1#hf://buckets/}" | cut -d/ -f3-
+}
+
+# Copy a local directory into the bucket. Tries the hf CLI first (it skips
+# unchanged files) and falls back to the Python API when the CLI is missing,
+# too old, or not allowed to write - so the logs/backups cannot silently stop
+# being uploaded. $3 may be --delete (mirror, used for the world backup).
+bucket_sync_dir() {
+    local local_dir="$1" remote="$2" flag="${3:-}" bucket_id prefix out rc method
+    method="${BUCKET_METHOD:-auto}"
+    bucket_id=$(bucket_id_of "$remote")
+    prefix=$(bucket_prefix_of "$remote")
+    BUCKET_ERROR=""
+
+    if [ "$method" != "python" ] && command -v hf >/dev/null 2>&1; then
+        out=$(hf buckets sync "$local_dir" "$remote" $flag 2>&1); rc=$?
+        if [ $rc -eq 0 ]; then
+            BUCKET_VIA="cli"
+            return 0
+        fi
+        BUCKET_ERROR=$(printf '%s\n' "$out" | grep -v '^[[:space:]]*$' | tail -2 | tr '\n' ' ')
+        if [ "$method" = "cli" ]; then
+            echo "   [BUCKET] hf buckets sync failed: $BUCKET_ERROR"
+            return 1
+        fi
+        echo "   [BUCKET] hf buckets sync failed (rc=$rc): $BUCKET_ERROR"
+        echo "   [BUCKET] retrying with the Python API..."
+    fi
+
+    out=$(bucket_py "$local_dir" "$bucket_id" "$prefix" $flag)
+    rc=$?
+    printf '%s\n' "$out" | grep -v '^[[:space:]]*$' | tail -3 | sed 's/^/   /'
+    if [ $rc -eq 0 ]; then
+        BUCKET_VIA="python"
+        return 0
+    fi
+    BUCKET_ERROR=$(printf '%s\n' "$out" | grep -v '^[[:space:]]*$' | tail -2 | tr '\n' ' ')
+    BUCKET_VIA=""
+    return 1
+}
+
+# Does the Space's token actually have write access? Asked once at boot, with
+# the answer (and the fix) printed where the user can see it in the Logs tab.
+bucket_write_probe() {
+    local out rc bucket_id role
+    BUCKET_WRITE_OK=false
+    BUCKET_VIA=""
+    bucket_id=$(bucket_id_of "$HF_BUCKET_HANDLE")
+    echo "[BUCKET] write test: $HF_BUCKET_HANDLE"
+
+    out=$(bucket_py --whoami); rc=$?
+    if [ $rc -eq 0 ]; then
+        role=$(printf '%s\n' "$out" | sed -n 's/.*token_role=\([^ ]*\).*/\1/p' | head -1)
+        [ -n "$role" ] && echo "   [BUCKET] token role: $role"
+    else
+        echo "   [BUCKET] $(printf '%s\n' "$out" | tail -1)"
+    fi
+
+    if [ "${BUCKET_METHOD:-auto}" != "python" ] && command -v hf >/dev/null 2>&1; then
+        printf 'probe' > /tmp/.hf-write-probe
+        out=$(hf buckets cp /tmp/.hf-write-probe "$HF_BUCKET_HANDLE/.write-probe" 2>&1); rc=$?
+        if [ $rc -eq 0 ]; then
+            hf buckets remove "$HF_BUCKET_HANDLE/.write-probe" >/dev/null 2>&1
+            BUCKET_WRITE_OK=true
+            BUCKET_VIA="cli"
+            echo "   [BUCKET] write test OK (hf CLI)"
+            return 0
+        fi
+        echo "   [BUCKET] hf CLI cannot write: $(printf '%s\n' "$out" | grep -v '^[[:space:]]*$' | tail -1)"
+    fi
+
+    out=$(bucket_py --probe "$bucket_id"); rc=$?
+    if [ $rc -eq 0 ]; then
+        BUCKET_WRITE_OK=true
+        BUCKET_VIA="python"
+        BUCKET_METHOD="python"
+        echo "   [BUCKET] write test OK (Python API)"
+        return 0
+    fi
+
+    echo "   [BUCKET] $(printf '%s\n' "$out" | grep -v '^[[:space:]]*$' | tail -1)"
+    echo "   [BUCKET] !! NOTHING will reach the bucket until this works."
+    echo "   [BUCKET] !! 1. open huggingface.co/settings/tokens -> New token -> Write"
+    echo "   [BUCKET] !! 2. copy it, then Space Settings -> Variables and secrets"
+    echo "   [BUCKET] !! 3. new secret: name HF_TOKEN, value the token, then Restart"
+    return 1
 }
 
 hf_restore_saves() {
@@ -903,11 +1355,11 @@ hf_push_saves() {
             cp -a "$BACKEND_DIR/$item" "$STAGING/$item"
         fi
     done
-    out=$(hf buckets sync "$STAGING" "${HF_BUCKET_HANDLE}/game-data" --delete 2>&1)
-    rc=$?
-    echo "$out" | tail -3
-    [ $rc -eq 0 ] && echo "[SYNC] OK $(date '+%H:%M:%S')" \
-                  || echo "[SYNC] FAIL $(date '+%H:%M:%S')"
+    if bucket_sync_dir "$STAGING" "${HF_BUCKET_HANDLE}/game-data" --delete; then
+        echo "[SYNC] OK $(date '+%H:%M:%S') via ${BUCKET_VIA:-?}"
+    else
+        echo "[SYNC] FAIL $(date '+%H:%M:%S') - ${BUCKET_ERROR:-unknown error}"
+    fi
     rm -rf "$STAGING"
 }
 
@@ -929,13 +1381,12 @@ hf_push_logs() {
         [ -f /tmp/paper.log ]  && tail -n "$CONSOLE_LOG_LINES" /tmp/paper.log  > "$STAGING/logs/paper.log"  2>/dev/null
         [ -f /tmp/bungee.log ] && tail -n "$CONSOLE_LOG_LINES" /tmp/bungee.log > "$STAGING/logs/bungee.log" 2>/dev/null
     fi
-    out=$(hf buckets sync "$STAGING" "${HF_BUCKET_HANDLE}/game-data" 2>&1)
-    rc=$?
-    if [ $rc -eq 0 ]; then
-        echo "[LOGSYNC] OK $(date '+%H:%M:%S') (security-logs$([ "$SYNC_PRIVATE_LOGS" = true ] && echo ' + private-logs')$([ "$SYNC_CONSOLE_LOGS" = true ] && echo ' + console tails'))"
+    LOG_SYNC_FILES=$(cd "$STAGING" 2>/dev/null && find . -type f -printf '%P(%s) ' 2>/dev/null | sort)
+    if bucket_sync_dir "$STAGING" "${HF_BUCKET_HANDLE}/game-data"; then
+        echo "[LOGSYNC] OK $(date '+%H:%M:%S') via ${BUCKET_VIA:-?} (security-logs$([ "$SYNC_PRIVATE_LOGS" = true ] && echo ' + private-logs')$([ "$SYNC_CONSOLE_LOGS" = true ] && echo ' + console tails'))"
+        echo "          $(printf '%s' "$LOG_SYNC_FILES")"
     else
-        echo "[LOGSYNC] FAIL $(date '+%H:%M:%S')"
-        echo "$out" | tail -3
+        echo "[LOGSYNC] FAIL $(date '+%H:%M:%S') - ${BUCKET_ERROR:-unknown error}"
     fi
     rm -rf "$STAGING"
 }
@@ -960,9 +1411,11 @@ log_sync_loop() {
 echo "[0/7] Bucket setup..."
 hf_authenticate
 hf_ensure_bucket
+bucket_write_probe || true
 hf_restore_saves
 mkdir -p "$SEC_DIR" "$PRIV_DIR"
 touch "$LOGIN_LOG" "$CMD_LOG" "$CLIENT_LOG" "$AUTH_LOG"
+: > "$ONLINE_STATE"
 echo ""
 
 # =============================================================
@@ -1105,6 +1558,11 @@ done
 # Start security logger (logins/IPs + commands + verified client checks)
 start_security_logger
 echo " Security logger PID: $SECLOG_PID"
+
+# Safety net for logins the log files never showed (RCON `list` polling)
+playerlist_loop &
+PLAYERLIST_PID=$!
+echo " Player list watchdog PID: $PLAYERLIST_PID (every ${PLAYERLIST_POLL}s)"
 
 for i in $(seq 1 30); do
     nc -z 127.0.0.1 25575 2>/dev/null && break
@@ -1292,6 +1750,11 @@ if [ "$PORT_READY" = true ]; then
     [ -n "$OP_USERNAME" ] && echo " OP: $OP_USERNAME (level 4)"
     echo " Plugins Synced via HuggingFace!"
     echo " Security logging ACTIVE  ->  ${HF_BUCKET_HANDLE}/game-data/"
+    if [ "$BUCKET_WRITE_OK" = true ]; then
+        echo "   bucket uploads: OK (${BUCKET_VIA:-?}), every ${LOG_SYNC_INTERVAL}s + world every ${SYNC_INTERVAL}s"
+    else
+        echo "   bucket uploads: FAILING - see the [BUCKET] lines above"
+    fi
     echo "   security-logs/{logins,commands,client-checks}.log + shared-ips.txt"
     [ "$SYNC_PRIVATE_LOGS" = true ] && \
         echo "   private-logs/{auth,player-ips,logins-real-ips}.log + shared-ips-private.txt"

@@ -80,6 +80,12 @@ export PRIVATE_IP_LOG=true
 export SYNC_CONSOLE_LOGS=false   # turned on in section 6
 
 export VERIFIED_CLIENT_KICK_MESSAGE="This server only allows the verified client."
+export ONLINE_STATE="$WORK/online-players.txt"
+export PLAYERLIST_POLL=1
+export BUCKET_METHOD="auto"
+export BUCKET_SYNC_PY="$WORK/bucket_sync.py"
+export BUCKET_VIA=""
+export BUCKET_ERROR=""
 export LOGIN_CLIENT_FIELD=""   # set by start.sh from HIDE_VERIFIED_IP
 : > "$VERDICT_CACHE"; : > "$IP_MAP"; : > "$PENDING_AUTH"; : > "$AUTH_SEEN"
 touch "$BLOG" "$CLIENT_LOG" "$LOGIN_LOG" "$CMD_LOG" "$AUTH_LOG" "$IP_MAP_FILE"
@@ -92,6 +98,10 @@ for f in strip_colours bungee_console bungee_alive query_client_brand check_play
          flush_pending_auth ip_field hide_ip_for client_field \
          set_verdict verdict_for verdict_label is_bypassed enforce_client_policy \
          shared_report_body report_shared_ips hf_push_logs hf_push_saves \
+         is_online mark_online mark_offline record_login record_logout \
+         playerlist_names playerlist_check playerlist_loop \
+         bucket_id_of bucket_prefix_of bucket_sync_dir bucket_write_probe bucket_py \
+         write_bucket_sync_py ensure_bucket_sync_py \
          handle_paper_line handle_bungee_line; do
     extract "$f"
 done | sed "s|/tmp/bungee.log|$BLOG|g" > "$FUNCS"
@@ -424,6 +434,170 @@ print("yes" if (ok1 and ok2 and ok3) else f"no {ok1} {ok2} {ok3}")
 PY
 )
 check "the tool enforces the loader's 32 MiB dictionary limit" "$LIMITS" "yes"
+
+# --------------------------------------------------------------------------- #
+echo "== 9. logins are logged whatever the console looks like =="
+# The complaint this section exists for: "it's not logging logins".  The old
+# patterns only matched one Paper console format and a grep pre-filter dropped
+# everything else, so a different version - or a login the proxy reported
+# first - wrote no row at all. Section 9 only tests detection, so the client
+# check (which talks to the mock proxy) is stubbed out here.
+check_player_client() { :; }
+: > "$ONLINE_STATE"; : > "$LOGIN_LOG"; : > "$CMD_LOG"; : > "$IP_MAP"
+
+# (a) the modern Paper line ([time] [thread/INFO]) and the old one
+handle_paper_line "[15:04:11] [Server thread/INFO]: ModernGuy[/10.0.0.1:5000] logged in with entity id 42 at ([world]0.0, 0.0, 0.0)"
+handle_paper_line "[15:04:11 INFO]: OldGuy[/10.0.0.4:5004] logged in with entity id 43 at (0.0, 0.0, 0.0)"
+check "a modern Paper login line is logged" "$(grep -c '| LOGIN | ModernGuy |' "$LOGIN_LOG")" "1"
+check "…and the IP is recorded (hidden in the row until the check resolves)" \
+      "$(grep -c '^ModernGuy	10\.0\.0\.1$' "$IP_MAP")" "1"
+check "the older Paper format still works" "$(grep -c '| LOGIN | OldGuy |' "$LOGIN_LOG")" "1"
+
+# (b) no console prefix at all (other log backends / log formats)
+handle_paper_line "BareGuy[/10.0.0.2:5001] logged in with entity id 7"
+check "a bare login line is logged" "$(grep -c '| LOGIN | BareGuy |' "$LOGIN_LOG")" "1"
+
+# (c) the proxy reports the join before Paper ever sees it
+handle_bungee_line "[15:04:12 INFO] [UserConnection] ProxyGuy[/10.0.0.3:5002] <-> InitialHandler has connected"
+check "the proxy handshake alone is not a login yet" "$(grep -c '| LOGIN | ProxyGuy' "$LOGIN_LOG")" "0"
+handle_bungee_line "[15:04:13 INFO] ProxyGuy[/10.0.0.3:5002] <-> ServerConnector [lobby] has connected"
+check "a proxy-only login is logged" "$(grep -c '| LOGIN | ProxyGuy |' "$LOGIN_LOG")" "1"
+check "…with the IP from the proxy" \
+      "$(grep '^ProxyGuy	10\.0\.0\.3$' "$IP_MAP" | sort -u | wc -l | tr -d ' ')" "1"
+
+# (d) the same join seen by everything stays one row
+handle_paper_line "[15:04:13] [Server thread/INFO]: ProxyGuy[/10.0.0.3:5002] logged in with entity id 9"
+handle_bungee_line "[15:04:14 INFO] ProxyGuy[/10.0.0.3:5002] <-> ServerConnector [lobby] has connected"
+check "paper + proxy = one LOGIN row" "$(grep -c '| LOGIN | ProxyGuy' "$LOGIN_LOG")" "1"
+
+# (e) logouts, in either wording, exactly once
+handle_paper_line "[15:10:00] [Server thread/INFO]: ModernGuy lost connection: Disconnected"
+check "'lost connection' logs a LOGOUT" "$(grep -c '| LOGOUT | ModernGuy |' "$LOGIN_LOG")" "1"
+handle_paper_line "[15:10:01 INFO]: ModernGuy left the game"
+check "…and the duplicate 'left the game' does not" "$(grep -c '| LOGOUT | ModernGuy |' "$LOGIN_LOG")" "1"
+
+# (f) the safety net: the server itself is asked who is online
+mc_command() { printf '%s' "There are 2 of a max 20 players online: RconGuy, A_b-c"; }
+check "the player list is parsed" "$(mc_command 'list' | playerlist_names | tr '\n' ' ')" "RconGuy A_b-c "
+PLOUT=$(playerlist_check 2>&1)
+check "a player the logs never showed still gets a LOGIN row" \
+      "$(grep -c '| LOGIN | RconGuy |' "$LOGIN_LOG")" "1"
+check "…and a proxy login is not logged twice by the player list" \
+      "$(grep -c '| LOGIN | ProxyGuy |' "$LOGIN_LOG")" "1"
+check "…with a note in the console (visible in the Space Logs tab)" \
+      "$(grep -c 'RconGuy is online without a LOGIN row' <<<"$PLOUT")" "1"
+check "a repeat poll does not duplicate the row" \
+      "$(playerlist_check; grep -c '| LOGIN | RconGuy |' "$LOGIN_LOG")" "1"
+mc_command() { printf '%s' "There are 0 of a max 20 players online:"; }
+playerlist_check
+check "leaving is logged from the player list as well" "$(grep -c '| LOGOUT | RconGuy |' "$LOGIN_LOG")" "1"
+check "…and the online state is empty again" "$(grep -c . "$ONLINE_STATE")" "0"
+# an RCON hiccup must not be read as "everybody left"
+mc_command() { return 1; }
+handle_bungee_line "[15:14:00 INFO] ProxyGuy[/10.0.0.3:5002] <-> ServerConnector [lobby] has connected"
+BEFORE_LOGOUTS=$(grep -c '| LOGOUT | ProxyGuy |' "$LOGIN_LOG")
+playerlist_check
+check "an RCON failure never logs everybody out" \
+      "$(( $(grep -c '| LOGOUT | ProxyGuy |' "$LOGIN_LOG") - BEFORE_LOGOUTS ))" "0"
+check "…and the online state survives it" "$(grep -c '^ProxyGuy$' "$ONLINE_STATE")" "1"
+mc_command() { printf '%s\n' "$*" >> "$WORK/kicks"; }
+
+# the console gets a line per login/logout, so the Space Logs tab shows them
+: > "$ONLINE_STATE"
+LOGOUT=$( { handle_paper_line "[15:15:00] [Server thread/INFO]: EchoGuy[/10.0.0.9:5009] logged in with entity id 3"; } 2>&1 )
+check "logins are echoed to the console" "$(grep -c '\[LOG\] LOGIN  EchoGuy' <<<"$LOGOUT")" "1"
+
+# --------------------------------------------------------------------------- #
+echo "== 10. the bucket upload cannot silently stop =="
+# the embedded copy of the uploader must be the tested file, byte for byte
+EMBEDDED=$(python3 - "$ROOT" <<'PYSAME'
+import re, sys
+root = sys.argv[1]
+start = open(root + "/start.sh").read()
+m = re.search(r"<<'BUCKET_SYNC_PY_EOF'\n(.*?)\nBUCKET_SYNC_PY_EOF", start, re.S)
+src = open(root + "/tools/bucket_sync.py").read()
+print("same" if m and m.group(1) + "\n" == src else "different")
+PYSAME
+)
+check "start.sh ships the same bucket uploader as tools/bucket_sync.py" "$EMBEDDED" "same"
+
+FAKE_LIB="$WORK/fakelib"; mkdir -p "$FAKE_LIB"
+cat > "$FAKE_LIB/huggingface_hub.py" <<'PYFAKE'
+"""Minimal stand-in for the real library, used to test the upload path."""
+import os
+
+
+class HfApi:
+    def __init__(self, token=None):
+        pass
+
+    def whoami(self):
+        return {"name": "tester", "auth": {"accessToken": {"role": "write"}}}
+
+    def create_bucket(self, bucket_id, private=None, exist_ok=False, **kw):
+        pass
+
+    def list_bucket_tree(self, bucket_id, prefix=None, recursive=False):
+        return []
+
+    def batch_bucket_files(self, bucket_id, add=None, delete=None, **kw):
+        with open(os.environ.get("FAKE_HF_LOG", "/tmp/fake-hf.log"), "a") as fh:
+            for src, dst in (add or []):
+                data = src if isinstance(src, bytes) else open(src, "rb").read()
+                fh.write(f"add {bucket_id} {dst} {len(data)}\n")
+            for path in (delete or []):
+                fh.write(f"delete {bucket_id} {path}\n")
+PYFAKE
+export PYTHONPATH="$FAKE_LIB${PYTHONPATH:+:$PYTHONPATH}"
+export FAKE_HF_LOG="$WORK/fake-hf.log"
+
+# force the CLI to fail: the uploader has to fall back to the Python API
+hf() { printf 'hf %s\n' "$*" >> "$HF_CALLS"; return 1; }   # missing / read-only / too old
+STAGING="$WORK/stage-bucket"; mkdir -p "$STAGING/security-logs" "$STAGING/private-logs"
+echo "a login"    > "$STAGING/security-logs/logins.log"
+echo "a password" > "$STAGING/private-logs/auth.log"
+: > "$FAKE_HF_LOG"; : > "$HF_CALLS"
+BUCKET_METHOD=auto
+if bucket_sync_dir "$STAGING" "hf://buckets/tester/1.12/game-data" > "$WORK/sync.out" 2>&1; then
+    ok "the upload falls back to the Python API when hf fails"
+else
+    bad "the upload falls back to the Python API when hf fails"
+fi
+check "…and says so" "$(grep -c 'retrying with the Python API' "$WORK/sync.out")" "1"
+check "…and reports the CLI error instead of swallowing it" \
+      "$(grep -c 'hf buckets sync failed' "$WORK/sync.out")" "1"
+check "…the security log lands in the bucket" \
+      "$(grep -c '^add tester/1.12 game-data/security-logs/logins.log ' "$FAKE_HF_LOG")" "1"
+check "…the private log (passwords) lands in the bucket too" \
+      "$(grep -c '^add tester/1.12 game-data/private-logs/auth.log ' "$FAKE_HF_LOG")" "1"
+check "…and the sync line says which path was used" \
+      "$(grep -c 'bucket-sync:' "$WORK/sync.out")" "1"
+check "BUCKET_VIA reports python for the caller" "$BUCKET_VIA" "python"
+
+# the write probe: CLI broken -> the Python API, and the banner can say OK
+: > "$FAKE_HF_LOG"
+bucket_write_probe > "$WORK/probe.out" 2>&1
+check "the write probe finds the working path" \
+      "$(grep -c 'write test OK (Python API)' "$WORK/probe.out")" "1"
+check "…and switches the sync over to it" "$BUCKET_METHOD" "python"
+check "…after reporting the token role" "$(grep -c 'token role: write' "$WORK/probe.out")" "1"
+
+# nothing works: the user is told exactly what to do, in the Space logs
+python3() { return 1; }        # pretend the image has no usable huggingface_hub
+hf() { return 1; }
+BUCKET_METHOD=auto
+bucket_write_probe > "$WORK/probe-fail.out" 2>&1
+check "a dead bucket path is called out" \
+      "$(grep -c 'NOTHING will reach the bucket' "$WORK/probe-fail.out")" "1"
+check "…with the fix (a Write token as HF_TOKEN)" \
+      "$(grep -c 'name HF_TOKEN' "$WORK/probe-fail.out")" "1"
+unset -f python3
+# back to the fake CLI that works, so nothing after this inherits the failure
+hf() {   # fake the HF CLI: record the call and the staged files
+    printf 'hf %s\n' "$*" >> "$HF_CALLS"
+    [ -d "${3:-}" ] && find "$3" -type f -printf '%P\n' | sort >> "$HF_STAGED"
+    return 0
+}
 
 if [ "${PRINT_LOGS:-0}" = "1" ]; then
     echo

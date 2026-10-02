@@ -281,12 +281,19 @@ using eaglercraft!`) become `VANILLA`; no answer at all becomes `UNKNOWN`, never
   (`tools/run_epw_loader.mjs`) and requires `LOADER VERDICT: OK`, plus a
   negative control (a corrupted CRC must be rejected) — this is the check that
   catches the "EPW file is invalid / Try again later" class of bugs;
-* asserts the tool enforces the loader's 32 MiB dictionary limit.
+* asserts the tool enforces the loader's 32 MiB dictionary limit;
+* logs a login from every console format the server might use (modern Paper,
+  old Paper, bare, proxy-only) and only once when several report it;
+* catches a login the log files never showed at all, through the RCON player
+  list, and does not log everybody out when RCON hiccups;
+* keeps uploading when `hf` fails, by falling back to `tools/bucket_sync.py`
+  (the copy embedded in `start.sh` must stay byte-identical to that file), and
+  tells the user in the Space logs when the token cannot write at all.
 
 Run it after any change:
 
 ```bash
-bash tests/test_verified_client.sh               # 91 checks
+bash tests/test_verified_client.sh               # 124 checks
 PRINT_LOGS=1 bash tests/test_verified_client.sh  # …and dump the logs it built
 node tools/run_epw_loader.mjs client/1.12.html   # just boot the client's loader
 ```

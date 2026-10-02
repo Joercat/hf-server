@@ -34,6 +34,8 @@ A Hugging Face Space that runs:
 | `client/1.12.html` | **the verified client** (patched, see below) |
 | `tools/patch_verified_client.py` | patches / inspects the client brand |
 | `tools/run_epw_loader.mjs` | boots the client's own EPW loader to prove the file loads |
+| `tools/bucket_sync.py` | uploads a folder to the bucket (the fallback used when `hf` fails; embedded in `start.sh`) |
+| `tools/embed_bucket_sync.py` | keeps that embedded copy in sync (the tests fail when they differ) |
 | `tools/fetch-logs.sh` | downloads all the server logs from the bucket |
 | `tools/push-to-space.sh` | uploads only the files the Space needs |
 | `tests/test_verified_client.sh` | test suite (client ⇄ server consistency + detection) |
@@ -88,6 +90,29 @@ Switches: `SYNC_PRIVATE_LOGS=false` stops uploading `private-logs/` (then
 `auth.log` and the real IPs only exist inside the Space — and you cannot read
 them from outside), `SYNC_CONSOLE_LOGS=false` stops the console tails,
 `SYNC_INTERVAL` / `LOG_SYNC_INTERVAL` change the sync periods.
+
+#### If the bucket stays empty ("I don't see private-logs")
+
+The Space uploads with the `hf` CLI first and falls back to the Python API
+(`tools/bucket_sync.py`, embedded in `start.sh`), so a broken CLI alone no
+longer loses anything. What it *cannot* work around is a token without write
+access. At boot the Space therefore tests it and prints the answer next to the
+other startup output (Space → **Logs** tab):
+
+```
+[BUCKET] write test: hf://buckets/smodusermc/1.12/game-data
+   [BUCKET] token role: read
+   [BUCKET] hf CLI cannot write: ...
+   [BUCKET] !! NOTHING will reach the bucket until this works.
+   [BUCKET] !! 1. open huggingface.co/settings/tokens -> New token -> Write
+   [BUCKET] !! 2. copy it, then Space Settings -> Variables and secrets
+   [BUCKET] !! 3. new secret: name HF_TOKEN, value the token, then Restart
+```
+
+Fix = create a **Write** token and save it as the Space secret `HF_TOKEN`, then
+restart the Space. Every sync then prints `[LOGSYNC] OK … via cli` or
+`… via python`; a failure prints the reason instead of dying quietly.
+`BUCKET_METHOD=cli` or `BUCKET_METHOD=python` forces one upload path.
 
 ⚠️ With the defaults the bucket contains **clear-text passwords** (`auth.log`)
 and **your real IP** (`player-ips.log`), so keep the bucket private.
@@ -187,7 +212,7 @@ drift apart. The suite also checks the hidden-IP logging, the enforcement
 client's own EPW loader** (in Node) to prove the file still loads:
 
 ```bash
-bash tests/test_verified_client.sh              # 91 checks
+bash tests/test_verified_client.sh              # 124 checks
 
 # same, but print the logs it produced, so you can see the formats:
 PRINT_LOGS=1 bash tests/test_verified_client.sh
@@ -209,6 +234,23 @@ The loader is strict, and the tool now mirrors it:
   must match, and every slice must stay in bounds. `--check` verifies all of
   this on an existing file, and `tools/run_epw_loader.mjs` then runs the real
   loader as the final proof.
+
+### Why a login is never missed
+
+A join is reported three times and any one of them is enough:
+
+| source | line | why it matters |
+| --- | --- | --- |
+| Paper | `<name>[/<ip>:<port>] logged in with entity id …` | has the IP, current and older console formats |
+| BungeeCord | `<name>[/<ip>:<port>] <-> ServerConnector [lobby] has connected` | sees the player even if Paper's line never appears |
+| the server itself | RCON `list`, polled every `PLAYERLIST_POLL` (20) s | catches anything the log files never showed, whatever the console format is |
+
+The first of them that arrives writes the single `LOGIN` row (the name is
+marked online, so the other two stay quiet) and every login/logout is echoed to
+the console as `[LOG] LOGIN <name>` — visible in the Space's *Logs* tab, i.e.
+without the bucket. Player names come from LoginSecurity/AuthMe commands
+(`/login`, `/register`, `/changepass`, `/l`), which both plugins print to the
+console.
 
 ### Policy switches (top of `start.sh`)
 
