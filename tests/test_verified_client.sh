@@ -77,6 +77,8 @@ export ENFORCE_KICK_ON_UNKNOWN=false
 export ENFORCE_BYPASS_PLAYERS=""
 export HIDE_VERIFIED_IP=true
 export PRIVATE_IP_LOG=true
+export SYNC_CONSOLE_LOGS=false   # turned on in section 6
+
 export VERIFIED_CLIENT_KICK_MESSAGE="This server only allows the verified client."
 export LOGIN_CLIENT_FIELD=""   # set by start.sh from HIDE_VERIFIED_IP
 : > "$VERDICT_CACHE"; : > "$IP_MAP"; : > "$PENDING_AUTH"; : > "$AUTH_SEEN"
@@ -89,7 +91,7 @@ for f in strip_colours bungee_console bungee_alive query_client_brand check_play
          last_ip_for mask_cmd is_auth_cmd queue_auth auth_seen_recently record_auth_seen \
          flush_pending_auth ip_field hide_ip_for client_field \
          set_verdict verdict_for verdict_label is_bypassed enforce_client_policy \
-         shared_report_body report_shared_ips \
+         shared_report_body report_shared_ips hf_push_logs hf_push_saves \
          handle_paper_line handle_bungee_line; do
     extract "$f"
 done | sed "s|/tmp/bungee.log|$BLOG|g" > "$FUNCS"
@@ -271,6 +273,86 @@ for pair in "VERIFIED:VERIFIED CLIENT" "UNVERIFIED:OTHER EAGLERCRAFT CLIENT" \
             "VANILLA:JAVA CLIENT" "PENDING:CHECK PENDING" "GARBAGE:UNKNOWN CLIENT"; do
     check "label for ${pair%%:*} is right" "$(verdict_label "${pair%%:*}")" "${pair#*:}"
 done
+
+# --------------------------------------------------------------------------- #
+echo "== 6. every log reaches the bucket =="
+export BACKEND_DIR="$WORK/backend"
+export SEC_DIR="$BACKEND_DIR/security-logs"
+export PRIV_DIR="$BACKEND_DIR/private-logs"
+export HF_BUCKET_HANDLE="hf://buckets/test/1.12"
+export FULL_STAGING="$WORK/stage-full"
+export LOG_STAGING="$WORK/stage-logs"
+export SAVE_DIRS="security-logs private-logs"
+mkdir -p "$SEC_DIR" "$PRIV_DIR"
+touch "$SEC_DIR/logins.log" "$SEC_DIR/commands.log" "$SEC_DIR/client-checks.log" \
+      "$SEC_DIR/shared-ips.txt" "$PRIV_DIR/auth.log" "$PRIV_DIR/player-ips.log"
+HF_CALLS="$WORK/hf-calls.txt"; HF_STAGED="$WORK/hf-staged.txt"
+: > "$HF_CALLS"; : > "$HF_STAGED"
+hf() {   # fake the HF CLI: record the call and the staged files
+    printf 'hf %s\n' "$*" >> "$HF_CALLS"
+    [ -d "${3:-}" ] && find "$3" -type f -printf '%P\n' | sort >> "$HF_STAGED"
+    return 0
+}
+
+log_sync_cmd() { grep -m1 'buckets sync' "$HF_CALLS"; }
+
+: > "$HF_CALLS"; : > "$HF_STAGED"
+SYNC_PRIVATE_LOGS=true hf_push_logs
+check "the log sync pushes to the bucket" \
+      "$(grep -c "hf buckets sync $LOG_STAGING $HF_BUCKET_HANDLE/game-data" "$HF_CALLS")" "1"
+check "the log sync never uses --delete" "$(grep -c -- '--delete' "$HF_CALLS")" "0"
+check "security-logs are staged" "$(grep -c '^security-logs/logins.log$' "$HF_STAGED")" "1"
+check "commands.log is staged" "$(grep -c '^security-logs/commands.log$' "$HF_STAGED")" "1"
+check "client-checks.log is staged" "$(grep -c '^security-logs/client-checks.log$' "$HF_STAGED")" "1"
+check "shared-ips.txt is staged" "$(grep -c '^security-logs/shared-ips.txt$' "$HF_STAGED")" "1"
+check "auth.log (full /login) is staged" "$(grep -c '^private-logs/auth.log$' "$HF_STAGED")" "1"
+check "player-ips.log (the hidden IPs) is staged" "$(grep -c '^private-logs/player-ips.log$' "$HF_STAGED")" "1"
+check "the log staging dir is cleaned up" "$([ -d "$LOG_STAGING" ] && echo yes || echo no)" "no"
+
+: > "$HF_CALLS"; : > "$HF_STAGED"
+SYNC_PRIVATE_LOGS=false hf_push_logs
+check "SYNC_PRIVATE_LOGS=false keeps auth.log out of the bucket" \
+      "$(grep -c '^private-logs/' "$HF_STAGED")" "0"
+check "…and still uploads the sanitised logs" "$(grep -c '^security-logs/logins.log$' "$HF_STAGED")" "1"
+
+# raw console tails, so a boot failure is readable without Space access
+export CONSOLE_LOG_LINES=1000
+printf 'line1\n%s\n' "$(seq 1 5 | tr '\n' ' ')" > /tmp/paper.log
+printf 'bungee line\n' > /tmp/bungee.log
+: > "$HF_STAGED"
+SYNC_CONSOLE_LOGS=true SYNC_PRIVATE_LOGS=true hf_push_logs
+check "paper.log tail is uploaded" "$(grep -c '^logs/paper.log$' "$HF_STAGED")" "1"
+check "bungee.log tail is uploaded" "$(grep -c '^logs/bungee.log$' "$HF_STAGED")" "1"
+: > "$HF_STAGED"
+SYNC_CONSOLE_LOGS=false SYNC_PRIVATE_LOGS=true hf_push_logs
+check "SYNC_CONSOLE_LOGS=false skips the console tails" "$(grep -c '^logs/' "$HF_STAGED")" "0"
+
+: > "$HF_CALLS"; : > "$HF_STAGED"
+hf_push_saves
+check "the full game-data sync still mirrors with --delete" "$(grep -c -- '--delete' "$HF_CALLS")" "1"
+check "the full sync includes security-logs" "$(grep -c '^security-logs/logins.log$' "$HF_STAGED")" "1"
+check "the full sync includes private-logs" "$(grep -c '^private-logs/auth.log$' "$HF_STAGED")" "1"
+check "the full staging dir is cleaned up" "$([ -d "$FULL_STAGING" ] && echo yes || echo no)" "no"
+
+# the real SAVE_DIRS from start.sh must contain private-logs (and follow the switch)
+save_dirs_from_start_sh() {
+    ( SYNC_PRIVATE_LOGS="$1"; unset SAVE_DIRS
+      eval "$(grep -m1 -F 'SAVE_DIRS="world' "$ROOT/start.sh")"
+      eval "$(grep -m1 -F '[ "$SYNC_PRIVATE_LOGS" = true ] && SAVE_DIRS=' "$ROOT/start.sh")"
+      echo "$SAVE_DIRS" )
+}
+check "start.sh syncs private-logs by default" \
+      "$(save_dirs_from_start_sh true | tr ' ' '\n' | grep -c '^private-logs$')" "1"
+check "start.sh honours SYNC_PRIVATE_LOGS=false" \
+      "$(save_dirs_from_start_sh false | tr ' ' '\n' | grep -c '^private-logs$')" "0"
+check "start.sh still syncs the security-logs" \
+      "$(save_dirs_from_start_sh true | tr ' ' '\n' | grep -c '^security-logs$')" "1"
+check "start.sh has a dedicated fast log sync loop" \
+      "$(grep -c '^log_sync_loop &\?$' "$ROOT/start.sh")" "1"
+check "the log sync interval defaults to 60s" \
+      "$(grep -c '^LOG_SYNC_INTERVAL="\${LOG_SYNC_INTERVAL:-60}"$' "$ROOT/start.sh")" "1"
+check "the shutdown pushes the last log lines" \
+      "$(grep -c 'hf_push_logs     # make sure the last log lines reached the bucket' "$ROOT/start.sh")" "1"
 
 if [ "${PRINT_LOGS:-0}" = "1" ]; then
     echo

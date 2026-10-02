@@ -178,26 +178,41 @@ DRM mechanism.
    so a proxy restart can never lock you out of your own server; add names to
    `ENFORCE_BYPASS_PLAYERS` if somebody may use any client.
 7. **Passwords**: `/login`, `/l`, `/log`, `/register`, `/reg`,
-   `/changepassword`, `/changepass`, `/unregister` and `/authme` are masked in `commands.log` and kept in full in `private-logs/auth.log`, which
-   is **never synced** to the bucket. The verified client's own commands are
-   the one exception: your password is never written anywhere. Commands are
-   queued for a moment when needed, so the verdict is always known before the
-   line is written, and the same command seen twice (Paper and Bungee) is
-   written once.
+   `/changepassword`, `/changepass`, `/unregister` and `/authme` are masked in
+   `commands.log` and kept in full in `private-logs/auth.log`. The verified
+   client's own commands are the one exception: your password is never written
+   anywhere. Commands are queued for a moment when needed, so the verdict is
+   always known before the line is written, and the same command seen twice
+   (Paper and Bungee) is written once.
 
-`security-logs/` is copied into `SAVE_DIRS`-driven staging and pushed to the
-bucket every `SYNC_INTERVAL` seconds (300 by default):
+## 7. Getting the logs out of the Space
+
+The bucket is the only thing reachable from outside, so `start.sh` keeps two
+sync loops running: a fast one for the logs (`log_sync_loop`,
+`LOG_SYNC_INTERVAL=60` s, never uses `--delete`, uploads `security-logs/`,
+`private-logs/` and the tails of `/tmp/paper.log` + `/tmp/bungee.log`), and the
+full game-data mirror (`hf_sync_loop`, `SYNC_INTERVAL=300` s, `--delete`). Both
+are restarted by the monitor loop if they die, and the shutdown handler pushes
+the logs one last time.
+
+Everything lands here:
 
 ```
 hf://buckets/smodusermc/1.12/game-data/security-logs/{logins,commands,client-checks}.log
 hf://buckets/smodusermc/1.12/game-data/security-logs/shared-ips.txt
+hf://buckets/smodusermc/1.12/game-data/private-logs/{auth,player-ips,logins-real-ips}.log
+hf://buckets/smodusermc/1.12/game-data/private-logs/shared-ips-private.txt
+hf://buckets/smodusermc/1.12/game-data/logs/{paper,bungee}.log
 ```
 
-so `hf buckets cp hf://buckets/smodusermc/1.12/game-data/security-logs/logins.log .`
-or the web UI is enough to read them from outside the Space.
+`bash tools/fetch-logs.sh [outdir] [bucket/game-data]` downloads all of them in
+one go; a single file works too with
+`hf buckets cp hf://buckets/smodusermc/1.12/game-data/security-logs/logins.log .`
 
-`backend/private-logs/` is **not** in `SAVE_DIRS` and never leaves the Space
-(`start.sh` even warns at startup if `private-logs` ever ends up in the list):
+`backend/private-logs/` is synced to the bucket as well — the logs are only
+useful if you can actually read them, and the bucket is the only place reachable
+from outside the Space. Set `SYNC_PRIVATE_LOGS=false` to stop that (then the
+files below stay inside the Space and *cannot* be read from outside):
 
 | private file | content |
 | --- | --- |

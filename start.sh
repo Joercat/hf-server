@@ -51,14 +51,35 @@ BUNGEE_CONSOLE="$BUNGEE_DIR/console.pipe"
 mkdir -p "$PLUGIN_DIR" "$SEC_DIR" "$PRIV_DIR"
 
 HF_BUCKET_HANDLE="hf://buckets/smodusermc/1.12"
-# NOTE: private-logs is deliberately absent - auth.log holds clear-text
-# passwords and player-ips.log holds the IPs that are hidden in the synced
-# logs, so neither may ever leave the Space.
+
+# The bucket is the only place the logs can be read from outside the Space, so
+# BOTH log folders are synced:
+#   game-data/security-logs/  logins.log, commands.log, client-checks.log, shared-ips.txt
+#   game-data/private-logs/   auth.log (full /login lines), player-ips.log (the
+#                             real IPs that show as "hidden"), the private reports
+# SYNC_PRIVATE_LOGS=false uploads only the sanitised security-logs (then
+# auth.log and the real IPs stay inside the Space - and you cannot read them
+# from outside either).
+SYNC_PRIVATE_LOGS="${SYNC_PRIVATE_LOGS:-true}"
+
 SAVE_DIRS="world world_nether world_the_end players banned-ips.json banned-players.json ops.json whitelist.json plugins security-logs"
-case " $SAVE_DIRS " in *" private-logs "*)
-    echo "WARNING: private-logs is in SAVE_DIRS - auth.log would be synced to the bucket!" ;;
-esac
+[ "$SYNC_PRIVATE_LOGS" = true ] && SAVE_DIRS="$SAVE_DIRS private-logs"
+
+if [ "$SYNC_PRIVATE_LOGS" = true ]; then
+    echo "NOTE: private-logs is synced to the bucket - it contains clear-text"
+    echo "      passwords (auth.log) and the real IPs hidden in the public logs."
+    echo "      Keep $HF_BUCKET_HANDLE private."
+fi
+
 SYNC_INTERVAL="${SYNC_INTERVAL:-300}"
+# logs are small, so they get their own much faster sync (in seconds)
+LOG_SYNC_INTERVAL="${LOG_SYNC_INTERVAL:-60}"
+# also upload the tail of the raw Paper/Bungee consoles (boot errors, crashes)
+# to game-data/logs/ so they can be read without access to the Space
+SYNC_CONSOLE_LOGS="${SYNC_CONSOLE_LOGS:-true}"
+CONSOLE_LOG_LINES="${CONSOLE_LOG_LINES:-1000}"
+FULL_STAGING="/tmp/hf-staging"
+LOG_STAGING="/tmp/hf-log-staging"
 IDLE_MODE=false
 
 # =============================================
@@ -145,15 +166,26 @@ echo " Java: $($JAVA -version 2>&1 | head -1)"
 echo " Bucket: $HF_BUCKET_HANDLE"
 [ -n "$OP_USERNAME" ] && echo " OP Account: $OP_USERNAME"
 echo " Plugins synced: WorldEdit, WorldGuard, MineResetLite, Shopkeepers, SafeTrade, Skript, PvPManager"
-echo " Security logs: $SEC_DIR (synced to the bucket every ${SYNC_INTERVAL}s)"
-if [ "$HIDE_VERIFIED_IP" = true ]; then
-    echo "   -> the verified client is hidden: its IP is written as \"hidden\" and no"
-    echo "      client=... / VERIFY line is added for it"
-    echo "   -> real IPs of hidden lines -> $IP_MAP_FILE (not synced)"
+echo " Security logs: $SEC_DIR"
+echo " Private logs:  $PRIV_DIR"
+echo " Both are synced to the bucket every ${LOG_SYNC_INTERVAL}s (full game-data sync: ${SYNC_INTERVAL}s):"
+echo "   ${HF_BUCKET_HANDLE}/game-data/security-logs/logins.log        logins + verdicts"
+echo "   ${HF_BUCKET_HANDLE}/game-data/security-logs/commands.log      every command"
+echo "   ${HF_BUCKET_HANDLE}/game-data/security-logs/client-checks.log verified/other/vanilla per login"
+echo "   ${HF_BUCKET_HANDLE}/game-data/security-logs/shared-ips.txt    shared-IP report"
+if [ "$SYNC_PRIVATE_LOGS" = true ]; then
+    echo "   ${HF_BUCKET_HANDLE}/game-data/private-logs/auth.log          full /login lines (passwords!)"
+    echo "   ${HF_BUCKET_HANDLE}/game-data/private-logs/player-ips.log     real IPs of \"hidden\" lines"
+    echo "   ${HF_BUCKET_HANDLE}/game-data/private-logs/logins-real-ips.log, shared-ips-private.txt"
+else
+    echo "   (SYNC_PRIVATE_LOGS=false: auth.log / player-ips.log stay inside the Space)"
 fi
-echo " Private logs (never synced): $PRIV_DIR"
-echo "   -> auth.log: full /login|/register|/changepassword commands of everybody"
-echo "      except the verified client (for password resets)"
+[ "$SYNC_CONSOLE_LOGS" = true ] && \
+    echo "   ${HF_BUCKET_HANDLE}/game-data/logs/{paper,bungee}.log        last ${CONSOLE_LOG_LINES} console lines"
+if [ "$HIDE_VERIFIED_IP" = true ]; then
+    echo " The verified client is hidden in the security-logs: its IP is written as"
+    echo " \"hidden\" and it gets no client=... tag / VERIFY line"
+fi
 echo " Verified client: $VERIFIED_CLIENT_BRAND ($VERIFIED_CLIENT_UUID)"
 if [ "$ENFORCE_VERIFIED_CLIENT" = true ]; then
     echo " Enforce verified client: ON - only the verified client may join"
@@ -863,7 +895,7 @@ hf_restore_saves() {
 
 hf_push_saves() {
     report_shared_ips
-    local STAGING="/tmp/hf-staging"
+    local STAGING="$FULL_STAGING" out rc
     rm -rf "$STAGING" && mkdir -p "$STAGING"
     for item in $SAVE_DIRS; do
         if [ -e "$BACKEND_DIR/$item" ]; then
@@ -871,9 +903,40 @@ hf_push_saves() {
             cp -a "$BACKEND_DIR/$item" "$STAGING/$item"
         fi
     done
-    hf buckets sync "$STAGING" "${HF_BUCKET_HANDLE}/game-data" --delete 2>&1 | tail -3
-    [ $? -eq 0 ] && echo "[SYNC] OK $(date '+%H:%M:%S')" \
+    out=$(hf buckets sync "$STAGING" "${HF_BUCKET_HANDLE}/game-data" --delete 2>&1)
+    rc=$?
+    echo "$out" | tail -3
+    [ $rc -eq 0 ] && echo "[SYNC] OK $(date '+%H:%M:%S')" \
                   || echo "[SYNC] FAIL $(date '+%H:%M:%S')"
+    rm -rf "$STAGING"
+}
+
+# Fast log-only sync: the bucket is the only way to read the logs from outside
+# the Space, so the log folders are pushed every $LOG_SYNC_INTERVAL seconds
+# instead of waiting for the full game-data sync. No --delete here: this must
+# never remove anything from game-data (world, plugins, ...).
+hf_push_logs() {
+    flush_pending_auth
+    report_shared_ips
+    local STAGING="$LOG_STAGING" out rc
+    rm -rf "$STAGING" && mkdir -p "$STAGING"
+    [ -d "$SEC_DIR" ] && cp -a "$SEC_DIR" "$STAGING/security-logs"
+    if [ "$SYNC_PRIVATE_LOGS" = true ] && [ -d "$PRIV_DIR" ]; then
+        cp -a "$PRIV_DIR" "$STAGING/private-logs"
+    fi
+    if [ "$SYNC_CONSOLE_LOGS" = true ]; then
+        mkdir -p "$STAGING/logs"
+        [ -f /tmp/paper.log ]  && tail -n "$CONSOLE_LOG_LINES" /tmp/paper.log  > "$STAGING/logs/paper.log"  2>/dev/null
+        [ -f /tmp/bungee.log ] && tail -n "$CONSOLE_LOG_LINES" /tmp/bungee.log > "$STAGING/logs/bungee.log" 2>/dev/null
+    fi
+    out=$(hf buckets sync "$STAGING" "${HF_BUCKET_HANDLE}/game-data" 2>&1)
+    rc=$?
+    if [ $rc -eq 0 ]; then
+        echo "[LOGSYNC] OK $(date '+%H:%M:%S') (security-logs$([ "$SYNC_PRIVATE_LOGS" = true ] && echo ' + private-logs')$([ "$SYNC_CONSOLE_LOGS" = true ] && echo ' + console tails'))"
+    else
+        echo "[LOGSYNC] FAIL $(date '+%H:%M:%S')"
+        echo "$out" | tail -3
+    fi
     rm -rf "$STAGING"
 }
 
@@ -881,6 +944,13 @@ hf_sync_loop() {
     while true; do
         sleep "$SYNC_INTERVAL"
         hf_push_saves
+    done
+}
+
+log_sync_loop() {
+    while true; do
+        hf_push_logs
+        sleep "$LOG_SYNC_INTERVAL"
     done
 }
 
@@ -1221,9 +1291,11 @@ if [ "$PORT_READY" = true ]; then
     echo " SERVER READY — Vanilla EaglerCraft on :7860"
     [ -n "$OP_USERNAME" ] && echo " OP: $OP_USERNAME (level 4)"
     echo " Plugins Synced via HuggingFace!"
-    echo " Security logging ACTIVE  (client marks: security-logs/logins.log, passwords: private-logs/auth.log)"
+    echo " Security logging ACTIVE  ->  ${HF_BUCKET_HANDLE}/game-data/"
+    echo "   security-logs/{logins,commands,client-checks}.log + shared-ips.txt"
+    [ "$SYNC_PRIVATE_LOGS" = true ] && \
+        echo "   private-logs/{auth,player-ips,logins-real-ips}.log + shared-ips-private.txt"
     echo " Verified client: $VERIFIED_CLIENT_BRAND"
-    echo " Client checks -> security-logs/client-checks.log (synced to the bucket)"
     echo "============================================"
 else
     echo " Port 7860 NOT open!"
@@ -1254,10 +1326,12 @@ echo " ======================"
 echo ""
 
 # =============================================================
-# Sync loop
+# Sync loops — full game data + fast log-only sync
 # =============================================================
 hf_sync_loop &
 SYNC_PID=$!
+log_sync_loop &
+LOGSYNC_PID=$!
 
 # =============================================================
 # Shutdown — save world properly, then push, then stop processes
@@ -1270,6 +1344,8 @@ graceful_shutdown() {
     sleep 5
     pkill -f "tail -n0 -F /tmp/" 2>/dev/null
     kill $SECLOG_PID 2>/dev/null
+    kill $LOGSYNC_PID 2>/dev/null
+    hf_push_logs     # make sure the last log lines reached the bucket
     hf_push_saves
     kill $SYNC_PID 2>/dev/null
     mc_command "stop"
@@ -1321,6 +1397,12 @@ while true; do
     if ! kill -0 $SYNC_PID 2>/dev/null; then
         hf_sync_loop &
         SYNC_PID=$!
+    fi
+
+    if [ -z "${LOGSYNC_PID:-}" ] || ! kill -0 "$LOGSYNC_PID" 2>/dev/null; then
+        echo "[$(date '+%H:%M:%S')] Log sync died — restarting..."
+        log_sync_loop &
+        LOGSYNC_PID=$!
     fi
 
     if ! kill -0 "$SECLOG_PID" 2>/dev/null; then

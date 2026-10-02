@@ -20,8 +20,8 @@ A Hugging Face Space that runs:
   persistence and periodic syncs
 * an append-only **security log** of logins, commands and client checks, with
   the verified client's own IP hidden and everybody else fully logged
-* a **private log** (`private-logs/`, never synced) of full `/login`-style
-  commands of every account except the verified client's
+* a **private log** (`private-logs/`) of full `/login`-style commands of every
+  account except the verified client's
 
 ## Layout
 
@@ -33,6 +33,7 @@ A Hugging Face Space that runs:
 | `plugins/` | backend plugins copied into Paper (AuthMe jars live here) |
 | `client/1.12.html` | **the verified client** (patched, see below) |
 | `tools/patch_verified_client.py` | patches / inspects the client brand |
+| `tools/fetch-logs.sh` | downloads all the server logs from the bucket |
 | `tests/test_verified_client.sh` | test suite (client ⇄ server consistency + detection) |
 | `docs/verified-client.md` | how the verified client works, in detail |
 
@@ -55,6 +56,40 @@ arrives with the UUID
 51b2ebf3-ddab-35e7-8646-94f7bcbfd7ff
 ```
 
+### Everything ends up in the bucket
+
+The bucket is the only place the logs can be read from outside the Space, so
+both log folders **and** the raw console tails are pushed to it — the small
+ones every `LOG_SYNC_INTERVAL` seconds (60), the full game data every
+`SYNC_INTERVAL` seconds (300):
+
+```
+hf://buckets/smodusermc/1.12/game-data/security-logs/logins.log              logins (IPs/verdicts)
+hf://buckets/smodusermc/1.12/game-data/security-logs/commands.log            every command
+hf://buckets/smodusermc/1.12/game-data/security-logs/client-checks.log       verified / other / vanilla per login
+hf://buckets/smodusermc/1.12/game-data/security-logs/shared-ips.txt          shared-IP + verdict report
+hf://buckets/smodusermc/1.12/game-data/private-logs/auth.log                 full /login lines (passwords)
+hf://buckets/smodusermc/1.12/game-data/private-logs/player-ips.log           real IPs behind "hidden"
+hf://buckets/smodusermc/1.12/game-data/private-logs/logins-real-ips.log      logins with the real IPs
+hf://buckets/smodusermc/1.12/game-data/private-logs/shared-ips-private.txt   report with the real IPs
+hf://buckets/smodusermc/1.12/game-data/logs/paper.log                        last 1000 console lines
+hf://buckets/smodusermc/1.12/game-data/logs/bungee.log                       last 1000 console lines
+```
+
+Get them locally in one go:
+
+```bash
+bash tools/fetch-logs.sh            # -> ./server-logs/{security-logs,private-logs,logs}
+```
+
+Switches: `SYNC_PRIVATE_LOGS=false` stops uploading `private-logs/` (then
+`auth.log` and the real IPs only exist inside the Space — and you cannot read
+them from outside), `SYNC_CONSOLE_LOGS=false` stops the console tails,
+`SYNC_INTERVAL` / `LOG_SYNC_INTERVAL` change the sync periods.
+
+⚠️ With the defaults the bucket contains **clear-text passwords** (`auth.log`)
+and **your real IP** (`player-ips.log`), so keep the bucket private.
+
 `start.sh` asks the proxy for the brand of every player that joins
 (`/client-brand`, over a console pipe), **kicks everybody who is not the
 verified client** and records the result:
@@ -67,9 +102,10 @@ security-logs/commands.log        DATE | name | ip | command | client=...  (pass
 security-logs/client-checks.log   DATE | VERDICT | name | ip | brand=... | version=... | uuid=...
 security-logs/shared-ips.txt      report: shared IPs + verification summary
 
-private-logs/auth.log             DATE | name | ip | /login hunter2 | client=...   <- full passwords, never synced
+private-logs/auth.log             DATE | name | ip | /login hunter2 | client=...   <- full passwords
 private-logs/player-ips.log       the real IPs that show as "hidden" above
 private-logs/shared-ips-private.txt, private-logs/logins-real-ips.log
+logs/paper.log, logs/bungee.log   last 1000 lines of the raw servers
 ```
 
 Nothing that identifies the verified client is in the synced logs: its IP is
@@ -79,10 +115,9 @@ Everyone else keeps full IPs, verdicts and labels.
 
 **Passwords:** `/login`, `/l`, `/log`, `/register`, `/reg`, `/changepassword`,
 `/changepass`, `/unregister` and `/authme` are masked (`/login ********`) in
-`commands.log`, and kept in full in `private-logs/auth.log` (which is *not* in
-`SAVE_DIRS`, so it never reaches the bucket) — **except** for the verified
-client, whose password is never written anywhere. Use it to recover a password
-a player set for you.
+`commands.log`, and kept in full in `private-logs/auth.log` — **except** for the
+verified client, whose password is never written anywhere. Use it to recover a
+password a player set for you.
 
 **Only the verified client may play:** `ENFORCE_VERIFIED_CLIENT=true` (default)
 kicks `UNVERIFIED` and `VANILLA` clients right after the login. A check that
@@ -90,20 +125,6 @@ could not run (`UNKNOWN`/`CONSOLE_DOWN`, e.g. the proxy restarting) never kicks,
 so you cannot lock yourself out — set `ENFORCE_KICK_ON_UNKNOWN=true` if you
 want that too, and list names in `ENFORCE_BYPASS_PLAYERS` to let somebody in
 with any client.
-
-These files live in the Space **and are synced to the bucket** every
-`SYNC_INTERVAL` seconds (default 300), so you can read them from anywhere:
-
-```
-hf://buckets/smodusermc/1.12/game-data/security-logs/logins.log
-hf://buckets/smodusermc/1.12/game-data/security-logs/commands.log
-hf://buckets/smodusermc/1.12/game-data/security-logs/client-checks.log
-hf://buckets/smodusermc/1.12/game-data/security-logs/shared-ips.txt
-```
-
-Every login gets a `VERIFY` line and every command is tagged with the client
-that ran it, so grepping for `VERIFIED CLIENT` in the bucket tells you
-immediately which logins were your own client:
 
 `VERDICT` is one of:
 
@@ -137,8 +158,11 @@ $ tail -f /opt/server/backend/security-logs/commands.log
 2026-10-02 21:14:40 | CreppyBitch | hidden | /gamemode 1
 2026-10-02 21:15:52 | RandomDude  | 5.6.7.8 | /gamemode 1 | client=OTHER EAGLERCRAFT CLIENT
 
-$ cat /opt/server/backend/private-logs/auth.log      # never synced, passwords in clear
+$ cat /opt/server/backend/private-logs/auth.log        # passwords in clear
 2026-10-02 21:15:52 | RandomDude | 5.6.7.8 | /login hisnewpass | client=OTHER EAGLERCRAFT CLIENT
+
+$ cat /opt/server/backend/private-logs/player-ips.log  # the IPs behind "hidden"
+2026-10-02 21:14:01 | CreppyBitch | 203.0.113.7
 ```
 
 ### Changing the brand / re-patching the client
@@ -207,6 +231,9 @@ Required Space settings: a `HF_TOKEN` secret with write access to the bucket
 
 ## Notes
 
+* The bucket contains clear-text passwords (`private-logs/auth.log`) and your
+  real IP (`private-logs/player-ips.log`) with the default settings — keep the
+  bucket private; `SYNC_PRIVATE_LOGS=false` stops uploading them.
 * `plugins/` needs the AuthMe jars from the original Space (`AuthMe-6.0.1-Bungee.jar`,
   `AuthMeBungee-2.2.0-beta1.jar`); they are binary files and are not in this
   checkout — see `plugins/README.md`.
