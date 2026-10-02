@@ -5,6 +5,7 @@
 #   bash tools/push-to-space.sh                  # smodusermc/12, minimal upload
 #   bash tools/push-to-space.sh --with-readme    # also update the Space card
 #   bash tools/push-to-space.sh --with-client    # also put the private client in the bucket
+#   bash tools/push-to-space.sh --client-only    # ONLY refresh the private client in the bucket
 #   SPACE=someone/else bash tools/push-to-space.sh
 #
 # Needs the `hf` CLI (`pip install "huggingface_hub[cli]"`) and `hf auth login`
@@ -17,11 +18,13 @@ SPACE="${SPACE:-smodusermc/12}"
 BUCKET="${BUCKET:-hf://buckets/smodusermc/1.12}"
 WITH_README=false
 WITH_CLIENT=false
+CLIENT_ONLY=false
 
 for arg in "$@"; do
     case "$arg" in
         --with-readme) WITH_README=true ;;
         --with-client) WITH_CLIENT=true ;;
+        --client-only) CLIENT_ONLY=true; WITH_CLIENT=true ;;
         -h|--help) sed -n '2,12p' "$0"; exit 0 ;;
         *) echo "unknown option: $arg (see --help)"; exit 2 ;;
     esac
@@ -38,6 +41,18 @@ command -v hf >/dev/null 2>&1 || {
 #  - start.sh    (server logic, logging, enforcement, bucket syncs)
 # plugins/, config/bungee/*.jar and .gitattributes already exist on the Space
 # and must stay as they are (they are LFS-tracked there).
+if [ "$CLIENT_ONLY" = true ]; then
+    echo "Uploading the private client to the bucket (no Space rebuild):"
+    if hf buckets cp "$ROOT/client/1.12.html" "$BUCKET/client/1.12.html"; then
+        echo "  $BUCKET/client/1.12.html"
+        echo "  verify it with: hf buckets cp $BUCKET/client/1.12.html ./1.12.html && \\"
+        echo "                  python3 tools/patch_verified_client.py --check ./1.12.html"
+    else
+        echo "  failed - check that you can write to $BUCKET"; exit 1
+    fi
+    exit 0
+fi
+
 STAGE=$(mktemp -d)
 trap 'rm -rf "$STAGE"' EXIT
 cp "$ROOT/Dockerfile" "$ROOT/start.sh" "$STAGE/"

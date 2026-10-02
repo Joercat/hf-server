@@ -235,6 +235,12 @@ hf auth login                     # token with write access to smodusermc/12
 bash tools/push-to-space.sh --with-readme      # uploads Dockerfile + start.sh (+ README)
 ```
 
+After the client is rebuilt, refresh it in the bucket (no Space rebuild needed):
+
+```bash
+bash tools/push-to-space.sh --client-only
+```
+
 or by hand (one folder = one commit = one Space rebuild):
 
 ```bash
