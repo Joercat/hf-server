@@ -354,6 +354,23 @@ check "the log sync interval defaults to 60s" \
 check "the shutdown pushes the last log lines" \
       "$(grep -c 'hf_push_logs     # make sure the last log lines reached the bucket' "$ROOT/start.sh")" "1"
 
+# --------------------------------------------------------------------------- #
+echo "== 7. the Space only needs a couple of files =="
+check "the Dockerfile does not depend on client/ (kept out of the Space)" \
+      "$(grep -c '^COPY client/' "$ROOT/Dockerfile")" "0"
+check "the Dockerfile copies the files the Space has" \
+      "$(grep -c '^COPY start.sh ' "$ROOT/Dockerfile")" "1"
+check "…plugins/ (AuthMe jars live on the Space)" \
+      "$(grep -c '^COPY plugins/ ' "$ROOT/Dockerfile")" "1"
+check "…and EaglerXBungee.jar (already on the Space)" \
+      "$(grep -c '^COPY config/bungee/EaglerXBungee.jar ' "$ROOT/Dockerfile")" "1"
+FILES=$(bash "$ROOT/tools/push-to-space.sh" --help >/dev/null 2>&1; \
+        grep -oE '"\$ROOT/[A-Za-z.]+"' "$ROOT/tools/push-to-space.sh" | sed 's|"\$ROOT/||;s|"||' | sort -u | tr '\n' ' ')
+check "the push helper uploads exactly Dockerfile + start.sh (+ README on flag)" \
+      "$FILES" "Dockerfile README.md start.sh "
+check "nothing in the repo references a client file at runtime" \
+      "$(grep -c '/opt/server/client' "$ROOT/start.sh" "$ROOT/Dockerfile" | grep -c ':0$')" "2"
+
 if [ "${PRINT_LOGS:-0}" = "1" ]; then
     echo
     echo "############ security-logs/logins.log"

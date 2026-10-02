@@ -92,9 +92,12 @@ COPY plugins/ /opt/server/backend/plugins/
 # EaglerXBungee
 COPY config/bungee/EaglerXBungee.jar /opt/server/bungee/plugins/EaglerXBungee.jar
 
-# The verified client this server expects (see docs/verified-client.md).
-# start.sh checks the client brand of every login against it.
-COPY client/ /opt/server/client/
+# NOTE: client/1.12.html is deliberately NOT copied into the image (and does
+# not have to exist in the Space). It is your private client - publishing it
+# in the Space repo would hand the verified brand to everybody - so it lives
+# in the bucket or on your machine, see README "What to upload to the Space".
+# Keeping it out also means the Space can be updated file by file without
+# uploading the 22 MB client every time.
 
 RUN printf 'server_connect_timeout: 5000\n\
 online_mode: false\n\

@@ -34,6 +34,7 @@ A Hugging Face Space that runs:
 | `client/1.12.html` | **the verified client** (patched, see below) |
 | `tools/patch_verified_client.py` | patches / inspects the client brand |
 | `tools/fetch-logs.sh` | downloads all the server logs from the bucket |
+| `tools/push-to-space.sh` | uploads only the files the Space needs |
 | `tests/test_verified_client.sh` | test suite (client ⇄ server consistency + detection) |
 | `docs/verified-client.md` | how the verified client works, in detail |
 
@@ -206,28 +207,64 @@ the verified client" is as strong as the client file staying private — anybody
 who rebuilds a client with the same brand gets in. It is enough to keep
 strangers on stock clients out, which is what the logs are for.
 
-## Deploying / running
+## What actually has to go into the Space
 
-The current tree has to be copied onto the Space (this checkout does not
-contain the binary jars that live there, so do **not** force-push over it):
+**Two files**, everything else in this repo is for development:
 
 ```bash
-hf auth login                                  # token with write access to smodusermc/12
-git clone https://huggingface.co/spaces/smodusermc/12 space
-cd space
-git fetch https://github.com/Joercat/hf-server.git arena/01a0fc66-hf-server
-git checkout FETCH_HEAD -- .                   # overwrites/updates files, deletes nothing
-git add -A && git commit -m "Verified client + tagged security logs"
-git push
+hf auth login                     # token with write access to smodusermc/12
+bash tools/push-to-space.sh --with-readme      # uploads Dockerfile + start.sh (+ README)
 ```
 
-`git checkout FETCH_HEAD -- .` deliberately leaves the jars that only exist on
-the Space (`plugins/AuthMe*.jar`, `config/bungee/EaglerXServer.jar`) in place —
-they are LFS-tracked there.
+or by hand (one folder = one commit = one Space rebuild):
+
+```bash
+mkdir -p /tmp/space-files && cp Dockerfile start.sh README.md /tmp/space-files/
+hf upload smodusermc/12 /tmp/space-files . --repo-type space
+```
+
+| File | Upload? | Why |
+| --- | --- | --- |
+| `Dockerfile` | **yes** | build recipe; the old one must be replaced (it no longer needs `client/`) |
+| `start.sh` | **yes** | all the server logic, logging, enforcement, bucket syncs |
+| `README.md` | optional | Space card + documentation (same front-matter as before) |
+| `config/bungee/EaglerXBungee.jar` | only if needed | keep the Space's copy — it is LFS-tracked there. Upload this one (585 KB, v1.3.6) **only** if `client-checks.log` shows `UNKNOWN` / `Unknown command` for everybody, meaning the Space's plugin does not know `client-brand name <player>` |
+| `client/1.12.html` | **no** | 22 MB and *private*: a public Space repo would hand the verified brand to anybody. Keep it in the bucket (below) or on your machine |
+| `plugins/`, `config/bungee/EaglerXServer.jar` | **no** | the Space already has them (AuthMe jars are LFS-tracked there) |
+| `.gitattributes`, `.gitignore` | **no** | leave the Space's own LFS rules alone |
+| `tools/`, `tests/`, `docs/` | **no** | dev-only; nothing in the image uses them |
+
+Uploading a single file works too:
+
+```bash
+hf upload smodusermc/12 start.sh  start.sh  --repo-type space
+hf upload smodusermc/12 Dockerfile Dockerfile --repo-type space
+```
+
+The Space rebuilds itself after every upload; watch it in the Space's *Logs*
+tab, and the running server's own console is mirrored to
+`game-data/logs/paper.log` + `logs/bungee.log` in the bucket.
+
+### Where the client goes instead
+
+The client must **not** sit in the Space repo (public) — keep it in the bucket,
+which is private and reachable from anywhere:
+
+```bash
+# upload (once)
+hf buckets cp client/1.12.html hf://buckets/smodusermc/1.12/client/1.12.html
+
+# download on your machine whenever you need it
+hf buckets cp hf://buckets/smodusermc/1.12/client/1.12.html ./1.12.html
+```
+
+Put it at the bucket root like that, **not** under `game-data/` — the full
+game-data sync runs with `--delete` and would remove anything there that the
+server did not stage itself.
 
 Required Space settings: a `HF_TOKEN` secret with write access to the bucket
-(`EXPOSE 7860` is already handled). Players join with the client in
-`client/1.12.html` on `wss://smodusermc-12.hf.space/`.
+(`EXPOSE 7860` is already handled). Players join on
+`wss://smodusermc-12.hf.space/` with the client you hand them.
 
 ## Notes
 
