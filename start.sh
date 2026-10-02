@@ -11,12 +11,23 @@ BUNGEE_DIR="/opt/server/bungee"
 BACKEND_DIR="/opt/server/backend"
 PLUGIN_DIR="$BACKEND_DIR/plugins"
 
-# Security log locations (append-only, synced to HF bucket)
+# Security log locations (append-only, synced to the HF bucket every
+# $SYNC_INTERVAL seconds, see SAVE_DIRS below):
+#   hf://buckets/smodusermc/1.12/game-data/security-logs/logins.log
+#   hf://buckets/smodusermc/1.12/game-data/security-logs/commands.log
+#   hf://buckets/smodusermc/1.12/game-data/security-logs/client-checks.log
+#   hf://buckets/smodusermc/1.12/game-data/security-logs/shared-ips.txt
 SEC_DIR="$BACKEND_DIR/security-logs"
 LOGIN_LOG="$SEC_DIR/logins.log"
 CMD_LOG="$SEC_DIR/commands.log"
 SHARED_REPORT="$SEC_DIR/shared-ips.txt"
 CLIENT_LOG="$SEC_DIR/client-checks.log"
+
+# Runtime cache of the last client verdict per player (append-only, one line
+# per update: "<name>\t<VERDICT>"). Commands and logouts look up the verdict
+# here so every line can say whether the player was on the verified client.
+VERDICT_CACHE="/tmp/client-verdicts.txt"
+: > "$VERDICT_CACHE"
 
 # Bungee console pipe - lets this script run commands on the proxy, it is used
 # to ask EaglerXBungee which client a player is using (/client-brand)
@@ -87,9 +98,11 @@ echo " Java: $($JAVA -version 2>&1 | head -1)"
 echo " Bucket: $HF_BUCKET_HANDLE"
 [ -n "$OP_USERNAME" ] && echo " OP Account: $OP_USERNAME"
 echo " Plugins synced: WorldEdit, WorldGuard, MineResetLite, Shopkeepers, SafeTrade, Skript, PvPManager"
-echo " Security logs: $SEC_DIR"
-echo " Verified client: $VERIFIED_CLIENT_BRAND ($VERIFIED_CLIENT_UUID)"
-echo " Enforce verified client: $ENFORCE_VERIFIED_CLIENT"
+    echo " Security logs: $SEC_DIR"
+    echo "   -> logins.log / commands.log tagged with client=VERIFIED CLIENT for this client"
+    echo "   -> synced to ${HF_BUCKET_HANDLE}/game-data/security-logs every ${SYNC_INTERVAL}s"
+    echo " Verified client: $VERIFIED_CLIENT_BRAND ($VERIFIED_CLIENT_UUID)"
+    echo " Enforce verified client: $ENFORCE_VERIFIED_CLIENT (false = everyone can join, only logged)"
 echo ""
 
 # =============================================
@@ -306,8 +319,10 @@ start_bungee() {
 # =============================================================
 # SECURITY LOGGER — logins/IPs + commands (append-only)
 # =============================================================
-# logins.log   : DATE | LOGIN/LOGOUT | name | ip
-# commands.log : DATE | name | ip | command
+# logins.log   : DATE | LOGIN  | name | ip | client=CHECK PENDING
+#                DATE | VERIFY | name | ip | VERIFIED CLIENT | brand=... | version=... | uuid=...
+#                DATE | LOGOUT | name | ip | client=...
+# commands.log : DATE | name | ip | command | client=...
 # shared-ips.txt : report of shared IPs / multi-IP accounts
 #
 # VERIFIED CLIENT
@@ -319,6 +334,35 @@ start_bungee() {
 # =============================================================
 last_ip_for() {
     grep -F "| LOGIN | $1 | " "$LOGIN_LOG" 2>/dev/null | tail -1 | awk -F' [|] ' '{print $4}'
+}
+
+# -------------------------------------------------------------
+# Verified client verdict cache
+# -------------------------------------------------------------
+# The client check runs in the background right after the login (the proxy
+# handshake needs a moment), so commands a player typed in the first seconds
+# are logged as PENDING and everything after that carries the final verdict.
+set_verdict() {
+    printf '%s\t%s\n' "$1" "${2:-UNKNOWN}" >> "$VERDICT_CACHE"
+}
+
+verdict_for() {
+    local v
+    v=$(awk -F'\t' -v n="$1" '$1==n{v=$2} END{print v}' "$VERDICT_CACHE" 2>/dev/null)
+    echo "${v:-UNKNOWN}"
+}
+
+# Human readable form used next to logins/commands so the raw logs say it
+# plainly. VERIFIED CLIENT is the only label containing that phrase, so
+# "grep 'VERIFIED CLIENT' logins.log" always means "this was my client".
+verdict_label() {
+    case "${1:-UNKNOWN}" in
+        VERIFIED)   echo "VERIFIED CLIENT" ;;
+        UNVERIFIED) echo "OTHER EAGLERCRAFT CLIENT" ;;
+        VANILLA)    echo "JAVA CLIENT" ;;
+        PENDING)    echo "CHECK PENDING" ;;
+        *)          echo "UNKNOWN CLIENT" ;;
+    esac
 }
 
 # Hide passwords from auth-style commands
@@ -341,18 +385,21 @@ handle_paper_line() {
     NOW=$(date '+%F %T')
 
     if [[ "$line" =~ $LOGIN_RE ]]; then
-        echo "$NOW | LOGIN | ${BASH_REMATCH[1]} | ${BASH_REMATCH[2]}" >> "$LOGIN_LOG"
-        # ask the proxy which client this player is using (runs in the background)
-        check_player_client "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" &
+        name="${BASH_REMATCH[1]}"
+        echo "$NOW | LOGIN | $name | ${BASH_REMATCH[2]} | client=CHECK PENDING" >> "$LOGIN_LOG"
+        set_verdict "$name" PENDING
+        # ask the proxy which client this player is using (runs in the background,
+        # it appends the "VERIFY" line to logins.log once it knows)
+        check_player_client "$name" "${BASH_REMATCH[2]}" &
     elif [[ "$line" =~ $CMD_RE ]]; then
         name="${BASH_REMATCH[1]}"
         cmd=$(mask_cmd "${BASH_REMATCH[2]}")
         ip=$(last_ip_for "$name")
-        echo "$NOW | $name | ${ip:-unknown} | $cmd" >> "$CMD_LOG"
+        echo "$NOW | $name | ${ip:-unknown} | $cmd | client=$(verdict_label "$(verdict_for "$name")")" >> "$CMD_LOG"
     elif [[ "$line" =~ $LEAVE_RE ]]; then
         name="${BASH_REMATCH[1]}"
         ip=$(last_ip_for "$name")
-        echo "$NOW | LOGOUT | $name | ${ip:-unknown}" >> "$LOGIN_LOG"
+        echo "$NOW | LOGOUT | $name | ${ip:-unknown} | client=$(verdict_label "$(verdict_for "$name")")" >> "$LOGIN_LOG"
     fi
 }
 
@@ -366,7 +413,7 @@ handle_bungee_line() {
         [[ "$name" == "CONSOLE" || "$name" == "Console" || "$name" == "client-brand" ]] && return
         cmd=$(mask_cmd "${BASH_REMATCH[2]}")
         ip=$(last_ip_for "$name")
-        echo "$NOW | $name | ${ip:-unknown} | [bungee] $cmd" >> "$CMD_LOG"
+        echo "$NOW | $name | ${ip:-unknown} | [bungee] $cmd | client=$(verdict_label "$(verdict_for "$name")")" >> "$CMD_LOG"
     fi
 }
 
@@ -471,8 +518,13 @@ check_player_client() {
     fi
 
     now=$(date '+%F %T')
-    echo "$now | ${verdict:-UNKNOWN} | $name | $ip | brand=${brand:-?} | version=${version:-?} | uuid=${uuid:-?}" >> "$CLIENT_LOG"
-    echo "[CLIENT] $(date '+%H:%M:%S') $name ($ip): ${verdict:-UNKNOWN} brand=${brand:-?} version=${version:-?}"
+    verdict="${verdict:-UNKNOWN}"
+    set_verdict "$name" "$verdict"
+    echo "$now | ${verdict} | $name | $ip | brand=${brand:-?} | version=${version:-?} | uuid=${uuid:-?}" >> "$CLIENT_LOG"
+    # the human readable verdict goes into the login log too, so logins.log
+    # alone answers "was this me?"        (grep 'VERIFIED CLIENT' logins.log)
+    echo "$now | VERIFY | $name | $ip | $(verdict_label "$verdict") | brand=${brand:-?} | version=${version:-?} | uuid=${uuid:-?}" >> "$LOGIN_LOG"
+    echo "[CLIENT] $(date '+%H:%M:%S') $name ($ip): ${verdict} / $(verdict_label "$verdict") brand=${brand:-?} version=${version:-?}"
 
     if [ "$ENFORCE_VERIFIED_CLIENT" = true ] && [ "$verdict" = "UNVERIFIED" ]; then
         mc_command "kick $name $VERIFIED_CLIENT_KICK_MESSAGE"
@@ -902,9 +954,9 @@ if [ "$PORT_READY" = true ]; then
     echo " SERVER READY — Vanilla EaglerCraft on :7860"
     [ -n "$OP_USERNAME" ] && echo " OP: $OP_USERNAME (level 4)"
     echo " Plugins Synced via HuggingFace!"
-    echo " Security logging ACTIVE"
+    echo " Security logging ACTIVE  (grep 'VERIFIED CLIENT' security-logs/logins.log)"
     echo " Verified client: $VERIFIED_CLIENT_BRAND"
-    echo " Client checks -> security-logs/client-checks.log"
+    echo " Client checks -> security-logs/client-checks.log (synced to the bucket)"
     echo "============================================"
 else
     echo " Port 7860 NOT open!"

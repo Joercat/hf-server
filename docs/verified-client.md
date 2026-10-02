@@ -156,8 +156,33 @@ DRM mechanism.
    `VERIFIED_CLIENT_BRAND` and the verdict is written to
    `security-logs/client-checks.log` plus a `[CLIENT]` line on the container
    console.
-5. Optionally (`ENFORCE_VERIFIED_CLIENT=true`) `UNVERIFIED` players are kicked
-   through RCON.
+5. The verdict is cached for the player, so **every later log line carries it**:
+
+   ```
+   logins.log    DATE | LOGIN  | name | ip | client=CHECK PENDING
+                 DATE | VERIFY | name | ip | VERIFIED CLIENT | brand=… | version=… | uuid=…
+                 DATE | LOGOUT | name | ip | client=VERIFIED CLIENT
+   commands.log  DATE | name | ip | command | client=VERIFIED CLIENT
+   ```
+
+   Before the check finishes (a second or two) commands are tagged
+   `CHECK PENDING`; `grep 'VERIFIED CLIENT' logins.log` matches only logins from
+   this client (the other labels are `OTHER EAGLERCRAFT CLIENT`, `JAVA CLIENT`
+   and `UNKNOWN CLIENT`, none of which contain that phrase).
+6. Optionally (`ENFORCE_VERIFIED_CLIENT=true`) `UNVERIFIED` players are kicked
+   through RCON. **The default is `false`: everyone can join, everything is
+   only logged.**
+
+All four files are copied into `SAVE_DIRS`-driven staging and pushed to the
+bucket every `SYNC_INTERVAL` seconds (300 by default):
+
+```
+hf://buckets/smodusermc/1.12/game-data/security-logs/{logins,commands,client-checks}.log
+hf://buckets/smodusermc/1.12/game-data/security-logs/shared-ips.txt
+```
+
+so `hf buckets cp hf://buckets/smodusermc/1.12/game-data/security-logs/logins.log .`
+or the web UI is enough to read them from outside the Space.
 
 Console answers about players that are not Eaglercraft (`That player is not
 using eaglercraft!`) become `VANILLA`; no answer at all becomes `UNKNOWN`, never
@@ -175,7 +200,10 @@ using eaglercraft!`) become `VANILLA`; no answer at all becomes `UNKNOWN`, never
 * extracts the detection functions from `start.sh` and drives them against a
   fake BungeeCord console, asserting `VERIFIED` / `UNVERIFIED` / `VANILLA` /
   `CONSOLE_DOWN` classifications, the login flow, and that the script's own
-  injected console commands are not logged as player commands.
+  injected console commands are not logged as player commands;
+* asserts that the `VERIFY` line lands in `logins.log`, that commands carry the
+  `client=…` tag (including `CHECK PENDING` before the check resolves), and that
+  `grep 'VERIFIED CLIENT'` really matches nothing but the verified client.
 
 Run it after any change:
 

@@ -50,6 +50,8 @@ PIDFILE="$WORK/bungee.pid"
 export CLIENT_LOG="$WORK/client-checks.log"
 export LOGIN_LOG="$WORK/logins.log"
 export CMD_LOG="$WORK/commands.log"
+export VERDICT_CACHE="$WORK/client-verdicts.txt"
+: > "$VERDICT_CACHE"
 export VERIFIED_CLIENT_BRAND="Eaglercraft[VER]"
 export VERIFIED_CLIENT_UUID="51b2ebf3-ddab-35e7-8646-94f7bcbfd7ff"
 export BUNGEE_CONSOLE="$FIFO"
@@ -61,7 +63,8 @@ touch "$BLOG" "$CLIENT_LOG" "$LOGIN_LOG" "$CMD_LOG"
 extract() { awk "/^$1\(\) \{/,/^\}/" "$ROOT/start.sh"; }
 FUNCS="$WORK/funcs.sh"
 for f in strip_colours bungee_console bungee_alive query_client_brand check_player_client \
-         last_ip_for mask_cmd handle_paper_line handle_bungee_line; do
+         last_ip_for mask_cmd set_verdict verdict_for verdict_label \
+         handle_paper_line handle_bungee_line; do
     extract "$f"
 done | sed "s|/tmp/bungee.log|$BLOG|g" > "$FUNCS"
 # shellcheck disable=SC1090
@@ -119,6 +122,46 @@ handle_bungee_line "12:00:05 [INFO] CONSOLE executed command: client-brand name 
 check "injected console commands are ignored" "$(wc -l < "$CMD_LOG")" "0"
 handle_bungee_line "12:00:06 [INFO] CreppyBitch executed command: /spawn"
 check "player commands still recorded" "$(wc -l < "$CMD_LOG")" "1"
+
+# --------------------------------------------------------------------------- #
+echo "== 3. verified client visible in the logs =="
+check "login line marks the check as pending" \
+      "$(grep -c '| LOGIN | CreppyBitch | 1.2.3.4 | client=CHECK PENDING' "$LOGIN_LOG")" "1"
+check "logins.log gets a VERIFY line with 'VERIFIED CLIENT'" \
+      "$(grep -c '| VERIFY | CreppyBitch | 1.2.3.4 | VERIFIED CLIENT |' "$LOGIN_LOG")" "1"
+check "logins.log VERIFY line carries the brand uuid" \
+      "$(grep -c 'uuid=51b2ebf3-ddab-35e7-8646-94f7bcbfd7ff' "$LOGIN_LOG")" "1"
+check "grep 'VERIFIED CLIENT' means exactly the verified client" \
+      "$(grep -c 'VERIFIED CLIENT' "$LOGIN_LOG")" "1"
+check "commands.log tags the command with the verified client" \
+      "$(grep -c '| client=VERIFIED CLIENT$' "$CMD_LOG")" "1"
+check "verdict cache remembers the player" "$(verdict_for CreppyBitch)" "VERIFIED"
+check "unknown players have no verdict" "$(verdict_for Nobody)" "UNKNOWN"
+
+# a non-verified player is labelled, but never with the words "VERIFIED CLIENT"
+brand_answer "Eaglercraft 1.12" "522b2ce5-c9b9-36cf-be7c-5d90f55e631a"
+handle_paper_line "[12:01:00 INFO]: RandomGuy[/5.6.7.8:5555] logged in with entity id 43 at (0.0, 0.0, 0.0)"
+handle_paper_line "[12:01:02 INFO]: RandomGuy issued server command: /home"
+sleep 4   # the background check finishes here
+handle_paper_line "[12:01:10 INFO]: RandomGuy issued server command: /spawn"
+handle_paper_line "[12:01:11 INFO]: RandomGuy left the game"
+check "unverified Eaglercraft client is labelled in logins.log" \
+      "$(grep -c '| VERIFY | RandomGuy | 5.6.7.8 | OTHER EAGLERCRAFT CLIENT |' "$LOGIN_LOG")" "1"
+check "logins.log VERIFY line carries the stock uuid" \
+      "$(grep -c 'uuid=522b2ce5-c9b9-36cf-be7c-5d90f55e631a' "$LOGIN_LOG")" "1"
+check "logout line repeats the verdict" \
+      "$(grep -c '| LOGOUT | RandomGuy | 5.6.7.8 | client=OTHER EAGLERCRAFT CLIENT' "$LOGIN_LOG")" "1"
+check "commands before the check are tagged CHECK PENDING" \
+      "$(grep -c '| RandomGuy | 5.6.7.8 | /home | client=CHECK PENDING' "$CMD_LOG")" "1"
+check "commands after the check are tagged with the verdict" \
+      "$(grep -c '| RandomGuy | 5.6.7.8 | /spawn | client=OTHER EAGLERCRAFT CLIENT' "$CMD_LOG")" "1"
+check "'VERIFIED CLIENT' still only matches the verified player" \
+      "$(grep -c 'VERIFIED CLIENT' "$LOGIN_LOG")" "1"
+
+for pair in "VERIFIED:VERIFIED CLIENT" "UNVERIFIED:OTHER EAGLERCRAFT CLIENT" \
+            "VANILLA:JAVA CLIENT" "PENDING:CHECK PENDING" "GARBAGE:UNKNOWN CLIENT"; do
+    check "label for ${pair%%:*} is right" "$(verdict_label "${pair%%:*}")" "${pair#*:}"
+done
 
 # report generation must not break on the new log
 report_ips() { awk -F' [|] ' '$2=="LOGIN"{ipc[$4]++} END{}' "$LOGIN_LOG"; }

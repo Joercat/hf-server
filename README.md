@@ -56,11 +56,27 @@ arrives with the UUID
 (`/client-brand`, over a console pipe) and records the result:
 
 ```
-security-logs/logins.log          DATE | LOGIN/LOGOUT | name | ip
-security-logs/client-checks.log    DATE | VERDICT | name | ip | brand=... | version=... | uuid=...
-security-logs/commands.log         DATE | name | ip | command        (passwords masked)
-security-logs/shared-ips.txt       report: shared IPs + verification summary
+security-logs/logins.log          DATE | LOGIN  | name | ip | client=CHECK PENDING
+                                  DATE | VERIFY | name | ip | VERIFIED CLIENT | brand=... | uuid=...
+                                  DATE | LOGOUT | name | ip | client=...
+security-logs/commands.log        DATE | name | ip | command | client=...     (passwords masked)
+security-logs/client-checks.log   DATE | VERDICT | name | ip | brand=... | version=... | uuid=...
+security-logs/shared-ips.txt      report: shared IPs + verification summary
 ```
+
+These files live in the Space **and are synced to the bucket** every
+`SYNC_INTERVAL` seconds (default 300), so you can read them from anywhere:
+
+```
+hf://buckets/smodusermc/1.12/game-data/security-logs/logins.log
+hf://buckets/smodusermc/1.12/game-data/security-logs/commands.log
+hf://buckets/smodusermc/1.12/game-data/security-logs/client-checks.log
+hf://buckets/smodusermc/1.12/game-data/security-logs/shared-ips.txt
+```
+
+Every login gets a `VERIFY` line and every command is tagged with the client
+that ran it, so grepping for `VERIFIED CLIENT` in the bucket tells you
+immediately which logins were your own client:
 
 `VERDICT` is one of:
 
@@ -71,13 +87,28 @@ security-logs/shared-ips.txt       report: shared IPs + verification summary
 | `VANILLA` | a real (Java) Minecraft client, not Eaglercraft |
 | `UNKNOWN` | could not be checked (proxy busy/down) |
 
+| Label in `logins.log` / `commands.log` | Meaning |
+| --- | --- |
+| `VERIFIED CLIENT` | this repo's client (`grep 'VERIFIED CLIENT' logins.log`) |
+| `OTHER EAGLERCRAFT CLIENT` | some other Eaglercraft client / fork / edited client |
+| `JAVA CLIENT` | a real (Java) Minecraft client, not Eaglercraft |
+| `UNKNOWN CLIENT` | could not be checked (proxy busy/down) |
+| `CHECK PENDING` | the login happened seconds ago and the check is still running |
+
 So a quick look at the log tells you whether a login was you (or someone you
 gave the client to) or somebody else:
 
 ```
-$ tail -f /opt/server/backend/security-logs/client-checks.log
-2026-10-02 21:14:03 | VERIFIED   | CreppyBitch | 1.2.3.4  | brand=Eaglercraft[VER] | version=u2 | uuid=51b2ebf3-ddab-35e7-8646-94f7bcbfd7ff
-2026-10-02 21:15:47 | UNVERIFIED | RandomDude  | 5.6.7.8  | brand=Eaglercraft 1.12 | version=u2 | uuid=522b2ce5-c9b9-36cf-be7c-5d90f55e631a
+$ tail -f /opt/server/backend/security-logs/logins.log
+2026-10-02 21:14:02 | LOGIN  | CreppyBitch | 1.2.3.4 | client=CHECK PENDING
+2026-10-02 21:14:04 | VERIFY | CreppyBitch | 1.2.3.4 | VERIFIED CLIENT | brand=Eaglercraft[VER] | version=u2 | uuid=51b2ebf3-ddab-35e7-8646-94f7bcbfd7ff
+2026-10-02 21:15:46 | LOGIN  | RandomDude  | 5.6.7.8 | client=CHECK PENDING
+2026-10-02 21:15:48 | VERIFY | RandomDude  | 5.6.7.8 | OTHER EAGLERCRAFT CLIENT | brand=Eaglercraft 1.12 | version=u2 | uuid=522b2ce5-c9b9-36cf-be7c-5d90f55e631a
+2026-10-02 21:15:49 | LOGOUT | RandomDude  | 5.6.7.8 | client=OTHER EAGLERCRAFT CLIENT
+
+$ tail -f /opt/server/backend/security-logs/commands.log
+2026-10-02 21:14:40 | CreppyBitch | 1.2.3.4 | /gamemode 1 | client=VERIFIED CLIENT
+2026-10-02 21:15:52 | RandomDude  | 5.6.7.8 | /gamemode 1 | client=OTHER EAGLERCRAFT CLIENT
 ```
 
 ### Changing the brand / re-patching the client
@@ -101,11 +132,12 @@ drift apart:
 bash tests/test_verified_client.sh
 ```
 
-### Enforcing it
+### Log-only by default (no kicking)
 
-Set `ENFORCE_VERIFIED_CLIENT=true` in `start.sh` to kick anyone whose client is
-`UNVERIFIED` (stock Eaglercraft clients are kicked too, so hand out the client
-from `client/1.12.html`).
+`ENFORCE_VERIFIED_CLIENT` is `false`: **everyone can join**, all accounts are
+allowed, the server just records who was on which client — logins and the
+commands they ran. Set it to `true` if you ever want to kick anything that is
+not the verified client.
 
 ## Deploying / running
 
