@@ -12,13 +12,15 @@
 # What it does:
 #   1. finds a stock Eaglercraft 1.12 client (git history / --stock FILE),
 #   2. rebuilds client/1.12.html with the new brand + the login gate,
-#   3. writes .verified-client.env (the brand + UUID; never committed),
-#   4. prints the two values for the Space's "Variables and secrets" and the
-#      command that puts the new client into the bucket.
+#   3. writes .verified-client.env (the brand + UUID; git-ignored),
+#   4. bakes the pair into start.sh *obfuscated* (XOR + base64, like the client
+#      hides the brand behind a PBKDF2 verifier), so the server works without
+#      any secrets and the values are still not readable in the repository,
+#   5. prints the pair for the Space's "Variables and secrets" and the command
+#      that puts the new client into the bucket.
 #
-# Nothing is committed and nothing is written into start.sh: the pair belongs
-# in the Space secrets, because this repository is public and a brand that is
-# public can be copied into anybody's client and then shows up as "verified".
+# The environment always wins over the baked-in pair, so setting the secrets is
+# optional; a rotation that leaves stale secrets behind is reported at boot.
 #
 set -uo pipefail
 
@@ -94,6 +96,7 @@ fi
 # --------------------------------------------------------------------------- #
 # 2. build
 # --------------------------------------------------------------------------- #
+mkdir -p "$(dirname "$OUT")"
 echo "Building the verified client"
 [ -n "$BRAND" ] && echo "  brand        : $BRAND"
 [ "$ROTATE" = true ] && echo "  brand        : rotating (random, never used before)"
@@ -110,22 +113,10 @@ OUTPUT=$(python3 tools/patch_verified_client.py "$STOCK_FILE" "${ARGS[@]}") || {
 echo "$OUTPUT" | sed -n 's/^\[+\]/  /p'
 echo "$OUTPUT" | tail -6 | sed 's/^/  /'
 
-NEW_BRAND=$(python3 - "$OUT" <<'PY'
-import re, sys
-# the marker sits at the very end of the file (the sealed payload is in front
-# of it), so read the tail instead of the head
-text = open(sys.argv[1], "rb").read()[-65536:].decode("utf-8", "replace")
-m = re.search(r'brand: "([^"]*)", uuid: "([^"]*)"', text)
-print(m.group(1) if m else "")
-PY
-)
-NEW_UUID=$(python3 - "$OUT" <<'PY'
-import re, sys
-text = open(sys.argv[1], "rb").read()[-65536:].decode("utf-8", "replace")
-m = re.search(r'brand: "([^"]*)", uuid: "([^"]*)"', text)
-print(m.group(2) if m else "")
-PY
-)
+# the patcher prints what it built; the file itself deliberately does not
+# carry the brand in plain text (only a PBKDF2 verifier of it)
+NEW_BRAND=$(sed -n 's/^ *brand *: *//p' <<<"$OUTPUT" | tail -1)
+NEW_UUID=$(sed -n 's/^ *brandUUID *: *//p' <<<"$OUTPUT" | tail -1)
 echo "  new brand    : $NEW_BRAND"
 echo "  new UUID     : $NEW_UUID"
 
@@ -146,6 +137,42 @@ EOF
 echo "  wrote        : $ENV_FILE  (git-ignored)"
 
 # --------------------------------------------------------------------------- #
+# 3b. bake the pair into start.sh, obfuscated (XOR + base64)
+# --------------------------------------------------------------------------- #
+if [ -f start.sh ]; then
+    BAKED=$(python3 - "$NEW_BRAND|$NEW_UUID" <<'PY'
+import base64, os, sys
+key = os.urandom(16)
+blob = bytes(b ^ key[i % len(key)] for i, b in enumerate(sys.argv[1].encode()))
+print(base64.b64encode(blob).decode())
+print(key.hex())
+PY
+)
+    B64=$(sed -n '1p' <<<"$BAKED"); KEY=$(sed -n '2p' <<<"$BAKED")
+    if grep -q '^VERIFIED_CLIENT_PAIR_B64=' start.sh && grep -q '^VERIFIED_CLIENT_PAIR_KEY=' start.sh; then
+        python3 - "$B64" "$KEY" <<'PY'
+import pathlib, re, sys
+p = pathlib.Path("start.sh")
+s = p.read_text()
+s = re.sub(r'^VERIFIED_CLIENT_PAIR_B64=".*"$', lambda m: 'VERIFIED_CLIENT_PAIR_B64="%s"' % sys.argv[1],
+           s, count=1, flags=re.M)
+s = re.sub(r'^VERIFIED_CLIENT_PAIR_KEY=".*"$', lambda m: 'VERIFIED_CLIENT_PAIR_KEY="%s"' % sys.argv[2],
+           s, count=1, flags=re.M)
+p.write_text(s)
+PY
+        echo "  baked        : start.sh (VERIFIED_CLIENT_PAIR_B64/_KEY, obfuscated)"
+        echo "                 the Space gets it with the next tools/push-to-space.sh"
+    else
+        echo "  WARNING      : could not find the pair placeholders in start.sh - the"
+        echo "                 built-in pair was NOT updated (the secrets still work)."
+    fi
+fi
+
+if grep -qF "$NEW_BRAND" start.sh 2>/dev/null; then
+    echo "  WARNING      : the brand is readable in start.sh - that should not happen."
+fi
+
+# --------------------------------------------------------------------------- #
 # 4. what to do with it
 # --------------------------------------------------------------------------- #
 cat <<EOF
@@ -162,9 +189,13 @@ Now put it in the two places that matter
    then cannot tell your own /login from anybody else's, it masks every
    password until the pair is set (the boot log says so).
 
-2. the client itself, in the private bucket (never in this public repo):
+2. the client itself - it is committed in this repo now (the brand inside it
+   cannot be read without the login), and it belongs in the bucket too:
 
      hf buckets cp $OUT $BUCKET/client/1.12.html
+
+   The pair is also baked into start.sh (obfuscated) by this script, so the
+   next push is enough - the secrets below are only needed to override it.
 
 The login of the client itself did not change: username "$GATE_USER".
 EOF

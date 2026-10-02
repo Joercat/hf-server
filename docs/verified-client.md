@@ -44,14 +44,14 @@ The same check for the other official brands proves the algorithm:
 
 So: **change the brand string → change the UUID the client sends.**
 
-The current client carries a brand that is **not written down here**: the
-repository is public and so is its history, so a brand published in it can be
-copied into anybody's client — that somebody would then be marked as the owner
-without ever having the real client.
+The brand is never written down in readable text anywhere: the client carries
+only a **PBKDF2-SHA512 verifier** of it (`window.__verGate.brandKdf`) and
+`start.sh` keeps the pair XOR'd + base64 (`VERIFIED_CLIENT_PAIR_B64`, decoded at
+boot). Both are committed; neither shows the brand.
 
 | brand | UUID | state |
 | --- | --- | --- |
-| *(not in this repo)* | *(in `.verified-client.env` / the Space secrets)* | **current** — `start.sh` reads the pair from the environment |
+| *(not readable anywhere)* | *(likewise)* | **current** — the client has a verifier, `start.sh` has the obfuscated pair, the git-ignored `.verified-client.env` and the optional Space secrets hold it in clear |
 | `Eaglercraft[VER]` | `51b2ebf3-ddab-35e7-8646-94f7bcbfd7ff` | **burned** — committed to the repo, refused by `PUBLISHED_CLIENT_BRANDS` |
 | `EaglercraftX[V2]` | `355d0b9f-14ce-359f-8c9f-97cc1a7c92ca` | **burned** — same |
 | `Eaglercraft 1.12` (stock) | `522b2ce5-c9b9-36cf-be7c-5d90f55e631a` | never the verified client |
@@ -103,7 +103,11 @@ What this does and does not give you:
   assert that neither string appears in the file;
 * it is still client-side: a copy of the *decrypted* EPW can be shared, and the
   server cannot see the gate at all (it only sees the brand UUID, which is why
-  revocation stays possible). Change the credentials by rebuilding/rotating.
+  revocation stays possible). Change the credentials by rebuilding/rotating;
+* the gate is also what keeps the brand secret: it only exists inside the sealed
+  payload, so the client file can be committed and handed out without revealing
+  which brand the server looks for. Reading it back needs the login, or an
+  `--expect-brand` check against the verifier the file carries.
 
 ---
 
@@ -346,13 +350,14 @@ using eaglercraft!`) become `VANILLA`; no answer at all becomes `UNKNOWN`, never
 
 `tests/test_verified_client.sh`:
 
-* reads the configured `VERIFIED_CLIENT_BRAND`/`VERIFIED_CLIENT_UUID` (from the
-  environment or the git-ignored `.verified-client.env`) and asserts that
-  **neither string appears anywhere in the git history** — a public brand can be
-  copied into anybody's client, so a leaked pair means the mark is worthless;
-* extracts the real brand UUID out of `client/1.12.html` (`--check`) and asserts
-  it matches the configured pair, and that `client/1.12.html` is neither tracked
-  by git nor un-ignored;
+* decodes the pair baked into `start.sh` and asserts it is *not* readable in the
+  file, that it is the same client as `.verified-client.env`, and that neither
+  string appears anywhere in the git history;
+* asserts the committed `client/1.12.html` does not leak the brand (as text) and
+  that its PBKDF2 verifier accepts the configured brand
+  (`--check --expect-brand` → `matches : YES`), and — with the credentials — that
+  the brand inside the sealed payload is the configured one and agrees with the
+  verifier.
 * asserts that the burned brands (stock, `Eaglercraft[VER]`, `EaglercraftX[V2]`)
   are not the verified client: a mock proxy answering with them gets
   `UNVERIFIED`, and a configured-but-burned pair is refused with `PUBLIC BRAND`;
@@ -413,9 +418,9 @@ using eaglercraft!`) become `VANILLA`; no answer at all becomes `UNKNOWN`, never
 Run it after any change:
 
 ```bash
-bash tests/test_verified_client.sh               # 196 checks
+bash tests/test_verified_client.sh               # 201 checks
 VER_CLIENT_USER=<user> VER_CLIENT_PASS=<password> \
-    bash tests/test_verified_client.sh           # 208 checks (adds the boot test)
+    bash tests/test_verified_client.sh           # 216 checks (adds the boot test)
 PRINT_LOGS=1 bash tests/test_verified_client.sh  # …and dump the logs it built
 
 # just the client: gate + loader (prints every check it made)

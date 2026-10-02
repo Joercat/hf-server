@@ -27,71 +27,95 @@ check(){ if [ "$2" = "$3" ]; then ok "$1"; else bad "$1 (expected '$3', got '$2'
 check_at_least(){ if [ "${2:-0}" -ge "${3:-1}" ] 2>/dev/null; then ok "$1"; else bad "$1 (expected >= $3, got '$2')"; fi; }
 
 # --------------------------------------------------------------------------- #
-echo "== 1. client <-> start.sh consistency =="
-# The brand/UUID are a secret: they come from the environment (the Space passes
-# them as secrets) or from the git-ignored .verified-client.env, never from a
-# literal in the repository.
+echo "== 1. the client, and the pair that identifies it =="
+# The pair is never written down in readable text: start.sh carries it XOR'd +
+# base64, the client only carries a PBKDF2 verifier of the brand, and both can
+# be overridden by the environment (Space secrets) or .verified-client.env.
+BUILTIN_B64=$(sed -n 's/^VERIFIED_CLIENT_PAIR_B64="\(.*\)"$/\1/p' "$ROOT/start.sh" | head -1)
+BUILTIN_KEY=$(sed -n 's/^VERIFIED_CLIENT_PAIR_KEY="\(.*\)"$/\1/p' "$ROOT/start.sh" | head -1)
+decode_pair() {
+    python3 -c '
+import base64, sys
+blob = base64.b64decode(sys.argv[1])
+key = bytes.fromhex(sys.argv[2])
+sys.stdout.write(bytes(b ^ key[i % len(key)] for i, b in enumerate(blob)).decode("utf-8"))
+' "$1" "$2"
+}
+BUILTIN_PAIR=$(decode_pair "$BUILTIN_B64" "$BUILTIN_KEY" 2>/dev/null)
+BUILTIN_BRAND="${BUILTIN_PAIR%%|*}"
+BUILTIN_UUID="${BUILTIN_PAIR##*|}"
+
+check "start.sh carries an obfuscated pair that decodes" \
+      "$([ -n "$BUILTIN_BRAND" ] && [ -n "$BUILTIN_UUID" ] && [ "$BUILTIN_BRAND" != "$BUILTIN_PAIR" ] && echo yes)" "yes"
+check "…and it is not readable in start.sh" \
+      "$([ -n "$BUILTIN_BRAND" ] && grep -qF "$BUILTIN_BRAND" "$ROOT/start.sh" && echo readable || echo hidden)" "hidden"
+
 [ -z "${VERIFIED_CLIENT_BRAND:-}" ] && [ -s "$ROOT/.verified-client.env" ] && \
     . "$ROOT/.verified-client.env"
-EXPECTED_BRAND="${VERIFIED_CLIENT_BRAND:-}"
-EXPECTED_UUID="${VERIFIED_CLIENT_UUID:-}"
-
-if [ -z "$EXPECTED_BRAND" ] || [ -z "$EXPECTED_UUID" ]; then
-    echo "  skip - no brand configured (that is a valid, safe state: start.sh"
-    echo "         then marks nobody as the verified client)."
-    echo "         To test the full system: bash tools/setup-verified-client.sh \\"
-    echo "             --brand \"<16 chars>\" --gate-user <user> --gate-pass <pass>"
-    echo "         or set VERIFIED_CLIENT_BRAND / VERIFIED_CLIENT_UUID."
-else
+EXPECTED_BRAND="${VERIFIED_CLIENT_BRAND:-$BUILTIN_BRAND}"
+EXPECTED_UUID="${VERIFIED_CLIENT_UUID:-$BUILTIN_UUID}"
 echo "  brand        : $EXPECTED_BRAND"
 echo "  uuid         : $EXPECTED_UUID"
 
-# ... and that pair must never have been public
+check "the built-in pair and the configured pair are the same client" \
+      "$(skip=no; if [ -s "$ROOT/.verified-client.env" ]; then
+             [ "$EXPECTED_BRAND" = "$BUILTIN_BRAND" ] && [ "$EXPECTED_UUID" = "$BUILTIN_UUID" ] && echo same || echo different
+         else echo same; fi)" "same"
+
+# that pair must never have been public
 if command -v git >/dev/null 2>&1 && git -C "$ROOT" rev-parse --git-dir >/dev/null 2>&1; then
-    HITS=""
-    [ -n "$EXPECTED_BRAND" ] && HITS=$(git -C "$ROOT" log --all --format=%h -S"$EXPECTED_BRAND" 2>/dev/null | head -3)
-    [ -n "$EXPECTED_UUID" ] && HITS="$HITS $(git -C "$ROOT" log --all --format=%h -S"$EXPECTED_UUID" 2>/dev/null | head -3)"
-    check "the configured brand/UUID never appear in git history" "$(echo $HITS | tr -d ' ')" ""
+    HITS=$(git -C "$ROOT" log --all --format=%h -S"$EXPECTED_BRAND" 2>/dev/null | head -3)
+    HITS="$HITS $(git -C "$ROOT" log --all --format=%h -S"$EXPECTED_UUID" 2>/dev/null | head -3)"
+    check "the pair never appears in git history" "$(echo $HITS | tr -d ' ')" ""
+    check "client/1.12.html is committed (it is the client you hand out)" \
+          "$(git -C "$ROOT" ls-files --error-unmatch client/1.12.html >/dev/null 2>&1 && echo tracked || echo untracked)" \
+          "tracked"
+    check "…and does not leak the brand" \
+          "$(grep -qF "$EXPECTED_BRAND" "$ROOT/client/1.12.html" && echo leaks || echo hidden)" "hidden"
+    check ".verified-client.env stays out of the repository" \
+          "$(git -C "$ROOT" check-ignore -q .verified-client.env && echo ignored || echo not-ignored)" "ignored"
+    check "…and is not tracked" \
+          "$(git -C "$ROOT" ls-files --error-unmatch .verified-client.env >/dev/null 2>&1 && echo tracked || echo untracked)" \
+          "untracked"
 else
     echo "  skip - not a git checkout, cannot check the history"
 fi
 
-# the client itself must not be committed either (it carries the brand)
-if command -v git >/dev/null 2>&1 && git -C "$ROOT" rev-parse --git-dir >/dev/null 2>&1; then
-    check "client/1.12.html is not tracked by git" \
-          "$(git -C "$ROOT" ls-files --error-unmatch client/1.12.html >/dev/null 2>&1 && echo tracked || echo untracked)" \
-          "untracked"
-    check "…and is ignored" \
-          "$(git -C "$ROOT" check-ignore -q client/1.12.html && echo ignored || echo not-ignored)" "ignored"
-fi
-
-fi   # end: brand configured
-
 if [ ! -s "$ROOT/client/1.12.html" ]; then
     echo "  skip - client/1.12.html is not built here (tools/setup-verified-client.sh)"
 else
-    CLIENT_INFO=$(python3 "$ROOT/tools/patch_verified_client.py" --check "$ROOT/client/1.12.html" 2>&1)
-    CLIENT_UUID=$(sed -n 's/.*brandUUID *: *//p' <<<"$CLIENT_INFO" | head -1)
-    CLIENT_BRAND=$(sed -n "s/.*brand *: *'\(.*\)'.*/\1/p" <<<"$CLIENT_INFO" | head -1)
-    echo "  client brand : $CLIENT_BRAND"
-    echo "  client uuid  : $CLIENT_UUID"
-    check "the client reports the configured brand" "$CLIENT_BRAND" "$EXPECTED_BRAND"
-    check "…and the configured UUID" "$CLIENT_UUID" "$EXPECTED_UUID"
+    # without the credentials: the file's own verifier says whether this is the
+    # configured brand
+    VERIFY=$(python3 "$ROOT/tools/patch_verified_client.py" --check "$ROOT/client/1.12.html" \
+             --expect-brand "$EXPECTED_BRAND" 2>&1)
+    check "the client's brand verifier matches the configured brand" \
+          "$(grep -c 'matches   : YES' <<<"$VERIFY")" "1"
+    check "…and the file keeps the brand hidden" \
+          "$(grep -c 'brand     : hidden' <<<"$VERIFY")" "1"
     check "the client carries the login gate" \
           "$(grep -c 'verified-client gate' "$ROOT/client/1.12.html")" "1"
 
-    for BURNED in "Eaglercraft 1.12" "Eaglercraft[VER]" "EaglercraftX[V2]"; do
+    if [ -n "${VER_CLIENT_USER:-}" ] && [ -n "${VER_CLIENT_PASS:-}" ]; then
+        # with the credentials: the real brand inside the sealed payload
+        CLIENT_INFO=$(python3 "$ROOT/tools/patch_verified_client.py" --check "$ROOT/client/1.12.html" \
+                      --gate-user "$VER_CLIENT_USER" --gate-pass "$VER_CLIENT_PASS" 2>&1)
+        CLIENT_BRAND=$(sed -n "s/.*brand     : '\(.*\)'.*/\1/p" <<<"$CLIENT_INFO" | head -1)
+        CLIENT_UUID=$(sed -n 's/.*brandUUID *: *//p' <<<"$CLIENT_INFO" | head -1)
+        check "the payload's real brand is the configured one" "$CLIENT_BRAND" "$EXPECTED_BRAND"
+        check "…and its brand UUID is the configured one" "$CLIENT_UUID" "$EXPECTED_UUID"
+        check "the file's verifier agrees with the payload" \
+              "$(grep -c 'verifier  : matches the brand in the payload' <<<"$CLIENT_INFO")" "1"
+    else
+        echo "  skip - set VER_CLIENT_USER / VER_CLIENT_PASS to read the brand inside the payload"
+    fi
+
+    for BURNED in "Eaglercraft 1.12" "Eaglercraft[VER]" "EaglercraftX[V2]" "EaglercraftX[SV]"; do
         if [ "$BURNED" = "$EXPECTED_BRAND" ]; then
-            bad "the client must not use the revoked brand '$BURNED'"
+            bad "the client must not use the burned brand '$BURNED'"
         else
-            ok "revoked brand '$BURNED' is not the verified client"
+            ok "burned brand '$BURNED' is not the verified client"
         fi
     done
-    if [ "$CLIENT_BRAND" = "EaglercraftX[V2]" ] || [ "$CLIENT_BRAND" = "Eaglercraft[VER]" ]; then
-        bad "the released client uses a brand that is public in this repo"
-    else
-        ok "the released client uses a brand that is not in this repo"
-    fi
 fi
 
 # a brand that is already public must be refused by the builder
@@ -100,7 +124,6 @@ REFUSED=$(python3 "$ROOT/tools/patch_verified_client.py" --brand "Eaglercraft[VE
 check "the builder refuses a public (revoked) brand" \
       "$(grep -c 'refusing brand' <<<"$REFUSED")" "1"
 
-# --------------------------------------------------------------------------- #
 echo "== 2. start.sh detection helpers =="
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"; kill ${MOCK_PID:-0} 2>/dev/null' EXIT

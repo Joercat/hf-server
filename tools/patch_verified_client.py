@@ -36,6 +36,7 @@ client is byte-for-byte identical.
 import argparse
 import base64
 import hashlib
+import hmac
 import lzma
 import os
 import re
@@ -100,6 +101,28 @@ def brand_uuid(brand: str) -> uuid.UUID:
     h[6] = (h[6] & 0x0F) | 0x30   # UUID version 3
     h[8] = (h[8] & 0x3F) | 0x80   # RFC 4122 variant
     return uuid.UUID(bytes=bytes(h))
+
+
+# --------------------------------------------------------------------------- #
+# brand verifier (how the client file proves it carries a brand without
+# publishing it - the same PBKDF2-SHA512 the payload seal uses)
+# --------------------------------------------------------------------------- #
+def brand_verifier(brand, salt=None, iterations=None):
+    salt = os.urandom(16) if salt is None else salt
+    iterations = PBKDF2_ITERATIONS if iterations is None else iterations
+    key = hashlib.pbkdf2_hmac("sha512", brand.encode("ascii"), salt, iterations, dklen=32)
+    return {"salt": salt.hex(), "iter": iterations, "hash": key.hex()}
+
+
+def brand_verifier_matches(brand, verifier):
+    try:
+        want = bytes.fromhex(verifier["hash"])
+        iterations = int(verifier["iter"])
+        salt = bytes.fromhex(verifier["salt"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    got = hashlib.pbkdf2_hmac("sha512", brand.encode("ascii"), salt, iterations, dklen=32)
+    return hmac.compare_digest(got, want)
 
 
 # --------------------------------------------------------------------------- #
@@ -416,11 +439,13 @@ def unseal_client(html, user, password):
 def build_gate(new_brand, encrypted, salt, iv, iterations, verbose=True):
     """Return the gate <script> block with the parameters substituted in."""
     template = open(GATE_TEMPLATE, "r", encoding="utf-8").read()
+    verifier = brand_verifier(new_brand)
     for token, value in (("%ITER%", str(iterations)),
                          ("%SALT%", salt.hex()),
                          ("%IV%", iv.hex()),
-                         ("%BRAND%", new_brand),
-                         ("%UUID%", str(brand_uuid(new_brand)))):
+                         ("%BRANDSALT%", verifier["salt"]),
+                         ("%BRANDITER%", str(verifier["iter"])),
+                         ("%BRANDHASH%", verifier["hash"])):
         template = template.replace(token, value)
     if "%" in template.replace("%%", ""):
         leftover = re.findall(r"%[A-Za-z]+%", template)
@@ -432,6 +457,18 @@ def build_gate(new_brand, encrypted, salt, iv, iterations, verbose=True):
 def read_brand(wasm):
     m = BRAND_POOL_RE.search(wasm)
     return m.group(1).decode("ascii") if m else None
+
+
+BRAND_VERIFIER_RE = re.compile(
+    r'brandKdf:\s*\{\s*salt:\s*"([0-9a-f]+)",\s*iter:\s*(\d+),\s*hash:\s*"([0-9a-f]+)"\s*\}')
+
+
+def read_brand_verifier(html):
+    """The PBKDF2 verifier a gated client carries (or None)."""
+    m = BRAND_VERIFIER_RE.search(html.decode("utf-8", "replace"))
+    if not m:
+        return None
+    return {"salt": m.group(1), "iter": int(m.group(2)), "hash": m.group(3)}
 
 
 # --------------------------------------------------------------------------- #
@@ -566,6 +603,10 @@ def main():
                     help="only print the UUID a brand produces, then exit")
     ap.add_argument("--check", action="store_true",
                     help="verify an existing client and report its brand, do not modify it")
+    ap.add_argument("--expect-brand", metavar="BRAND",
+                    help="with --check: is this the brand inside the file? (works for a "
+                         "sealed client without --gate-user/--gate-pass, because the file "
+                         "only carries a PBKDF2 verifier of the brand)")
     args = ap.parse_args()
 
     if args.print_uuid:
@@ -611,13 +652,25 @@ def main():
                 data = unseal_client(html, args.gate_user, args.gate_pass)
                 print("    gate      : sealed payload unlocked with the given credentials")
             else:
-                text = html.decode("utf-8", "replace")
-                m = re.search(r'brand: "([^"]*)", uuid: "([^"]*)"', text)
-                brand = m.group(1) if m else "?"
+                verifier = read_brand_verifier(html)
                 print("    gate      : payload is sealed (login required)")
-                print(f"    brand     : {brand!r}")
-                print(f"    brandUUID : {m.group(2) if m else '?'}")
-                print("    (pass --gate-user/--gate-pass to verify the sealed payload too)")
+                if verifier is None:
+                    print("    brand     : ? (this file carries no brand verifier)")
+                else:
+                    print(f"    brand     : hidden - PBKDF2-SHA512 verifier, "
+                          f"{verifier['iter']} iterations")
+                    if args.expect_brand:
+                        ok = brand_verifier_matches(args.expect_brand, verifier)
+                        print(f"    matches   : {'YES' if ok else 'NO'} "
+                              f"({args.expect_brand!r} is "
+                              f"{'' if ok else 'not '}the brand in this file)")
+                        if ok:
+                            print(f"    brandUUID : {brand_uuid(args.expect_brand)}")
+                        else:
+                            return
+                    else:
+                        print("    (--expect-brand \"<brand>\" checks a brand against it;")
+                        print("     --gate-user/--gate-pass opens the payload for the real one)")
                 return
         else:
             data = decode_assets_uri(html)[2]
@@ -630,6 +683,10 @@ def main():
         brand = read_brand(wasm)
         print(f"    brand     : {brand!r}")
         print(f"    brandUUID : {brand_uuid(brand) if brand else '?'}")
+        verifier = read_brand_verifier(html)
+        if verifier is not None and brand:
+            ok = brand_verifier_matches(brand, verifier)
+            print(f"    verifier  : {'matches the brand in the payload' if ok else 'DOES NOT MATCH'}")
         print(f"    stock     : {STOCK_BRAND_UUID}  ({STOCK_BRAND!r})")
         for old_brand, old_uuid in REVOKED_BRANDS.items():
             if brand == old_brand:
@@ -649,6 +706,8 @@ def main():
 
     out_html = patch_html(html, args.brand, args.gate_user, args.gate_pass)
     target = args.output or args.html
+    out_dir = os.path.dirname(os.path.abspath(target))
+    os.makedirs(out_dir, exist_ok=True)
     with open(target, "wb") as fh:
         fh.write(out_html)
     print()

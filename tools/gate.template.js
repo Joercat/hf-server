@@ -10,8 +10,10 @@
  * hold the game back until the payload is unsealed.  Placeholders are filled
  * in by the patcher:
  *
- *   %ITER%   PBKDF2 iterations        %SALT%  hex salt
- *   %IV%     96 bit GCM IV (hex)      %BRAND% / %UUID%  markers (not secret)
+ *   %ITER%    PBKDF2 iterations   %SALT%   hex salt
+ *   %IV%      96 bit GCM IV (hex)  %BRANDSALT% / %BRANDITER% / %BRANDHASH%
+ *                                    PBKDF2 verifier of the brand (the brand
+ *                                    itself is never written in this file)
  * ------------------------------------------------------------------------- */
 (function () {
     "use strict";
@@ -176,8 +178,12 @@
         return void 0;
     };
 
+    // The brand is deliberately NOT written here in plain text: this is a
+    // PBKDF2-SHA512 verifier of it (same KDF as the payload key), so the file
+    // itself never gives the brand away - only somebody who knows it (or who
+    // unseals the payload with the login) can check it against this file.
     W.__verGate = {
-        brand: "%BRAND%", uuid: "%UUID%",
+        brandKdf: { salt: "%BRANDSALT%", iter: %BRANDITER%, hash: "%BRANDHASH%" },
         submit: function (u, p) { return submit(u, p); },
         state: function () { return { ready: ready, booted: booted, visible: shown, fails: fails }; }
     };

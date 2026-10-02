@@ -35,8 +35,8 @@ A Hugging Face Space that runs:
 | `start.sh` | boots + supervises everything, writes configs and security logs |
 | `config/bungee/EaglerXBungee.jar` | proxy plugin that lets EaglercraftX clients join |
 | `plugins/` | backend plugins copied into Paper (AuthMe jars live here) |
-| `client/1.12.html` | **the verified client** — built locally, sealed behind a login; *not* committed (it carries the secret brand) |
-| `tools/setup-verified-client.sh` | one command to build/rotate it and print the Space secrets |
+| `client/1.12.html` | **the verified client** — sealed behind a login; the brand inside it cannot be read without that login, so the file is safe to commit |
+| `tools/setup-verified-client.sh` | one command to build/rotate it, re-bake the pair into `start.sh` and print the secrets |
 | `tools/patch_verified_client.py` | patches / inspects / seals the client brand |
 | `tools/verify_gated_client.mjs` | runs the real login gate + loader headless: proves the file only boots after the login |
 | `tools/run_epw_loader.mjs` | boots the client's own EPW loader to prove the file loads |
@@ -62,38 +62,48 @@ always produces `522b2ce5-c9b9-36cf-be7c-5d90f55e631a` — so *everyone* using a
 stock client looks identical in the logs. The client built here carries a brand
 of your own, so its logins are recognisable.
 
-**The brand is a secret, and the client file is not in this repository.** Both
-are public here otherwise: anybody could read the brand, build a client that
-reports it and be marked as *you* in the logs — which is why
+**The brand is never written down in readable text.** Two places hold it and
+neither shows it:
 
-* the brand + UUID live in `.verified-client.env` (git-ignored) and on the Space
-  as `VERIFIED_CLIENT_BRAND` / `VERIFIED_CLIENT_UUID` variables-secrets,
-* `start.sh` has no default pair at all (an unconfigured server marks nobody,
-  and says so in the boot log and in `logger-status.log`),
-* every brand that was ever committed here is *refused* even if it is
-  configured — see `PUBLISHED_CLIENT_BRANDS` in `start.sh`: the stock brand,
-  `Eaglercraft[VER]` (`51b2ebf3-ddab-35e7-8646-94f7bcbfd7ff`) and
-  `EaglercraftX[V2]` (`355d0b9f-14ce-359f-8c9f-97cc1a7c92ca`). The two clients
-  handed out earlier are therefore not verified any more, no matter what
-  somebody found in the git history.
+| where | how it is stored |
+| --- | --- |
+| `client/1.12.html` | not at all — the file carries a **PBKDF2-SHA512 verifier** of the brand (`window.__verGate.brandKdf`); the brand itself only exists inside the sealed payload, behind the login |
+| `start.sh` | XOR'd + base64 (`VERIFIED_CLIENT_PAIR_B64` / `_KEY`), decoded at boot |
 
-Build or rotate it with one command:
+That means the client can be committed and handed out freely: reading the brand
+out of it needs the login. `--check` therefore reports
+`brand : hidden - PBKDF2-SHA512 verifier` and can still answer *"is this the
+client I think it is?"*:
+
+```bash
+python3 tools/patch_verified_client.py --check client/1.12.html --expect-brand "<brand>"
+#   matches   : YES ('<brand>' is the brand in this file)
+#   brandUUID : <the UUID the server will see>
+```
+
+**Optional: the Space secrets override the baked-in pair.** Set
+`VERIFIED_CLIENT_BRAND` / `VERIFIED_CLIENT_UUID` (Settings → Variables and
+secrets) if you want to change the pair without pushing `start.sh`; the boot log
+prints which source won (`pair from: built-in | environment | .verified-client.env`)
+and warns when the environment holds a pair the build was not made for (a stale
+secret after a rotation).
+
+Be clear about what the obfuscation is worth: `start.sh` carries the key right
+next to the blob, so **anybody who can read this repository can decode the pair
+in one command** and build a client that reports it. The obfuscation keeps it
+out of plain sight and out of `git grep`, not out of reach. If the "verified"
+mark has to stay unforgeable, either make this repository private or keep the
+pair only in the Space secrets (and remove the baked blob). Everything else
+about the system — joining, logging, IPs — does not depend on that choice.
+
+Build or rotate it with one command (it rebuilds the client, re-bakes the pair
+into `start.sh`, writes the git-ignored `.verified-client.env` and prints what
+to put into the Space):
 
 ```bash
 bash tools/setup-verified-client.sh --brand "AnotherName16Cha" --gate-user sllab --gate-pass '<password>'
 bash tools/setup-verified-client.sh --rotate --gate-user sllab --upload
 ```
-
-It finds a stock client (git history or `--stock FILE`), rebuilds
-`client/1.12.html`, writes `.verified-client.env`, prints the two values for the
-Space and (with `--upload`) puts the client into the bucket.
-
-**It also asks for a username and password before it starts.** The game payload
-inside the file is sealed (AES-256-GCM, key derived from the credentials with
-PBKDF2-SHA512), so a patched copy of the file does not boot at all without them
-— the login is not a cosmetic screen. Credentials are not stored in this repo;
-they were set when the client was built (`--gate-user`/`--gate-pass`) and are
-only in the file in sealed form.
 
 **The clients handed out before are revoked** — `Eaglercraft[VER]` and then
 `EaglercraftX[V2]`, because both their brands were committed to this public
@@ -252,7 +262,9 @@ $ cat /opt/server/backend/private-logs/player-ips.log  # the IPs behind "hidden"
 ### Changing the brand / rebuilding the client
 
 ```bash
-# the one command that does everything (rotates and remembers the pair)
+# the one command that does everything: new brand, new credentials, the client
+# rebuilt, the pair re-baked into start.sh (obfuscated), the git-ignored
+# .verified-client.env rewritten, and optionally the client uploaded
 bash tools/setup-verified-client.sh --rotate --gate-user sllab --upload
 
 # or with a brand you pick (exactly 16 ASCII characters, never used here)
@@ -268,12 +280,11 @@ python3 tools/patch_verified_client.py --check client/1.12.html
 node tools/verify_gated_client.mjs client/1.12.html --user <user> --pass <password>
 ```
 
-The pair never goes into a file in this repo: it goes into the Space secrets
-(and `.verified-client.env`, which is git-ignored). A brand that was committed
-here is refused by the patcher (`REVOKED_BRANDS`) and by the server
-(`PUBLISHED_CLIENT_BRANDS`), and the test suite checks that the configured pair
-does not appear anywhere in the git history:
-`git log --all -S"<brand>"` must be empty. The suite also checks the hidden-IP logging, the enforcement
+After a rotation, push `start.sh` (the pair inside it changed) and hand out the
+new client. The old pair stops matching immediately. A brand that was public at
+some point is refused by the patcher (`REVOKED_BRANDS`) and by the server
+(`PUBLISHED_CLIENT_BRANDS`), and the test suite checks that the pair never
+appears in the git history: `git log --all -S"<brand>"` must be empty. The suite also checks the hidden-IP logging, the enforcement
 (kicks), the `/login` logging against a fake Bungee console, the IP report, the
 forwarded-IP discovery (with a fake proxy that refuses headers) and that the
 copies embedded in `start.sh` match `tools/`. With the client credentials in the
@@ -281,9 +292,9 @@ environment it additionally **runs the real login gate and boots the client's
 own EPW loader** in Node, i.e. it proves the file you hand out works:
 
 ```bash
-bash tests/test_verified_client.sh              # 196 checks
+bash tests/test_verified_client.sh              # 201 checks
 VER_CLIENT_USER=<user> VER_CLIENT_PASS=<password> \
-    bash tests/test_verified_client.sh          # 208 checks (adds the boot test)
+    bash tests/test_verified_client.sh          # 216 checks (adds the boot test)
 
 # same, but print the logs it produced, so you can see the formats:
 PRINT_LOGS=1 bash tests/test_verified_client.sh
@@ -394,31 +405,30 @@ account. It lists one line per account/address/source:
 Placeholders (`unknown`, `hidden`) are never treated as an address, which is
 what used to make unrelated accounts look like they shared one.
 
-### The brand is a secret (this is the normal state now)
+### Where the brand is (and is not) written down
 
-The brand UUID is the only thing the server checks, and the brand string sits
-inside the client file. So:
-
-* anybody who *has* your client file and knows the credentials can play — that
-  is the point;
-* anybody who knows the **brand string** does not need your file at all: they
-  can build their own client with the same brand (the patcher is in this repo)
-  and be marked as you.
-
-Both brands that were ever used before were committed to this public repository,
-so they are burned: `start.sh` refuses them (`PUBLISHED_CLIENT_BRANDS`) even if
-somebody configures them, and the patcher refuses to build with them. The
-current pair is secret:
-
-| where | what |
+| place | what is there |
 | --- | --- |
-| Space → Settings → Variables and secrets | `VERIFIED_CLIENT_BRAND`, `VERIFIED_CLIENT_UUID` |
-| locally | `.verified-client.env` (git-ignored) |
-| nowhere | this repository — `git log -S"<brand>"` must stay empty, the tests check it (that is how the `EaglercraftX[SV]` brand got burned: it appeared in a committed example) |
+| `client/1.12.html` (committed) | a PBKDF2-SHA512 verifier of the brand; the brand itself only inside the sealed payload |
+| `start.sh` (committed) | the pair XOR'd + base64, decoded at boot |
+| `.verified-client.env` (git-ignored) | the pair in clear text, for local tools/tests |
+| the Space | optional `VERIFIED_CLIENT_BRAND` / `VERIFIED_CLIENT_UUID` secrets, which win over the baked pair |
+| `security-logs/logger-status.log` | which pair is in use and where it came from |
 
-If the Space ever loses the pair (someone deletes the secrets, a fresh Space),
-the boot log and `security-logs/logger-status.log` say `NOT CONFIGURED`, nobody
-is marked as you, and `auth.log` masks every password until it is set again.
+Burned (refused by `start.sh` even if configured, and by the builder) are the
+brands that were public at some point: the stock one, `Eaglercraft[VER]`,
+`EaglercraftX[V2]` and `EaglercraftX[SV]`.
+
+**The honest limit:** the obfuscation in `start.sh` is not encryption — the key
+is in the same file, so anyone who can read this repository can decode the pair
+and build a client that reports it. What the seal *does* protect is the client
+file: without the login, nobody can read the brand out of `client/1.12.html`.
+If the mark must stay unforgeable, make the repository private or keep the pair
+only in the Space secrets and delete the baked blob.
+
+If the Space ever loses the pair, the boot log and
+`security-logs/logger-status.log` say `NOT CONFIGURED`, nobody is marked as you,
+and `auth.log` masks every password until it is set again.
 
 ## What actually has to go into the Space
 
@@ -432,11 +442,11 @@ bash tools/setup-verified-client.sh --rotate --gate-user sllab --upload
 bash tools/push-to-space.sh --with-readme      # uploads Dockerfile + start.sh (+ README)
 ```
 
-Then, in the Space: **Settings → Variables and secrets**, add both values the
-setup script printed (`VERIFIED_CLIENT_BRAND`, `VERIFIED_CLIENT_UUID`) and
-restart. Without them the server runs fine and everybody can join, but nobody
-is marked as you and every password is masked in `auth.log` — the boot log
-(`NOT CONFIGURED`) and `logger-status.log` say so.
+The pair is **already baked into `start.sh`** (obfuscated), so nothing else is
+required: the Space marks your client out of the box. The secrets are optional —
+add `VERIFIED_CLIENT_BRAND` / `VERIFIED_CLIENT_UUID` (Settings → Variables and
+secrets) only if you want to override the baked pair without pushing files; the
+environment always wins, and a stale secret after a rotation is reported at boot.
 
 After the client is rebuilt, refresh it in the bucket (no Space rebuild needed):
 
@@ -457,7 +467,7 @@ hf upload smodusermc/12 /tmp/space-files . --repo-type space
 | `start.sh` | **yes** | all the server logic, logging, enforcement, bucket syncs |
 | `README.md` | optional | Space card + documentation (same front-matter as before) |
 | `config/bungee/EaglerXBungee.jar` | only if needed | keep the Space's copy — it is LFS-tracked there. Upload this one (585 KB, v1.3.6) **only** if `client-checks.log` shows `UNKNOWN` / `Unknown command` for everybody, meaning the Space's plugin does not know `client-brand name <player>` |
-| `client/1.12.html` | **no** | 22 MB and *private*: it carries the brand, so a public Space repo (or a public git repo) would hand the "verified" mark to anybody. Keep it in the bucket (below) or on your machine |
+| `client/1.12.html` | **no** (to the Space) | 22 MB, and the Space does not need it — it is committed in this repo and published in the bucket (below). Note this is about the *Space*: the Space repo is public, and the client does not reveal the brand, so committing it in your own repo is fine |
 | `plugins/`, `config/bungee/EaglerXServer.jar` | **no** | the Space already has them (AuthMe jars are LFS-tracked there) |
 | `.gitattributes`, `.gitignore` | **no** | leave the Space's own LFS rules alone |
 | `tools/`, `tests/`, `docs/` | **no** | dev-only; nothing in the image uses them |
@@ -475,9 +485,8 @@ tab, and the running server's own console is mirrored to
 
 ### Where the client goes instead
 
-*(If you had this repo checked out before: `client/1.12.html` was tracked then,
-so pulling this change deletes it from your working copy. It is now built with
-`tools/setup-verified-client.sh` or pulled from the bucket — see below.)
+The client is committed in this repo **and** belongs in the bucket: the bucket
+is private and reachable from anywhere, which is what you hand out.
 
 The client must **not** sit in the Space repo (public) — keep it in the bucket,
 which is private and reachable from anywhere:

@@ -20,7 +20,7 @@
 
 import fs from 'fs';
 import vm from 'vm';
-import { webcrypto } from 'crypto';
+import { webcrypto, pbkdf2Sync, createHash } from 'crypto';
 import { runLoader, isEpw } from './run_epw_loader.mjs';
 
 const args = process.argv.slice(2);
@@ -38,6 +38,16 @@ if (!user || !pass) {
 
 const html = fs.readFileSync(input);
 const text = html.toString('utf8');
+const expectedBrand = opt('brand') || process.env.VER_CLIENT_BRAND;
+
+// the brand UUID the server checks: UUID.nameUUIDFromBytes("EaglercraftXClient:"+brand)
+function brandUuid(brand) {
+    const h = createHash('md5').update('EaglercraftXClient:' + brand, 'utf8').digest();
+    h[6] = (h[6] & 0x0f) | 0x30;
+    h[8] = (h[8] & 0x3f) | 0x80;
+    const hex = h.toString('hex');
+    return [hex.slice(0, 8), hex.slice(8, 12), hex.slice(12, 16), hex.slice(16, 20), hex.slice(20)].join('-');
+}
 
 let pass_ = 0, fail = 0;
 const check = (name, ok, extra = '') => {
@@ -52,11 +62,32 @@ console.log('== the file');
 check('contains a login gate', text.includes('/* verified-client gate */'));
 check('the payload is sealed, not a plaintext EPW data URI',
     !text.includes('assetsURI = "data:application/octet-stream;base64,'));
-check('the plaintext username is not in the file', !text.includes(user));
-check('the plaintext password is not in the file', !text.includes(pass));
-const marker = text.match(/brand: "([^"]*)", uuid: "([^"]*)"/);
-check('the file advertises its brand/UUID', !!marker, marker ? marker[1] : 'none');
-if (marker) console.log('        brand=' + marker[1] + ' uuid=' + marker[2]);
+// the sealed payload is random ciphertext: a short credential can appear in it
+// by pure chance, so the file is checked with that blob taken out
+const withoutPayload = text.replace(/window\.__verSealed = "[A-Za-z0-9+/=]*";/,
+                                    'window.__verSealed = "<sealed>";');
+check('the plaintext username is not in the file (sealed payload excluded)',
+    !withoutPayload.includes(user));
+check('the plaintext password is not in the file (sealed payload excluded)',
+    !withoutPayload.includes(pass));
+// the brand is NOT written in the file: only a PBKDF2 verifier of it, so the
+// file can be checked against a brand without publishing it
+const kdf = text.match(/brandKdf:\s*\{\s*salt:\s*"([0-9a-f]+)",\s*iter:\s*(\d+),\s*hash:\s*"([0-9a-f]+)"\s*\}/);
+check('the file carries a brand verifier (PBKDF2-SHA512)', !!kdf);
+check('the file does not publish the brand in plain text', !/brand: "/.test(text));
+if (expectedBrand) {
+    const inFile = text.includes(expectedBrand);
+    check('the expected brand is nowhere in the file', !inFile);
+}
+if (kdf) {
+    const verifier = { salt: kdf[1], iter: parseInt(kdf[2], 10), hash: kdf[3] };
+    console.log(`        brand verifier: ${verifier.iter} iterations, ${verifier.hash.slice(0, 16)}...`);
+    if (expectedBrand) {
+        const got = pbkdf2Sync(expectedBrand, Buffer.from(verifier.salt, 'hex'), verifier.iter, 32, 'sha512').toString('hex');
+        check('…and it matches the expected brand', got === verifier.hash);
+        console.log('        expected brand uuid: ' + brandUuid(expectedBrand));
+    }
+}
 
 // --------------------------------------------------------------------------- //
 // 2. run the gate in a headless DOM
@@ -151,7 +182,7 @@ const find = needle => r.results.some(b => {
 const sizes = r.results.map(b => b && b.length).filter(Boolean).sort((a, b) => b - a).slice(0, 4);
 console.log('        biggest components:', sizes.join(', '), 'bytes');
 check('classes.wasm came out of the loader', find(String.fromCharCode(0) + 'asm'));
-const claimed = (marker && marker[1]) || '';
+const claimed = expectedBrand || '';
 // the brand the *server* sees is the 16 byte string-pool entry right before
 // "EaglercraftXClientOld:" - check that exact slot, not the game's own texts
 const brandSlot = (() => {
@@ -164,8 +195,15 @@ const brandSlot = (() => {
     return null;
 })();
 console.log('        brand slot in classes.wasm:', JSON.stringify(brandSlot));
-check('the unsealed payload carries the advertised brand', brandSlot === claimed, String(brandSlot));
+if (brandSlot) console.log('        -> brand UUID the server sees: ' + brandUuid(brandSlot));
+if (kdf && brandSlot) {
+    const verifier = { salt: kdf[1], iter: parseInt(kdf[2], 10), hash: kdf[3] };
+    const got = pbkdf2Sync(brandSlot, Buffer.from(verifier.salt, 'hex'), verifier.iter, 32, 'sha512').toString('hex');
+    check('the brand inside the payload matches the file\'s verifier', got === verifier.hash);
+}
+if (claimed) check('the payload carries the expected brand', brandSlot === claimed, String(brandSlot));
 check('the revoked brand is gone from the payload', brandSlot !== 'Eaglercraft[VER]' && !find('Eaglercraft[VER]XClientOld'));
+check('…and the stock brand is not used', brandSlot !== 'Eaglercraft 1.12');
 
 console.log('');
 console.log(`passed: ${pass_}  failed: ${fail}`);

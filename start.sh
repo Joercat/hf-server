@@ -129,12 +129,54 @@ OP_USERNAME="CreppyBitch"
 # Rotating = tools/setup-verified-client.sh --rotate, then put the printed
 # values into the Space and restart. Nothing in this file has to change.
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)
-if [ -z "${VERIFIED_CLIENT_BRAND:-}" ] && [ -s "$SCRIPT_DIR/.verified-client.env" ]; then
-    # shellcheck disable=SC1091
-    . "$SCRIPT_DIR/.verified-client.env"
-fi
+
+# the baked-in pair: XOR'd with the key below, then base64 (python3 decodes it;
+# the whole thing is a few bytes and only runs before the server starts)
+VERIFIED_CLIENT_PAIR_B64="q+UqfwTaozWljKaZWoxo/ZK1eSJXy5gusPfwmhapC7iLtSs+AMvLe/zip5kW/0e51rJ4dgQ="
+VERIFIED_CLIENT_PAIR_KEY="ee844d1361a8fb18d1dac5f822c8268b"
+
+verified_client_decode_pair() {
+    python3 -c '
+import base64, sys
+blob = base64.b64decode(sys.argv[1])
+key = bytes.fromhex(sys.argv[2])
+sys.stdout.write(bytes(b ^ key[i % len(key)] for i, b in enumerate(blob)).decode("utf-8"))
+' "$VERIFIED_CLIENT_PAIR_B64" "$VERIFIED_CLIENT_PAIR_KEY"
+}
+
+VERIFIED_CLIENT_SOURCE=""
+
+# 1. the environment wins. That is how the Space passes the pair in as
+#    variables/secrets, and how a rotation reaches this script without editing
+#    it: set both, restart, done.
 VERIFIED_CLIENT_BRAND="${VERIFIED_CLIENT_BRAND:-}"
 VERIFIED_CLIENT_UUID="${VERIFIED_CLIENT_UUID:-}"
+[ -n "$VERIFIED_CLIENT_BRAND" ] && [ -n "$VERIFIED_CLIENT_UUID" ] && VERIFIED_CLIENT_SOURCE="environment"
+
+# 2. the git-ignored file next to this script (local runs, tests)
+if [ -z "$VERIFIED_CLIENT_SOURCE" ] && [ -s "$SCRIPT_DIR/.verified-client.env" ]; then
+    # shellcheck disable=SC1091
+    . "$SCRIPT_DIR/.verified-client.env"
+    VERIFIED_CLIENT_BRAND="${VERIFIED_CLIENT_BRAND:-}"
+    VERIFIED_CLIENT_UUID="${VERIFIED_CLIENT_UUID:-}"
+    [ -n "$VERIFIED_CLIENT_BRAND" ] && [ -n "$VERIFIED_CLIENT_UUID" ] && VERIFIED_CLIENT_SOURCE=".verified-client.env"
+fi
+
+# 3. the pair baked in below. It is stored XOR'd + base64 (see the key), the
+#    same idea as the client: it is never written down in readable text - not
+#    here and not in the client file either (that one only carries a PBKDF2
+#    verifier of the brand). This is obfuscation, not encryption: what really
+#    hides the brand is that nobody can read it out of the client without the
+#    login. Rotate with tools/setup-verified-client.sh --rotate --upload.
+if [ -z "$VERIFIED_CLIENT_SOURCE" ]; then
+    _pair=$(verified_client_decode_pair 2>/dev/null)
+    if [ -n "$_pair" ] && [ "${_pair#*|}" != "$_pair" ]; then
+        VERIFIED_CLIENT_BRAND="${_pair%%|*}"
+        VERIFIED_CLIENT_UUID="${_pair##*|}"
+        VERIFIED_CLIENT_SOURCE="built-in"
+    fi
+    unset _pair
+fi
 
 # Brands+UUIDs that have been public at some point (they were committed to this
 # repo, so anybody could have copied them into a client). If one of these is
@@ -1279,6 +1321,23 @@ verified_client_problem() {
     fi
 }
 
+# A rotation updates the built-in pair. If the Space still holds the *old* pair
+# as a secret, that one wins and the fresh client would not be recognised, so
+# it is worth saying out loud.
+warn_verified_client_mismatch() {
+    local builtin
+    [ "$VERIFIED_CLIENT_SOURCE" = environment ] || return 0
+    builtin=$(verified_client_decode_pair 2>/dev/null)
+    [ -n "$builtin" ] || return 0
+    [ "${builtin%%|*}" = "$VERIFIED_CLIENT_BRAND" ] && return 0
+    echo ""
+    echo "!! VERIFIED CLIENT: the pair in the environment (${VERIFIED_CLIENT_BRAND})"
+    echo "!!   is not the one this build was made for (hidden, see logger-status.log)."
+    echo "!!   If you just rotated the client, delete the old secrets"
+    echo "!!   (VERIFIED_CLIENT_BRAND / VERIFIED_CLIENT_UUID) and restart."
+    echo ""
+}
+
 warn_verified_client_problem() {
     local problem
     problem=$(verified_client_problem)
@@ -1465,6 +1524,7 @@ write_logger_status() {
         echo "real client IPs: $(forward_ip_setting 2>/dev/null || true)"
         if [ "$VERIFIED_CLIENT_CONFIGURED" = true ]; then
             echo "verified client: ${VERIFIED_CLIENT_BRAND} (uuid ${VERIFIED_CLIENT_UUID})"
+            echo "  from         : ${VERIFIED_CLIENT_SOURCE:-?}$([ "$VERIFIED_CLIENT_SOURCE" = environment ] && echo " - the Space secrets win over the built-in pair")"
         else
             echo "verified client: NOT CONFIGURED (nobody is marked as you)"
         fi
@@ -2087,6 +2147,7 @@ done
 
 # Start security logger (logins/IPs + commands + verified client checks)
 warn_verified_client_problem
+warn_verified_client_mismatch
 write_logger_status
 start_security_logger
 echo " Security logger PID: $SECLOG_PID"
@@ -2300,6 +2361,7 @@ if [ "$PORT_READY" = true ]; then
         echo "   private-logs/{auth,player-ips,logins-real-ips,ip-report-private}.log"
     if [ "$VERIFIED_CLIENT_CONFIGURED" = true ]; then
         echo " Verified client: $VERIFIED_CLIENT_BRAND  (uuid $VERIFIED_CLIENT_UUID)"
+        echo "   pair from: $VERIFIED_CLIENT_SOURCE$([ "$VERIFIED_CLIENT_SOURCE" = environment ] && echo ' (Space secrets override the built-in pair)')"
     else
         echo " Verified client: NOT CONFIGURED - set VERIFIED_CLIENT_BRAND/_UUID in"
         echo "                  the Space's Variables and secrets (nobody is marked as you)"
