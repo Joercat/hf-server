@@ -1,34 +1,41 @@
 #!/usr/bin/env python3
 """optimize_client.py - make the verified client cheaper to run on weak machines.
 
-The client is a sealed EPW file; inside it sit two EPK asset packages
-(`assets.epk` and the `lang` one).  This tool rebuilds `assets.epk` with the two
-things that actually cost frames on a low-end machine, and re-seals the client:
+The client is a sealed EPW file; inside it sit the game's compiled code
+(`classes.wasm`) and two EPK asset packages (`assets.epk` and the `lang` one).
+This tool rewrites the three things that actually cost frames on a low-end
+machine, and re-seals the client:
 
-1. **The end portal / end sky texture.**  `entity/end_portal.png` ships as a
-   256x256 RGBA texture (256 KiB) that the game draws **layered**: the same
-   texture is drawn several times in a row, each pass with a different texture
-   matrix, straight through the pixel shader on the tile it covers.  Standing
-   next to an active portal - or anywhere in the End, where the sky is the same
-   texture - puts that many full-screen alpha-blended passes on the weakest path
-   a Chromebook has (the GPU's fill rate), which is exactly the "it lags really
-   bad when the portal is in render distance" report.  The texture is a soft
-   noise field: 32x32 looks identical in motion, costs 1/64th of the memory and
-   makes those passes cheap because the sampler saturates in L1 instead of
-   thrashing.  (The End sky uses the same texture, so the whole dimension gets
-   the same win.)
+1. **The end portal's render passes (the stronghold/End lag).**  Near an active
+   portal the stock client draws the portal quad over and over - up to **15
+   passes** - each pass with its own texture matrix change and a blended draw,
+   and the count comes straight from the squared distance to the block
+   (`RenderEndPortal.getPasses`).  In a browser every one of those GL calls
+   crosses the wasm -> JS boundary, so a 3x3 portal is a few thousand calls and
+   a few hundred draw calls *per frame*: that is the "it lags really bad when
+   the portal is in render distance" report, and it has nothing to do with the
+   texture file.  The count is compiled into a tiny function in `classes.wasm`
+   as single-byte constants, so this tool finds the chain and lowers it (default:
+   **at most 7 passes**).  The edit is one byte per pass count, the module still
+   compiles, and it can only ever make the client *lighter* - but the portal does
+   show fewer layers of its starfield, so `--portal-passes` (0 = stock) is there
+   to tune it.
 
-2. **Animated texture memory.**  The pack ships BTA-like animation strips: water
+2. **The end portal texture.**  `entity/end_portal.png` ships as a 256x256 RGBA
+   texture (256 KiB) that every pass samples; it is a soft noise field, so 32x32
+   looks the same in motion, costs 1/64th of the memory and keeps the sampler in
+   L1 instead of thrashing caches.  (The End's sky wallpaper uses the same
+   texture, so the whole dimension gets the same win.)
+
+3. **Animated texture memory.**  The pack ships BTA-like animation strips: water
    32 frames of 16x16, lava 20, fire 32, the nether portal 32, sea lantern 5,
-   prismarine 4, command blocks 4.  Every frame is uploaded as its own layer of
-   an array texture and re-uploaded on a timer; 32-frame strips are what causes
-   the periodic stutter when water/lava fills the screen (and the "large lag
-   spikes" in general, because the uploads land in the same frame as the chunk
-   you are walking into).  Animation is *time based*, so keeping every n-th
-   frame and multiplying the entry's `frametime` by n plays at the same speed -
-   water and lava simply stop running at 120 fps and animate at 15, which a
-   human eye cannot tell apart from 60 on a 4 GB machine that never runs 60
-   anyway.  Default: at most 8 frames per texture.
+   prismarine 4, command blocks 4.  Every frame is its own layer of an array
+   texture and is re-uploaded on a timer, so 32-frame strips are part of the
+   periodic stutter while water/lava fills the screen.  Animation is *time
+   based*, so keeping every n-th frame and multiplying the entry's `frametime`
+   by n plays at the same speed - water and lava simply stop running at 120 fps
+   and animate at 15, which a human eye cannot tell apart from 60 on a 4 GB
+   machine that never runs 60 anyway.  Default: at most 8 frames per texture.
 
 Everything else in the package is copied byte for byte, and the tool prints (and
 optionally writes to JSON) exactly what it changed.  The client's brand, the
@@ -48,12 +55,16 @@ usage:
 
   # the credentials and the brand come from .verified-client.env when present
   python3 tools/optimize_client.py client/1.12.html --user U --pass P
+
+  # fewer end portal passes (3 = fastest), 0 = leave the stock ones alone
+  python3 tools/optimize_client.py client/1.12.html --portal-passes 3 --user U --pass P
 """
 
 import argparse
 import base64
 import json
 import os
+import struct
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -65,6 +76,15 @@ import pnglite                                  # noqa: E402
 END_PORTAL = "assets/minecraft/textures/entity/end_portal.png"
 DEFAULT_FRAMES = 8
 DEFAULT_END_PORTAL = 32
+DEFAULT_PORTAL_PASSES = 7
+
+# RenderEndPortal.getPasses(double) in the stock 1.12.2 client: the squared
+# distance to the portal block picks how many times the portal quad is drawn
+# (each pass = a texture matrix change + a blended draw of the same quad).
+# The list below is the compiled comparison chain, in the order it appears in
+# classes.wasm; the compiled pass counts are 1, 3, 5, 7, 9, 11, 13, 15, 14.
+PORTAL_THRESHOLDS = (36864.0, 25600.0, 16384.0, 9216.0, 4096.0, 1024.0, 576.0, 256.0)
+PORTAL_MAX_STOCK_PASSES = 15
 
 
 # --------------------------------------------------------------------------- #
@@ -247,6 +267,118 @@ def optimize_pack(pack_files, frames_target=DEFAULT_FRAMES, end_portal_size=DEFA
 
 
 # --------------------------------------------------------------------------- #
+# the end portal pass cap
+#
+# Going near a stronghold or the End's exit portal in the stock client is a
+# known frame killer, and not because of the texture: RenderEndPortal draws the
+# same quad once per "pass" (up to 15 of them), each with its own texture matrix
+# change and a blended draw call.  In a browser every one of those GL calls
+# crosses the wasm -> JS boundary, so a 3x3 portal is thousands of calls and a
+# few hundred draw calls *per frame*.  Fewer passes = proportionally less work.
+#
+# The pass count is a pure function of the distance, compiled into a tiny
+# function in classes.wasm.  The stock module looks like this (decoded from the
+# committed client, offsets are the i32.const immediates):
+#
+#     if (d > 36864.0) i = 1;  else if (d > 25600.0) i = 3;
+#     else if (d > 16384.0) i = 5;  else if (d > 9216.0) i = 7;
+#     else if (d > 4096.0) i = 9;   else if (d > 1024.0) i = 11;
+#     else if (d > 576.0) i = 13;   else if (d >= 256.0) i = 15;  else i = 14;
+#
+# Every one of those is a single byte (0x41 <n>), so lowering one is a one byte
+# edit that cannot break the module: the chain stays monotonic, the function
+# stays valid, and the module still compiles.  The cap only ever lowers a pass
+# count, so nothing can get *heavier* than the stock client.
+# --------------------------------------------------------------------------- #
+def _read_uleb(buf, off):
+    value, shift = 0, 0
+    for _ in range(5):
+        b = buf[off]
+        off += 1
+        value |= (b & 0x7F) << shift
+        if not (b & 0x80):
+            return value, off
+        shift += 7
+    raise ValueError("malformed LEB128")
+
+
+def find_end_portal_passes(wasm):
+    """Locate RenderEndPortal.getPasses()'s compiled chain inside classes.wasm.
+
+    Returns the list of (offset, passes) for every pass count in the chain,
+    including the final `else` branch, or raises when the module does not look
+    exactly like the stock one (a rebuild with a different compiler, a patched
+    client, ... - in that case the caller must not touch it).
+    """
+    needle = struct.pack("<d", PORTAL_THRESHOLDS[0])
+    hits = []
+    start = 0
+    while True:
+        at = wasm.find(needle, start)
+        if at < 0:
+            break
+        start = at + 1
+        op = at - 1                                   # the 0x44 f64.const opcode
+        if op < 0 or wasm[op] != 0x44:
+            continue
+        for k, value in enumerate(PORTAL_THRESHOLDS):  # thresholds 21 bytes apart
+            p = op + 21 * k
+            if p + 9 > len(wasm) or wasm[p] != 0x44:
+                break
+            if struct.unpack_from("<d", wasm, p + 1)[0] != value:
+                break
+        else:
+            hits.append(op)
+    if len(hits) != 1:
+        raise ValueError(f"expected exactly one getPasses chain in classes.wasm, found {len(hits)}")
+
+    op = hits[0]
+    out = []
+    for k in range(len(PORTAL_THRESHOLDS)):
+        cmp_off = op + 9 + 21 * k                      # the compare opcode
+        if wasm[cmp_off] not in (0x63, 0x64, 0x65, 0x66):
+            raise ValueError(f"getPasses: unexpected instruction at {cmp_off:#x}")
+        if (wasm[cmp_off + 1], wasm[cmp_off + 2], wasm[cmp_off + 3]) != (0x04, 0x40, 0x41):
+            raise ValueError(f"getPasses: unexpected if/const at {cmp_off + 1:#x}")
+        value, after = _read_uleb(wasm, cmp_off + 4)
+        if (wasm[after], wasm[after + 2], wasm[after + 3], wasm[after + 4]) != (0x21, 0x0C, 0x01, 0x0B):
+            raise ValueError(f"getPasses: unexpected branch at {after:#x}")
+        out.append((cmp_off + 4, value))
+    # the `else` branch right after the last if-body (cmp + 10 bytes of body)
+    tail = op + 9 + 21 * (len(PORTAL_THRESHOLDS) - 1) + 10
+    if wasm[tail] != 0x41:
+        raise ValueError(f"getPasses: no final else branch at {tail:#x}")
+    value, after = _read_uleb(wasm, tail + 1)
+    if (wasm[after], wasm[after + 2], wasm[after + 3], wasm[after + 4]) != (0x21, 0x0B, 0x20, 0x02):
+        raise ValueError(f"getPasses: unexpected else tail at {after:#x}")
+    out.append((tail + 1, value))
+    return out
+
+
+def cap_end_portal_passes(wasm, cap=DEFAULT_PORTAL_PASSES):
+    """Lower every pass count above `cap` in getPasses.  Returns (wasm, changes)."""
+    if cap == 0:
+        return wasm, []
+    if not 1 <= cap < PORTAL_MAX_STOCK_PASSES:
+        raise SystemExit(f"--portal-passes must be 0 or 1..{PORTAL_MAX_STOCK_PASSES - 1}")
+    chain = find_end_portal_passes(wasm)
+    changes = []
+    out = bytearray(wasm)
+    for offset, passes in chain:
+        if passes > cap:
+            if out[offset] != passes or passes > 0x3F:
+                raise SystemExit("internal error: unexpected pass count encoding")
+            out[offset] = cap                          # one byte, same length
+            changes.append({"kind": "end_portal_passes", "offset": offset,
+                            "before": passes, "after": cap})
+    if bytes(out) != bytes(wasm):
+        confirm = find_end_portal_passes(bytes(out))
+        if [p for _o, p in confirm] != [min(p, cap) for _o, p in chain]:
+            raise SystemExit("internal error: the patched chain does not read back")
+    return bytes(out), changes
+
+
+# --------------------------------------------------------------------------- #
 # rewriting the client
 # --------------------------------------------------------------------------- #
 def splice_component(epw, get_slice, new_blob, label="component"):
@@ -294,9 +426,13 @@ def _epk_entries(header):
     return out
 
 
-def optimize_client(epw, frames_target, end_portal_size, verbose=True):
-    """Rebuild every EPK inside an EPW.  Returns (epw, report)."""
-    report = {"packs": [], "changes": [], "notes": []}
+def optimize_client(epw, frames_target, end_portal_size, portal_passes=DEFAULT_PORTAL_PASSES,
+                    verbose=True):
+    """Rebuild every EPK inside an EPW, then cap the end portal passes.
+
+    Returns (epw, report).
+    """
+    report = {"packs": [], "changes": [], "notes": [], "code": []}
     for index, path, comp in _epk_entries(P.parse_header(epw)):
         if comp.compressed_length == 0:
             continue
@@ -334,6 +470,36 @@ def optimize_client(epw, frames_target, end_portal_size, verbose=True):
         report["packs"].append({"epk": path, "records": len(parsed["records"]),
                                 "changed": len(changes), "bytes_before": len(raw),
                                 "bytes_after": len(rebuilt)})
+
+    if portal_passes:
+        epw, report = cap_portal_passes_in_client(epw, portal_passes, report, verbose)
+    return epw, report
+
+
+def cap_portal_passes_in_client(epw, cap, report, verbose=True):
+    """Apply the end portal pass cap to the classes.wasm inside an EPW."""
+    comp = P.parse_header(epw)["slices"]["classesWASMData"]
+    if comp.compressed_length == 0:
+        report["notes"].append("no classes.wasm in this EPW - end portal passes left alone")
+        return epw, report
+    wasm = P.decompress_component(comp)
+    try:
+        patched, changes = cap_end_portal_passes(wasm, cap)
+    except ValueError as exc:
+        report["notes"].append(f"end portal passes left alone: {exc}")
+        return epw, report
+    entry = {"component": "classesWASMData", "bytes_before": len(wasm),
+             "bytes_after": len(patched), "passes": cap,
+             "before": [p for _o, p in find_end_portal_passes(wasm)]}
+    if not changes:
+        entry["changed"] = 0
+        report["code"].append(entry)
+        return epw, report
+    epw, _delta = splice_component(epw, lambda h: h["slices"]["classesWASMData"], patched,
+                                   label="classes.wasm")
+    entry["changed"] = len(changes)
+    report["code"].append(entry)
+    report["changes"].extend(changes)
     return epw, report
 
 
@@ -396,6 +562,9 @@ def main(argv=None) -> int:
                     help=f"keep at most this many frames per animation (default {DEFAULT_FRAMES})")
     ap.add_argument("--end-portal", type=int, default=DEFAULT_END_PORTAL,
                     help=f"size of entity/end_portal.png (default {DEFAULT_END_PORTAL}, 0 = leave it)")
+    ap.add_argument("--portal-passes", type=int, default=DEFAULT_PORTAL_PASSES,
+                    help="most passes the end portal may draw per block, stock is up to "
+                         f"{PORTAL_MAX_STOCK_PASSES} (default {DEFAULT_PORTAL_PASSES}, 0 = leave it)")
     ap.add_argument("--dry-run", action="store_true", help="report only, write nothing")
     ap.add_argument("--report", help="write the report as JSON to this file")
     ap.add_argument("--quiet", action="store_true")
@@ -439,7 +608,7 @@ def main(argv=None) -> int:
     html = open(args.client, "rb").read()
     epw, mode, params = load_client(html, user, password, verbose)
     before = len(epw)
-    epw, report = optimize_client(epw, args.frames, args.end_portal, verbose)
+    epw, report = optimize_client(epw, args.frames, args.end_portal, args.portal_passes, verbose)
     report["input"] = args.client
     report["epw_bytes_before"] = before
     report["epw_bytes_after"] = len(epw)
@@ -465,7 +634,10 @@ def _print_report(report, verbose):
         total_after += pack["bytes_after"]
     if verbose:
         for change in report["changes"]:
-            if change["kind"] == "end-portal":
+            if change["kind"] == "end_portal_passes":
+                print(f"  end portal : pass {change['before']} -> {change['after']} "
+                      f"(at {change['offset']:#x} in classes.wasm)")
+            elif change["kind"] == "end-portal":
                 print(f"  end portal : {change['before_size'][0]}x{change['before_size'][1]} -> "
                       f"{change['after_size'][0]}x{change['after_size'][1]} "
                       f"({change['before']} -> {change['after']} bytes)")

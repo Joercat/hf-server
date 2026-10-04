@@ -12,8 +12,11 @@
 # What it does:
 #   1. finds a stock Eaglercraft 1.12 client (git history / --stock FILE),
 #   2. rebuilds client/1.12.html with the new brand + the login gate,
-#   2b. optimises its assets for low-end machines (the end portal texture and
-#      the animation frame counts - see tools/optimize_client.py),
+#   2b. optimises it for low-end machines: the assets (end portal texture,
+#      animation frame counts) and the end portal's render pass count, which is
+#      what makes a stronghold/End portal lag - see tools/optimize_client.py.
+#      --portal-passes N (default 7, 0 = leave the stock layout, PORTAL_PASSES
+#      in the environment) tunes the passes; the stock client draws up to 15.
 #   3. writes .verified-client.env (the brand + UUID; git-ignored),
 #   4. bakes the pair into start.sh *obfuscated* (XOR + base64, like the client
 #      hides the brand behind a PBKDF2 verifier), so the server works without
@@ -38,6 +41,7 @@ OUT="client/1.12.html"
 ENV_FILE=".verified-client.env"
 UPLOAD=false
 OPTIMIZE=true
+PORTAL_PASSES="${PORTAL_PASSES:-7}"      # see tools/optimize_client.py --portal-passes
 BUCKET="${BUCKET:-hf://buckets/smodusermc/1.12}"
 
 while [ $# -gt 0 ]; do
@@ -46,6 +50,7 @@ while [ $# -gt 0 ]; do
         --rotate) ROTATE=true; shift ;;
         --stock) STOCK="$2"; shift 2 ;;
         --no-optimize) OPTIMIZE=false; shift ;;
+        --portal-passes) PORTAL_PASSES="$2"; shift 2 ;;
         --gate-user) GATE_USER="$2"; shift 2 ;;
         --gate-pass) GATE_PASS="$2"; shift 2 ;;
         --output) OUT="$2"; shift 2 ;;
@@ -128,13 +133,14 @@ echo "  new UUID     : $NEW_UUID"
 # 2b. optimise the assets for low-end machines
 # --------------------------------------------------------------------------- #
 # The build above starts from the stock client, whose assets are not optimised:
-# the end portal texture is 256x256 (drawn in several full-screen alpha passes)
-# and the animated blocks carry 32-frame strips.  Doing this here means every
-# rebuilt client is optimised by construction, which the test suite asserts.
+# the end portal texture is 256x256 (drawn in up to 15 blended layers) and the
+# animated blocks carry 32-frame strips.  Doing this here means every rebuilt
+# client is optimised by construction, which the test suite asserts.
 if [ "$OPTIMIZE" = true ]; then
-    echo "Optimising the client assets (low-end devices)"
+    echo "Optimising the client (low-end devices)"
     OPT_OUT="${OUT}.optimizing"
     if python3 tools/optimize_client.py "$OUT" --user "$GATE_USER" --pass "$GATE_PASS" \
+            --portal-passes "$PORTAL_PASSES" \
             --output "$OPT_OUT" 2>&1 | sed 's/^/  /'; then
         mv -f "$OPT_OUT" "$OUT"
     else

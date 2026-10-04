@@ -1278,7 +1278,13 @@ BUNGEE_MAX_MB=1024
 PAPER_MAX_MB=$(( TOTAL_MEM_MB - BUNGEE_MAX_MB - 768 ))
 [ "$PAPER_MAX_MB" -gt 8192 ] && PAPER_MAX_MB=8192
 [ "$PAPER_MAX_MB" -lt 1024 ] && PAPER_MAX_MB=1024
-PAPER_MIN_MB=8192
+# -Xms must be <= -Xmx or the JVM refuses to start ("Initial heap size set to a
+# larger value than the maximum heap size"), and it must also fit in the Space's
+# RAM: on a 16 GB Space the max is 8192 but on a smaller one it is not, so the
+# initial heap is derived from the max instead of being a fixed 8192.
+PAPER_MIN_MB=$(( PAPER_MAX_MB / 2 ))
+[ "$PAPER_MIN_MB" -gt 4096 ] && PAPER_MIN_MB=4096
+[ "$PAPER_MIN_MB" -lt 512 ] && PAPER_MIN_MB=512
 
 echo "========================================"
 echo "  Eaglercraft 1.12.2 Vanilla Survival"
@@ -2914,9 +2920,22 @@ ensure_bucket_sync_py() {
 }
 # <<< embedded bucket_sync.py <<<
 
+# The bucket sync, the world copy and the log parsers run on the same two cores
+# as Paper.  They are pushed to the lowest CPU (and disk) priority so the tick
+# loop always wins the core: the upload then takes a little longer, but a player
+# never feels it as a lag spike.  Both tools are probed once - a container
+# without ionice (or without the permission to set an I/O class) silently falls
+# back to nice, and a container without nice runs them as before.
+BG_PRIORITY=()
+if command -v ionice >/dev/null 2>&1 && ionice -c3 true >/dev/null 2>&1; then
+    BG_PRIORITY=(nice -n 19 ionice -c3)
+elif command -v nice >/dev/null 2>&1; then
+    BG_PRIORITY=(nice -n 19)
+fi
+
 bucket_py() {   # run the embedded bucket uploader (tools/bucket_sync.py)
     ensure_bucket_sync_py
-    python3 "$BUCKET_SYNC_PY" "$@" 2>&1
+    "${BG_PRIORITY[@]}" python3 "$BUCKET_SYNC_PY" "$@" 2>&1
 }
 
 # hf://buckets/ns/name/game-data -> "ns/name", and the part after it on stdout
@@ -2940,7 +2959,7 @@ bucket_sync_dir() {
     BUCKET_ERROR=""
 
     if [ "$method" != "python" ] && command -v hf >/dev/null 2>&1; then
-        out=$(hf buckets sync "$local_dir" "$remote" $flag 2>&1); rc=$?
+        out=$("${BG_PRIORITY[@]}" hf buckets sync "$local_dir" "$remote" $flag 2>&1); rc=$?
         if [ $rc -eq 0 ]; then
             BUCKET_VIA="cli"
             return 0
@@ -3021,20 +3040,27 @@ hf_restore_saves() {
     done
 }
 
+# Copying the whole world out and hashing it in the bucket costs CPU (and disk)
+# on the same two cores Paper runs on, so every run reports how long it took:
+# if the game hitches in a regular rhythm, these lines are the first thing to
+# look at (SYNC_INTERVAL is a Space variable if you want it less often).
 hf_push_saves() {
     report_shared_ips
-    local STAGING="$FULL_STAGING" out rc
+    local STAGING="$FULL_STAGING" out rc STARTED TOOK
+    STARTED=$(date +%s)
     rm -rf "$STAGING" && mkdir -p "$STAGING"
     for item in $SAVE_DIRS; do
         if [ -e "$BACKEND_DIR/$item" ]; then
             mkdir -p "$STAGING/$(dirname "$item")"
-            cp -a "$BACKEND_DIR/$item" "$STAGING/$item"
+            "${BG_PRIORITY[@]}" cp -a "$BACKEND_DIR/$item" "$STAGING/$item"
         fi
     done
     if bucket_sync_dir "$STAGING" "${HF_BUCKET_HANDLE}/game-data" --delete; then
-        echo "[SYNC] OK $(date '+%H:%M:%S') via ${BUCKET_VIA:-?}"
+        TOOK=$(($(date +%s) - STARTED))
+        echo "[SYNC] OK $(date '+%H:%M:%S') via ${BUCKET_VIA:-?} (took ${TOOK}s)"
     else
-        echo "[SYNC] FAIL $(date '+%H:%M:%S') - ${BUCKET_ERROR:-unknown error}"
+        TOOK=$(($(date +%s) - STARTED))
+        echo "[SYNC] FAIL $(date '+%H:%M:%S') - ${BUCKET_ERROR:-unknown error} (took ${TOOK}s)"
     fi
     rm -rf "$STAGING"
 }
@@ -3047,7 +3073,8 @@ hf_push_logs() {
     flush_pending_auth
     report_shared_ips
     proxy_peers_record
-    local STAGING="$LOG_STAGING" out rc
+    local STAGING="$LOG_STAGING" out rc STARTED TOOK
+    STARTED=$(date +%s)
     rm -rf "$STAGING" && mkdir -p "$STAGING"
     [ -d "$SEC_DIR" ] && cp -a "$SEC_DIR" "$STAGING/security-logs"
     if [ "$SYNC_PRIVATE_LOGS" = true ] && [ -d "$PRIV_DIR" ]; then
@@ -3062,10 +3089,12 @@ hf_push_logs() {
     fi
     LOG_SYNC_FILES=$(cd "$STAGING" 2>/dev/null && find . -type f -printf '%P(%s) ' 2>/dev/null | sort)
     if bucket_sync_dir "$STAGING" "${HF_BUCKET_HANDLE}/game-data"; then
-        echo "[LOGSYNC] OK $(date '+%H:%M:%S') via ${BUCKET_VIA:-?} (security-logs$([ "$SYNC_PRIVATE_LOGS" = true ] && echo ' + private-logs')$([ "$SYNC_CONSOLE_LOGS" = true ] && echo ' + console tails'))"
+        TOOK=$(($(date +%s) - STARTED))
+        echo "[LOGSYNC] OK $(date '+%H:%M:%S') via ${BUCKET_VIA:-?} (took ${TOOK}s) (security-logs$([ "$SYNC_PRIVATE_LOGS" = true ] && echo ' + private-logs')$([ "$SYNC_CONSOLE_LOGS" = true ] && echo ' + console tails'))"
         echo "          $(printf '%s' "$LOG_SYNC_FILES")"
     else
-        echo "[LOGSYNC] FAIL $(date '+%H:%M:%S') - ${BUCKET_ERROR:-unknown error}"
+        TOOK=$(($(date +%s) - STARTED))
+        echo "[LOGSYNC] FAIL $(date '+%H:%M:%S') - ${BUCKET_ERROR:-unknown error} (took ${TOOK}s)"
     fi
     rm -rf "$STAGING"
 }

@@ -1559,6 +1559,195 @@ else
     echo "  skip - set VER_CLIENT_USER / VER_CLIENT_PASS to re-optimise the real client"
 fi
 
+# --------------------------------------------------------------------------- #
+echo "== 22. the end portal no longer draws 15 layers =="
+# The lag near a stronghold/End portal comes from RenderEndPortal drawing the
+# same quad once per "pass": the stock client picks up to 15 of them from the
+# squared distance.  The pass count is a tiny compiled function in classes.wasm;
+# the optimiser finds its comparison chain and lowers the constants.
+PFIX="$WORK/portalfix"; rm -rf "$PFIX"; mkdir -p "$PFIX"
+python3 - "$PFIX" "$ROOT" <<'PYPORTAL'
+import json, struct, subprocess, sys
+sys.path.insert(0, sys.argv[2] + "/tools")
+import optimize_client as O
+
+out = sys.argv[1]
+
+
+def uleb(n):
+    b = bytearray()
+    while True:
+        x = n & 0x7F
+        n >>= 7
+        if n:
+            b.append(x | 0x80)
+        else:
+            b.append(x)
+            return bytes(b)
+
+
+def body(returns, thresholds=O.PORTAL_THRESHOLDS):
+    """A module body shaped exactly like the compiled getPasses (f64, f64 -> i32)."""
+    b = bytearray(b"\x01\x01\x7f")          # one i32 local (index 2 = the result)
+    b += b"\x02\x40"                        # the block every branch jumps out of
+    for t, r in zip(thresholds, returns):
+        b += b"\x20\x01" + b"\x44" + struct.pack("<d", t)
+        b += (b"\x64" if t != O.PORTAL_THRESHOLDS[-1] else b"\x65") + b"\x04\x40"
+        b += b"\x41" + uleb(r) + b"\x21\x02\x0c\x01\x0b"
+    b += b"\x41" + uleb(returns[-1]) + b"\x21\x02"
+    b += b"\x0b\x20\x02\x0b"
+    return bytes(b)
+
+
+def module(buf):
+    code = uleb(1) + uleb(len(buf)) + buf
+    return (b"\x00asm\x01\x00\x00\x00" + b"\x01\x07\x01\x60\x02\x7c\x7c\x01\x7f"
+            + b"\x03\x02\x01\x00" + b"\x07\x05\x01\x01f\x00\x00"
+            + b"\x0a" + uleb(len(code)) + code)
+
+
+report = {}
+stock = module(body((1, 3, 5, 7, 9, 11, 13, 15, 14)))
+report["stock_len"] = len(stock)
+chain = O.find_end_portal_passes(stock)
+report["chain"] = [p for _o, p in chain]
+report["chain_offsets_sorted"] = [o for o, _p in chain] == sorted(o for o, _p in chain)
+patched, changes = O.cap_end_portal_passes(stock, 7)
+report["edits"] = len(changes)
+report["patched"] = [p for _o, p in O.find_end_portal_passes(patched)]
+report["same_len"] = len(patched) == len(stock)
+report["bytes_changed"] = sum(1 for a, b in zip(stock, patched) if a != b)
+report["only_lowered"] = all((o, p) == (o, min(p, 7)) for (o, p) in
+                             zip([o for o, _p in chain], report["patched"]))
+again, edits2 = O.cap_end_portal_passes(patched, 7)
+report["idempotent"] = again == patched and edits2 == []
+report["cap0_unchanged"] = O.cap_end_portal_passes(stock, 0)[0] == stock
+try:
+    O.cap_end_portal_passes(stock, 20)
+    report["bad_cap_refused"] = False
+except SystemExit:
+    report["bad_cap_refused"] = True
+shifted = module(body((1, 3, 5, 7, 9, 11, 13, 15, 14),
+                      thresholds=(999999.0,) + O.PORTAL_THRESHOLDS[1:]))
+try:
+    O.find_end_portal_passes(shifted)
+    report["other_module_refused"] = False
+except ValueError:
+    report["other_module_refused"] = True
+
+# behaviour: run both modules for real distances (needs node)
+report["node_stock"] = report["node_patched"] = None
+if subprocess.run(["bash", "-c", "command -v node"], capture_output=True).returncode == 0:
+    open(out + "/stock.wasm", "wb").write(stock)
+    open(out + "/patched.wasm", "wb").write(patched)
+    js = ("const fs=require('fs');(async()=>{const o={};"
+          "for(const n of ['stock','patched']){const m=await WebAssembly.instantiate("
+          "fs.readFileSync(process.argv[1]+'/../portalfix/'+n+'.wasm'));"
+          "o[n]=[1000000,30000,20000,10000,5000,2000,700,300,100]"
+          ".map(d=>m.instance.exports.f(0,d));}"
+          "console.log(JSON.stringify(o));})()")
+    r = subprocess.run(["node", "-e", js, out], capture_output=True, text=True, timeout=120)
+    if r.returncode == 0 and r.stdout.strip().startswith("{"):
+        data = json.loads(r.stdout)
+        report["node_stock"], report["node_patched"] = data["stock"], data["patched"]
+    else:
+        report["node_error"] = (r.stderr or r.stdout).strip()[:200]
+json.dump(report, open(out + "/report.json", "w"), indent=1)
+PYPORTAL
+PR="$PFIX/report.json"
+pfix() { python3 -c "import json,sys;d=json.load(open(sys.argv[1]));print(d[sys.argv[2]])" "$PR" "$1"; }
+check "the passes function is found in a stock-shaped module" \
+      "$(pfix chain)" "[1, 3, 5, 7, 9, 11, 13, 15, 14]"
+check "…the pass counts are read at the right offsets" "$(pfix chain_offsets_sorted)" "True"
+check "capping at 7 lowers every layer above it" "$(pfix edits)/$(pfix patched)" "5/[1, 3, 5, 7, 7, 7, 7, 7, 7]"
+check "…touching one byte per pass, never the length" \
+      "$(pfix bytes_changed)/$(pfix same_len)" "5/True"
+check "…and only ever lowering a count" "$(pfix only_lowered)" "True"
+check "capping an already capped client changes nothing" "$(pfix idempotent)" "True"
+check "0 leaves the passes alone" "$(pfix cap0_unchanged)" "True"
+check "an impossible cap is refused" "$(pfix bad_cap_refused)" "True"
+check "a module that does not look like the stock one is refused" "$(pfix other_module_refused)" "True"
+if [ "$(pfix node_stock)" != "None" ]; then
+    check "the stock module really returns 15 layers at 16-24 blocks" \
+          "$(pfix node_stock)" "[1, 3, 5, 7, 9, 11, 13, 14, 15]"
+    check "…and the patched module returns at most 7, and still runs" \
+          "$(pfix node_patched)" "[1, 3, 5, 7, 7, 7, 7, 7, 7]"
+else
+    echo "  skip - node is not installed, cannot run the fixture modules"
+fi
+
+if [ -n "${VER_CLIENT_USER:-}" ] && [ -n "${VER_CLIENT_PASS:-}" ]; then
+    python3 - "$ROOT" "$WORK" "$VER_CLIENT_USER" "$VER_CLIENT_PASS" > "$WORK/portal.log" 2>&1 <<'PYREAL'
+import json, sys
+sys.path.insert(0, sys.argv[1] + "/tools")
+import optimize_client as O, patch_verified_client as P
+client, work, user, password = sys.argv[1:5]
+epw = P.unseal_client(open(client + "/client/1.12.html", "rb").read(), user, password)
+wasm = P.decompress_component(P.parse_header(epw)["slices"]["classesWASMData"])
+chain = [p for _o, p in O.find_end_portal_passes(wasm)]
+print(json.dumps({
+    "chain": chain,
+    "max": max(chain),
+    "capped": all(p <= O.DEFAULT_PORTAL_PASSES for p in chain),
+    "no_stock_15": 15 not in chain and 14 not in chain and 13 not in chain,
+    "len": len(wasm),
+}))
+PYREAL
+    REAL=$(tail -1 "$WORK/portal.log")
+    real() { python3 -c "import json,sys;print(json.loads(sys.argv[1])[sys.argv[2]])" "$REAL" "$1"; }
+    check "the committed client carries the capped passes function" \
+          "$(real chain)" "[1, 3, 5, 7, 7, 7, 7, 7, 7]"
+    check "…so no portal block draws more than $(python3 -c "import sys;sys.path.insert(0,'$ROOT/tools');import optimize_client as O;print(O.DEFAULT_PORTAL_PASSES)") layers" \
+          "$(real capped)" "True"
+    check "…and the 13/14/15 layer cases are gone" "$(real no_stock_15)" "True"
+else
+    echo "  skip - set VER_CLIENT_USER / VER_CLIENT_PASS to check the real client"
+fi
+
+echo "== 23. the server does not fight the game for the CPU =="
+
+# -Xms may never exceed -Xmx: the JVM refuses to start with "Initial heap size
+# set to a larger value than the maximum heap size".  The sizing block is lifted
+# out of start.sh verbatim (only the free(1) call is replaced, so the test can
+# ask about a few Space sizes) and the invariant is checked for each of them.
+MEM_BLOCK="$WORK/mem-block.sh"
+sed -n '/^TOTAL_MEM_MB=\$(free -m/,/^\[ "\$PAPER_MIN_MB" -lt 512 \] && PAPER_MIN_MB=512$/p' \
+    "$ROOT/start.sh" > "$MEM_BLOCK"
+check_at_least "the JVM memory sizing block is still in start.sh" "$(wc -l < "$MEM_BLOCK")" 8
+check "…the old fixed -Xms8192 is gone" "$(grep -c '^PAPER_MIN_MB=8192$' "$ROOT/start.sh")" "0"
+
+sed 's|^TOTAL_MEM_MB=.*|TOTAL_MEM_MB=${TOTAL_MEM_MB:-16000}|' "$MEM_BLOCK" > "$WORK/mem-block-src.sh"
+sizing() { TOTAL_MEM_MB="$1" bash -c '. "$0"; printf "%s %s\n" "$PAPER_MIN_MB" "$PAPER_MAX_MB"' "$WORK/mem-block-src.sh"; }
+
+for MB_SIZE in 2048 4096 8192 16384 32768; do
+    set -- $(sizing "$MB_SIZE")
+    XMS="$1"; XMX="$2"
+    check "a ${MB_SIZE}MB Space gets Xms<=Xmx (${XMS} <= ${XMX})" \
+          "$([ "$XMS" -le "$XMX" ] && echo ok || echo broken)" "ok"
+    check "…and a heap that fits the Space" \
+          "$([ "$XMX" -ge 1024 ] && [ "$XMX" -le 8192 ] && [ "$XMS" -ge 512 ] && [ "$XMX" -le "$MB_SIZE" ] && echo ok || echo broken)" "ok"
+done
+
+# The bucket sync, the world copy and the log parsers must run below the game's
+# priority: they share two cores with Paper, and a full world copy every
+# SYNC_INTERVAL seconds otherwise competes with the tick loop.
+BG_PRIORITY=()
+eval "$(awk '/^BG_PRIORITY=\(\)/,/^fi$/ { print }' "$ROOT/start.sh" 2>/dev/null || true)"
+check "the sync runs behind a nice/ionice prefix" \
+      "$(grep -c 'BG_PRIORITY=(nice' "$ROOT/start.sh")" "2"      # nice alone + nice with ionice
+check "…the ionice class is probed before it is used" \
+      "$(grep -c 'ionice -c3 true' "$ROOT/start.sh")" "1"
+check "…both bucket paths and the world copy use it" \
+      "$(grep -c '"\${BG_PRIORITY\[@\]}"' "$ROOT/start.sh")" "3"
+if command -v nice >/dev/null 2>&1; then
+    check_at_least "…and the probe really picks a prefix here" "${#BG_PRIORITY[@]}" "1"
+fi
+check "…which runs a command" "$("${BG_PRIORITY[@]}" true >/dev/null 2>&1; echo $?)" "0"
+check "…and each sync prints how long it took (an OK and a FAIL line per loop)" \
+      "$(grep -c '(took \${TOOK}s)' "$ROOT/start.sh")" "4"
+check "…with the timing taken from the real work" \
+      "$(grep -c 'STARTED=\$(date +%s)' "$ROOT/start.sh")" "2"
+
 echo
 echo "passed: $PASS  failed: $FAIL"
 [ "$FAIL" -eq 0 ]

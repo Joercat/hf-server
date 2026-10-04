@@ -39,7 +39,7 @@ A Hugging Face Space that runs:
 | `tools/setup-verified-client.sh` | one command to build/rotate it, re-bake the pair into `start.sh` and print the secrets |
 | `tools/patch_verified_client.py` | patches / inspects / seals the client brand |
 | `tools/verify_gated_client.mjs` | runs the real login gate + loader headless: proves the file only boots after the login |
-| `tools/optimize_client.py` | shrinks the two things that cost frames on weak machines (end portal texture, animation frames) and re-seals the client |
+| `tools/optimize_client.py` | cuts what costs frames on weak machines (end portal render passes, end portal texture, animation frames) and re-seals the client |
 | `tools/epk.py` / `tools/pnglite.py` | the EPK package and PNG readers/writers that optimiser needs (no external libraries) |
 | `tools/run_epw_loader.mjs` | boots the client's own EPW loader to prove the file loads |
 | `tools/forward_ip_probe.py` | asks the proxy whether it sends a forwarded-IP header (embedded in `start.sh`) |
@@ -289,23 +289,26 @@ After a rotation, push `start.sh` (the pair inside it changed) and hand out the
 new client. The old pair stops matching immediately. A brand that was public at
 some point is refused by the patcher (`REVOKED_BRANDS`) and by the server
 (`PUBLISHED_CLIENT_BRANDS`), and the test suite checks that the pair never
-appears in the git history: `git log --all -S"<brand>"` must be empty. The suite also checks the hidden-IP logging, the enforcement
-(kicks), the `/login` logging against a fake Bungee console, the IP report, the
-forwarded-IP discovery (with a fake proxy that refuses headers), the proxy-peer
-evidence (against a fixture of the kernel's own tables), the low-end-device asset
-rules (end portal + animation frames, with the untouched files compared byte for
-byte), the auth-filter
-patch (its rule table, a fixture jar it patches and a real JVM loads, the
-`javap` rollback and the switch), the masking of the bucket's console copies,
-the per-account addresses, and that the copies embedded in `start.sh` match
-`tools/`. With the client credentials in the
+appears in the git history: `git log --all -S"<brand>"` must be empty. The suite
+also checks the hidden-IP logging, the enforcement (kicks), the `/login` logging
+against a fake Bungee console, the IP report, the forwarded-IP discovery (with a
+fake proxy that refuses headers), the proxy-peer
+evidence (against a fixture of the kernel's own tables), the low-end-device rules
+(end portal passes + texture + animation frames, with the untouched files
+compared byte for byte), the auth-filter patch (its rule table, a fixture jar it
+patches and a real JVM loads, the `javap` rollback and the switch), the masking
+of the bucket's console copies, the per-account addresses, that the JVM heap
+sizing can never hand the JVM an `-Xms` above its `-Xmx` (checked against five
+Space sizes by running the real block from `start.sh`), that the bucket sync and
+the world copy run at the lowest CPU/disk priority and report how long they took,
+and that the copies embedded in `start.sh` match `tools/`. With the client credentials in the
 environment it additionally **runs the real login gate and boots the client's
 own EPW loader** in Node, i.e. it proves the file you hand out works:
 
 ```bash
-bash tests/test_verified_client.sh              # 290 checks
+bash tests/test_verified_client.sh              # 320 checks
 VER_CLIENT_USER=<user> VER_CLIENT_PASS=<password> \
-    bash tests/test_verified_client.sh          # 309 checks (adds the boot test)
+    bash tests/test_verified_client.sh          # 342 checks (adds the real client)
 
 # same, but print the logs it produced, so you can see the formats:
 PRINT_LOGS=1 bash tests/test_verified_client.sh
@@ -541,22 +544,32 @@ and `auth.log` masks every password until it is set again.
 
 ### Low-end machines (4 GB Chromebooks and friends)
 
-Two things in the shipped assets were measurably expensive on weak GPUs, and both
-are fixed *inside the client file* — no setting to change, nothing to remember,
-the same login and the same brand:
+Three things in the shipped client cost real frames on weak hardware, and all
+three are fixed *inside the client file* — no setting to change, nothing to
+remember, the same login and the same brand:
 
-**1. The end portal / End sky texture** (`entity/end_portal.png`) shipped as
-256x256 (256 KiB). That texture is not drawn once: the portal block — and the End
-sky — is rendered as **several full-screen alpha-blended passes** stacked on top
-of each other, each with its own texture matrix scrolling the starfield, sampled
-straight through the pixel shader over the whole tile it covers. On a Chromebook
-that fill rate (and the texture cache misses from zooming into a 256x256 texture)
-is the single biggest cost of standing near a portal or being in the End, which is
-exactly the reported "it lags really bad when the portal is in render distance".
-It is a soft noise field, so it is now **32x32**: 1/64th of the memory, and the
-passes sample from L1 instead of thrashing. The animation is unchanged.
+**1. The end portal's render passes — the stronghold/End lag.** This is the big
+one, and it is not the texture: `RenderEndPortal` draws the portal quad **once per
+pass, up to 15 times**, each pass with its own texture-matrix change and a blended
+draw, and the count comes straight from the squared distance to the block
+(`getPasses`). In a browser every one of those GL calls crosses the wasm → JS
+boundary, so a 3x3 portal is a few thousand calls and a few hundred draw calls
+*per frame* — that is the reported "if you go to the stronghold/end and the portal
+is in render distance, it lags really bad". The pass count is compiled into
+`classes.wasm` as single-byte constants, so the optimiser finds that chain and
+**caps it at 7 passes** (one byte per count, the module still compiles, and the
+edit can only ever make the client lighter). The portal keeps its layered
+starfield, with half the layers; `--portal-passes` tunes it (`3` = fastest,
+`0` = leave the stock numbers, `PORTAL_PASSES` for the rebuild script).
 
-**2. Animated texture strips.** Water, lava, fire, the nether portal, sea lantern
+**2. The end portal / End sky texture** (`entity/end_portal.png`) shipped as
+256x256 (256 KiB) and is sampled by every one of those passes (the End's sky
+wallpaper uses the same file), so the passes were both call-heavy *and* cache
+unfriendly. It is a soft noise field, so it is now **32x32**: 1/64th of the
+memory, and the passes sample from L1 instead of thrashing. The look in motion is
+unchanged.
+
+**3. Animated texture strips.** Water, lava, fire, the nether portal, sea lantern
 and command blocks shipped as 32/20/16-frame strips (16x16 each). Every frame is
 uploaded to the GPU as its own layer and re-uploaded on a timer, which is what
 produces the periodic hitch when water or lava fills the screen. Animation is
@@ -576,6 +589,9 @@ python3 tools/optimize_client.py client/1.12.html --output /tmp/c.html && mv /tm
 
 # keep 8 frames per animation (default), or 4 for an even weaker machine
 python3 tools/optimize_client.py client/1.12.html --frames 4
+# fewer end portal layers (3 = fastest) / leave the stock renderer alone
+python3 tools/optimize_client.py client/1.12.html --portal-passes 3
+python3 tools/optimize_client.py client/1.12.html --portal-passes 0
 # leave the end portal texture alone
 python3 tools/optimize_client.py client/1.12.html --end-portal 0
 
@@ -585,7 +601,10 @@ python3 tools/optimize_client.py --pack mypack.epk -o mypack.optimized.epk
 
 The tool re-seals the payload with the **same salt, IV and iterations**, so the
 same username/password keeps working and the brand (and therefore the server's
-verification) is untouched. `tools/setup-verified-client.sh` runs it
+verification) is untouched. The optimisation steps are independent: `--frames`,
+`--end-portal` and `--portal-passes` can each be switched off, and re-running the
+tool on an already optimised client changes nothing (the suite asserts the
+committed client reproduces byte for byte). `tools/setup-verified-client.sh` runs it
 automatically after a rebuild (`--no-optimize` skips it), and the test suite
 asserts that the committed client is already in that shape: optimising it again
 has to reproduce the same file byte for byte.
@@ -598,9 +617,10 @@ compressed; and the gameplay settings (`render distance`, `fancy/fast graphics`,
 and are one click away in the client's own *Options* screen — those still matter
 more than anything in the file. Two things worth knowing on a 4 GB machine:
 
-* a **custom texture pack** is the biggest remaining lever, because the client
-  decodes, decompresses and re-uploads every texture of a pack when it loads it;
-  run the tool on the pack itself (`--pack`) before handing it out, and prefer
+* a **custom texture pack** is the biggest remaining lever after that, because
+  the client decodes, decompresses and re-uploads every texture of a pack when it
+  loads it — including its own animated strips, which replace the optimised ones.
+  Run the tool on the pack itself (`--pack`) before handing it out, and prefer
   packs whose `entity/end_portal.png` is not huge;
 * if the game still hitches with a pack loaded, it is the pack load, not the
   server: the pack is decoded on the machine, once per load.
@@ -695,5 +715,15 @@ Required Space settings: a `HF_TOKEN` secret with write access to the bucket
 * `config/bungee/EaglerXServer.jar` (unused by the Dockerfile) is not committed here.
 * The login regex in the original `start.sh` was missing the `]` after the
   port, so Paper logins were never written to `logins.log`; this is fixed here.
-* `PAPER_MIN_MB` is `8192` in the original script, so the Space needs enough RAM
-  for `-Xms8192M` (see the memory sizing block at the top of `start.sh`).
+* the memory sizing block at the top of `start.sh` used to hard-code
+  `PAPER_MIN_MB=8192`, i.e. `-Xms8192M` against an `-Xmx` that shrinks with the
+  Space's RAM — on anything smaller than a 16 GB Space `Xms > Xmx` and the JVM
+  refuses to start at all ("Initial heap size set to a larger value than the
+  maximum heap size"). The initial heap is now half of the maximum, capped at
+  4096 MB, so `Xms <= Xmx` always holds.
+* the bucket sync, the world copy and the log parsers run at the lowest CPU and
+  disk priority (`nice -n 19`, plus `ionice -c3` where the container allows it).
+  They share two cores with Paper: without this, a full world copy + upload every
+  `SYNC_INTERVAL` seconds (300 by default) competes with the tick loop, which is
+  felt in game as a periodic hitch. The sync and log-loop lines print how long
+  each run took, so a slow Space is visible in the logs instead of guessed at.
