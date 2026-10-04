@@ -1,47 +1,55 @@
 #!/usr/bin/env python3
 """optimize_client.py - make the verified client cheaper to run on weak machines.
 
-The client is a sealed EPW file; inside it sit the game's compiled code
+The client is a sealed EPW file; inside it sit the compiled game code
 (`classes.wasm`) and two EPK asset packages (`assets.epk` and the `lang` one).
-This tool rewrites the three things that actually cost frames on a low-end
-machine, and re-seals the client:
+Three things in there cost real frames on a slow machine - an old phone-class
+CPU, which is what a 4 GB Chromebook has - and this tool fixes all three:
 
-1. **The end portal's render passes (the stronghold/End lag).**  Near an active
-   portal the stock client draws the portal quad over and over - up to **15
-   passes** - each pass with its own texture matrix change and a blended draw,
-   and the count comes straight from the squared distance to the block
-   (`RenderEndPortal.getPasses`).  In a browser every one of those GL calls
-   crosses the wasm -> JS boundary, so a 3x3 portal is a few thousand calls and
-   a few hundred draw calls *per frame*: that is the "it lags really bad when
-   the portal is in render distance" report, and it has nothing to do with the
-   texture file.  The count is compiled into a tiny function in `classes.wasm`
-   as single-byte constants, so this tool finds the chain and lowers it (default:
-   **at most 7 passes**).  The edit is one byte per pass count, the module still
-   compiles, and it can only ever make the client *lighter* - but the portal does
-   show fewer layers of its starfield, so `--portal-passes` (0 = stock) is there
-   to tune it.
+1. **The end portal's render passes - the stronghold/End lag.**  The game does
+   not draw the portal once: `RenderEndPortal` draws the same quad over and over,
+   up to **15 passes**, and how many is decided by
+   `RenderEndPortal.getPasses(squaredDistanceToBlock)`.  Every pass changes the
+   texture matrix and issues another blended draw, and in a browser every one of
+   those GL calls crosses the wasm -> JS boundary, so a 3x3 portal is a few
+   hundred draw calls and a few thousand calls *per frame* - which is exactly the
+   reported "if you go to the stronghold/end and the portal is in render
+   distance, it lags really bad".  The pass counts are compiled into
+   `classes.wasm` as single-byte constants, so this tool finds that chain (and
+   refuses any module that does not match the stock one byte for byte) and lowers
+   every count above a cap - default **7**, i.e. half the layers.  It can only
+   ever make the client lighter: one byte per count, nothing changes length, and
+   the module still compiles.  `--portal-passes` tunes it (0 = leave the stock
+   renderer alone).
 
-2. **The end portal texture.**  `entity/end_portal.png` ships as a 256x256 RGBA
-   texture (256 KiB) that every pass samples; it is a soft noise field, so 32x32
-   looks the same in motion, costs 1/64th of the memory and keeps the sampler in
-   L1 instead of thrashing caches.  (The End's sky wallpaper uses the same
-   texture, so the whole dimension gets the same win.)
+2. **The end portal texture.**  `entity/end_portal.png` is what all of those
+   passes sample and it ships 256x256 (256 KiB), zoomed into by every pass; it is
+   a soft noise field, so 32x32 is the same picture in motion with 1/64th of the
+   memory and cache pressure.  (Fill rate is the GPU's business - which is why
+   this alone did not make a CPU-bound device any faster; the pass count above is
+   the part that is felt.)
 
-3. **Animated texture memory.**  The pack ships BTA-like animation strips: water
-   32 frames of 16x16, lava 20, fire 32, the nether portal 32, sea lantern 5,
-   prismarine 4, command blocks 4.  Every frame is its own layer of an array
-   texture and is re-uploaded on a timer, so 32-frame strips are part of the
-   periodic stutter while water/lava fills the screen.  Animation is *time
-   based*, so keeping every n-th frame and multiplying the entry's `frametime`
-   by n plays at the same speed - water and lava simply stop running at 120 fps
-   and animate at 15, which a human eye cannot tell apart from 60 on a 4 GB
-   machine that never runs 60 anyway.  Default: at most 8 frames per texture.
+3. **Animated texture memory and uploads.**  The pack ships BTA-like animation
+   strips: water 32 frames of 16x16, lava 20, fire 32, the nether portal 32, sea
+   lantern 5, prismarine 4, command blocks 4.  Every frame is its own layer of an
+   array texture and every frame change re-uploads it, so 32-frame strips are
+   part of the periodic stutter when water/lava fills the screen.  Animation is
+   *time based*, so keeping every n-th frame and multiplying the entry's
+   `frametime` by n plays the same animation at 1/n the uploads (water and lava
+   at 15 fps instead of 60 on a machine that never runs 60).  Lists that were
+   hand-written (lava's ping-pong, the prismarine flicker) are left alone.
+   Default: at most 8 frames per texture.
 
 Everything else in the package is copied byte for byte, and the tool prints (and
 optionally writes to JSON) exactly what it changed.  The client's brand, the
-login gate and every credential stay untouched: the payload is re-sealed with
-the same salt/IV/iterations, so the file keeps working with the same username and
+login gate and every credential stay untouched: the payload is re-sealed with the
+same salt/IV/iterations, so the file keeps working with the same username and
 password.
+
+The same two asset rules can be applied to a **resource pack** - which matters,
+because a pack replaces the optimised assets with its own (this is why "some
+packs give really big input delay"): `--pack` takes an EPK file or a `.zip` like
+the ones the client imports, and writes the same container back.
 
 usage:
   # what would change, without writing anything
@@ -50,8 +58,8 @@ usage:
   # write client/1.12.html.optimized
   python3 tools/optimize_client.py client/1.12.html --output client/1.12.html.optimized
 
-  # a resource pack (EPK file) instead of a client
-  python3 tools/optimize_client.py --pack mypack.epk --output mypack.optimized.epk
+  # a resource pack instead of a client (EPK or .zip)
+  python3 tools/optimize_client.py --pack mypack.zip --output mypack.optimized.zip
 
   # the credentials and the brand come from .verified-client.env when present
   python3 tools/optimize_client.py client/1.12.html --user U --pass P
@@ -62,10 +70,12 @@ usage:
 
 import argparse
 import base64
+import io
 import json
 import os
 import struct
 import sys
+import zipfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -264,6 +274,52 @@ def optimize_pack(pack_files, frames_target=DEFAULT_FRAMES, end_portal_size=DEFA
         new_files[name] = encoded
         new_files[meta_name] = json.dumps(new_parsed, indent=2).encode("utf-8")
     return new_files, changes, notes
+
+# --------------------------------------------------------------------------- #
+# resource packs: the same two asset rules, EPK or zip
+# --------------------------------------------------------------------------- #
+def zip_infos_and_files(path):
+    """[(ZipInfo, ...)], {name: bytes} of a resource pack zip, in file order."""
+    try:
+        with zipfile.ZipFile(path) as zf:
+            infos = list(zf.infolist())
+            files = {}
+            for info in infos:
+                if info.is_dir():
+                    continue
+                try:
+                    files[info.filename] = zf.read(info)
+                except NotImplementedError as exc:
+                    raise SystemExit(f"{info.filename}: the zip uses a compression "
+                                     f"this Python cannot read ({exc})")
+    except zipfile.BadZipFile as exc:
+        raise SystemExit(f"{path}: not a readable zip ({exc})")
+    return infos, files
+
+
+def zip_from_infos_and_files(infos, files):
+    """Rebuild the zip with the same entries, order, dates and compression."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as out:
+        for info in infos:
+            data = b"" if info.is_dir() else files[info.filename]
+            new_info = zipfile.ZipInfo(info.filename, date_time=info.date_time)
+            new_info.compress_type = info.compress_type
+            new_info.external_attr = info.external_attr
+            new_info.internal_attr = info.internal_attr
+            new_info.create_system = info.create_system
+            out.writestr(new_info, data)
+    return buf.getvalue()
+
+
+def check_zip(data, names):
+    """The rebuilt zip must still open, keep its entries and pass every CRC."""
+    with zipfile.ZipFile(io.BytesIO(data)) as zf:
+        if zf.namelist() != names:
+            raise SystemExit("internal error: the rebuilt zip lost or reordered entries")
+        bad = zf.testzip()
+        if bad is not None:
+            raise SystemExit(f"internal error: {bad} is corrupt in the rebuilt zip")
 
 
 # --------------------------------------------------------------------------- #
@@ -554,7 +610,9 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("client", nargs="?", help="client HTML (sealed or plain)")
-    ap.add_argument("--pack", help="optimize a resource-pack EPK file instead of a client")
+    ap.add_argument("--pack",
+                    help="optimize a resource pack instead of a client "
+                         "(an EPK file, or a .zip like the ones the client imports)")
     ap.add_argument("--output", "-o", help="output file (default: <input>.optimized)")
     ap.add_argument("--user", help="gate username (sealed clients)")
     ap.add_argument("--pass", dest="password", help="gate password (sealed clients)")
@@ -571,7 +629,7 @@ def main(argv=None) -> int:
     args = ap.parse_args(argv)
 
     if not args.client and not args.pack:
-        ap.error("give a client HTML or --pack <file.epk>")
+        ap.error("give a client HTML or --pack <file.epk|file.zip>")
     env = _env_credentials()
     user = args.user or env.get("VER_CLIENT_USER") or os.environ.get("VER_CLIENT_USER")
     password = args.password or env.get("VER_CLIENT_PASS") or os.environ.get("VER_CLIENT_PASS")
@@ -579,6 +637,30 @@ def main(argv=None) -> int:
 
     if args.pack:
         raw = open(args.pack, "rb").read()
+        if zipfile.is_zipfile(io.BytesIO(raw)):
+            infos, files = zip_infos_and_files(args.pack)
+            new_files, changes, notes = optimize_pack(files, args.frames, args.end_portal)
+            rebuilt = zip_from_infos_and_files(infos, new_files)
+            check_zip(rebuilt, [i.filename for i in infos])
+            report = {"input": args.pack, "format": "zip",
+                      "packs": [{"epk": os.path.basename(args.pack), "records": len(infos),
+                                 "changed": len(changes), "bytes_before": len(raw),
+                                 "bytes_after": len(rebuilt)}],
+                      "changes": changes, "notes": notes}
+            _print_report(report, verbose)
+            if args.report:
+                json.dump(report, open(args.report, "w"), indent=2)
+                print(f"report: {args.report}")
+            if args.dry_run:
+                return 0
+            out = args.output or (args.pack[:-4] + ".optimized.zip"
+                                  if args.pack.lower().endswith(".zip")
+                                  else args.pack + ".optimized.zip")
+            with open(out, "wb") as fh:
+                fh.write(rebuilt)
+            print(f"wrote {out} ({len(raw)} -> {len(rebuilt)} bytes, "
+                  f"{len(infos)} entries, {len(changes)} changed)")
+            return 0
         parsed = epk.read(raw)
         new_files, changes, notes = optimize_pack(epk.files(parsed), args.frames, args.end_portal)
         rebuilt = epk.write(

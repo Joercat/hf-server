@@ -362,9 +362,14 @@ else:
    change, and the module still compiles (the suite runs it and compares the
    returned layer counts for stock and patched).
 2. **The end portal texture** (`entity/end_portal.png`, 256x256 → 32x32): it is
-   what all those passes sample, and the End's sky wallpaper is the same file.
+   what every one of those passes samples (the End's sky wallpaper is the
+   separate `environment/end_sky.png`, which pass 0 of a portal face also uses).
 3. **The animated strips**: every n-th frame is kept with a scaled `frametime`
    (water and lava at 15 fps instead of 60, a quarter of the memory and uploads).
+
+The same two asset rules run on a **resource pack** (`--pack`, an EPK or the
+`.zip` the client imports), because a pack replaces the optimised assets with its
+own - which is why some packs are much worse than others.
 
 A rebuild with `tools/setup-verified-client.sh` runs `tools/optimize_client.py` on
 the result automatically - see "Low-end machines" in `README.md` for the switches
@@ -449,6 +454,10 @@ using eaglercraft!`) become `VANILLA`; no answer at all becomes `UNKNOWN`, never
   other file in the package stays byte for byte, and the rebuilt package still
   round-trips - plus that re-running the optimiser on the committed client
   changes nothing and reproduces the file byte for byte;
+* asserts the same rules on a **resource-pack zip**: the rebuilt archive keeps
+  every entry in order with its CRC, the directory entry and every file it did
+  not change byte for byte, and only the portal texture and the animated strip
+  differ;
 * asserts the end portal pass cap on a fixture module shaped exactly like the
   compiled `getPasses` (found by its threshold chain, one byte per count, only
   ever lowered, idempotent, `0`/impossible caps refused, a module that does not

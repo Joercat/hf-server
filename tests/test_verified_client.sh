@@ -1536,6 +1536,79 @@ check "the rebuilt package still round-trips" \
 check "the optimiser does not need a PNG library from the internet" \
       "$(grep -c 'import PIL\|from PIL' "$ROOT/tools/pnglite.py" "$ROOT/tools/optimize_client.py" | grep -c ':0')" "2"
 
+# The same two rules have to work on a resource pack, because a pack replaces
+# the optimised assets with its own - which is how "some packs give really big
+# input delay" happens.  A pack the client imports is a .zip, so the optimiser
+# takes one and gives a .zip back, byte for byte apart from what it changed.
+python3 - "$FIX" "$ROOT" <<'PYZIP'
+import json, subprocess, sys, zipfile
+sys.path.insert(0, sys.argv[2] + "/tools")
+import pnglite
+
+out, root = sys.argv[1], sys.argv[2]
+
+
+def strip(width, frames, rgb=(10, 20, 30)):
+    img = pnglite.Image(width, width * frames)
+    for f in range(frames):
+        for y in range(width):
+            for x in range(width):
+                o = ((f * width + y) * width + x) * 4
+                img.pixels[o:o + 4] = bytes((rgb[0], rgb[1], rgb[2], 255 if (x + y + f) % 3 else 200))
+    return pnglite.encode(img)
+
+
+base = "assets/minecraft/textures/"
+entries = [
+    ("pack.mcmeta", json.dumps({"pack": {"pack_format": 3, "description": "fixture"}}).encode()),
+    (base + "entity/end_portal.png", pnglite.encode(pnglite.Image(256, 256, bytes((30, 30, 90, 255)) * 65536))),
+    (base + "blocks/water_still.png", strip(16, 32)),
+    (base + "blocks/water_still.png.mcmeta", json.dumps({"animation": {"frametime": 2}}).encode()),
+    (base + "blocks/lava_flow.png", strip(16, 16, (200, 90, 10))),
+    # a hand-written frame list: must be left exactly as it is
+    (base + "blocks/lava_flow.png.mcmeta",
+     json.dumps({"animation": {"frametime": 3, "frames": [0, 1, 2, 3, 2, 1]}}).encode()),
+    ("assets/minecraft/sounds.json", b'{"ping": {"sounds": ["ping"]}}'),
+]
+src = out + "/pack.zip"
+with zipfile.ZipFile(src, "w", zipfile.ZIP_DEFLATED) as zf:
+    for name, data in entries:
+        zf.writestr(name, data)
+    zf.writestr(zipfile.ZipInfo("assets/"), b"")
+
+dst = out + "/pack.opt.zip"
+run = subprocess.run([sys.executable, root + "/tools/optimize_client.py", "--pack", src,
+                      "--output", dst, "--report", out + "/zip-report.json"],
+                     capture_output=True, text=True)
+report = {"rc": run.returncode, "log": run.stdout + run.stderr}
+if run.returncode == 0:
+    with zipfile.ZipFile(src) as a, zipfile.ZipFile(dst) as b:
+        report["names_same"] = a.namelist() == b.namelist()
+        report["crc_ok"] = b.testzip() is None
+        report["dir_kept"] = "assets/" in b.namelist()
+        report["untouched"] = a.read("pack.mcmeta") == b.read("pack.mcmeta") and             a.read("assets/minecraft/sounds.json") == b.read("assets/minecraft/sounds.json")
+        report["lava_same"] = a.read(base + "blocks/lava_flow.png") == b.read(base + "blocks/lava_flow.png") and             a.read(base + "blocks/lava_flow.png.mcmeta") == b.read(base + "blocks/lava_flow.png.mcmeta")
+        portal = pnglite.decode(b.read(base + "entity/end_portal.png"))
+        report["portal"] = [portal.width, portal.height]
+        img = pnglite.decode(b.read(base + "blocks/water_still.png"))
+        report["water_frames"] = img.height // 16
+        report["water_frametime"] = json.loads(b.read(base + "blocks/water_still.png.mcmeta"))["animation"]["frametime"]
+        report["cycle_same"] = report["water_frames"] * report["water_frametime"] == 32 * 2
+        report["changed"] = json.load(open(out + "/zip-report.json"))["packs"][0]["changed"]
+json.dump(report, open(out + "/zip-check.json", "w"), indent=1)
+PYZIP
+FIXZ="$FIX/zip-check.json"
+fixz() { python3 -c "import json,sys;d=json.load(open(sys.argv[1]));print(d[sys.argv[2]])" "$FIXZ" "$1"; }
+check "the optimiser also takes a resource-pack .zip" "$(fixz rc)" "0"
+check "…gives back the same entries in the same order" "$(fixz names_same)" "True"
+check "…with every CRC intact and the directory entry kept" "$(fixz crc_ok)/$(fixz dir_kept)" "True/True"
+check "…shrinks the pack's end portal texture to 32x32" "$(fixz portal | tr -d "[]' ")" "32,32"
+check "…reduces its 32-frame animation to 8 with the same speed" \
+      "$(fixz water_frames)/$(fixz cycle_same)" "8/True"
+check "…leaves a hand-written frame list alone" "$(fixz lava_same)" "True"
+check "…and leaves everything it did not touch byte for byte" "$(fixz untouched)" "True"
+check "…reporting the 2 files it changed (portal + animation)" "$(fixz changed)" "2"
+
 # the committed client must already be in that shape: optimising it again has
 # to change nothing (and reproduce the file byte for byte)
 if [ -n "${VER_CLIENT_USER:-}" ] && [ -n "${VER_CLIENT_PASS:-}" ]; then
@@ -1746,7 +1819,7 @@ check "…which runs a command" "$("${BG_PRIORITY[@]}" true >/dev/null 2>&1; ech
 check "…and each sync prints how long it took (an OK and a FAIL line per loop)" \
       "$(grep -c '(took \${TOOK}s)' "$ROOT/start.sh")" "4"
 check "…with the timing taken from the real work" \
-      "$(grep -c 'STARTED=\$(date +%s)' "$ROOT/start.sh")" "2"
+      "$(grep -c 'STARTED=\$(date +%s)$' "$ROOT/start.sh")" "2"
 
 echo
 echo "passed: $PASS  failed: $FAIL"

@@ -39,7 +39,7 @@ A Hugging Face Space that runs:
 | `tools/setup-verified-client.sh` | one command to build/rotate it, re-bake the pair into `start.sh` and print the secrets |
 | `tools/patch_verified_client.py` | patches / inspects / seals the client brand |
 | `tools/verify_gated_client.mjs` | runs the real login gate + loader headless: proves the file only boots after the login |
-| `tools/optimize_client.py` | cuts what costs frames on weak machines (end portal render passes, end portal texture, animation frames) and re-seals the client |
+| `tools/optimize_client.py` | cuts what costs frames on weak machines (end portal render passes, end portal texture, animation frames) and re-seals the client; also takes a resource pack (`--pack pack.zip`) |
 | `tools/epk.py` / `tools/pnglite.py` | the EPK package and PNG readers/writers that optimiser needs (no external libraries) |
 | `tools/run_epw_loader.mjs` | boots the client's own EPW loader to prove the file loads |
 | `tools/forward_ip_probe.py` | asks the proxy whether it sends a forwarded-IP header (embedded in `start.sh`) |
@@ -294,8 +294,8 @@ also checks the hidden-IP logging, the enforcement (kicks), the `/login` logging
 against a fake Bungee console, the IP report, the forwarded-IP discovery (with a
 fake proxy that refuses headers), the proxy-peer
 evidence (against a fixture of the kernel's own tables), the low-end-device rules
-(end portal passes + texture + animation frames, with the untouched files
-compared byte for byte), the auth-filter patch (its rule table, a fixture jar it
+(end portal passes + texture + animation frames, on the client's own packages and
+on a resource-pack zip, with the untouched files compared byte for byte), the auth-filter patch (its rule table, a fixture jar it
 patches and a real JVM loads, the `javap` rollback and the switch), the masking
 of the bucket's console copies, the per-account addresses, that the JVM heap
 sizing can never hand the JVM an `-Xms` above its `-Xmx` (checked against five
@@ -306,9 +306,9 @@ environment it additionally **runs the real login gate and boots the client's
 own EPW loader** in Node, i.e. it proves the file you hand out works:
 
 ```bash
-bash tests/test_verified_client.sh              # 320 checks
+bash tests/test_verified_client.sh              # 328 checks
 VER_CLIENT_USER=<user> VER_CLIENT_PASS=<password> \
-    bash tests/test_verified_client.sh          # 342 checks (adds the real client)
+    bash tests/test_verified_client.sh          # 350 checks (adds the real client)
 
 # same, but print the logs it produced, so you can see the formats:
 PRINT_LOGS=1 bash tests/test_verified_client.sh
@@ -562,12 +562,13 @@ edit can only ever make the client lighter). The portal keeps its layered
 starfield, with half the layers; `--portal-passes` tunes it (`3` = fastest,
 `0` = leave the stock numbers, `PORTAL_PASSES` for the rebuild script).
 
-**2. The end portal / End sky texture** (`entity/end_portal.png`) shipped as
-256x256 (256 KiB) and is sampled by every one of those passes (the End's sky
-wallpaper uses the same file), so the passes were both call-heavy *and* cache
-unfriendly. It is a soft noise field, so it is now **32x32**: 1/64th of the
-memory, and the passes sample from L1 instead of thrashing. The look in motion is
-unchanged.
+**2. The end portal texture** (`entity/end_portal.png`) shipped as 256x256
+(256 KiB) and is sampled by every one of those passes — pass 0 of a portal face
+and the End's sky wallpaper use the separate `environment/end_sky.png` — so the
+passes were both call-heavy *and* cache unfriendly. It is a soft noise field, so
+it is now **32x32**: 1/64th of the memory, sampled from L1 instead of thrashing
+the cache. This is the part that is GPU-side, which is why on its own it did not
+make a CPU-bound device faster; the look in motion is unchanged.
 
 **3. Animated texture strips.** Water, lava, fire, the nether portal, sea lantern
 and command blocks shipped as 32/20/16-frame strips (16x16 each). Every frame is
@@ -595,7 +596,8 @@ python3 tools/optimize_client.py client/1.12.html --portal-passes 0
 # leave the end portal texture alone
 python3 tools/optimize_client.py client/1.12.html --end-portal 0
 
-# a resource pack instead: same two rules, pack stays a pack
+# a resource pack instead: same rules, EPK or the .zip the client imports
+python3 tools/optimize_client.py --pack mypack.zip -o mypack.optimized.zip
 python3 tools/optimize_client.py --pack mypack.epk -o mypack.optimized.epk
 ```
 
@@ -617,11 +619,12 @@ compressed; and the gameplay settings (`render distance`, `fancy/fast graphics`,
 and are one click away in the client's own *Options* screen — those still matter
 more than anything in the file. Two things worth knowing on a 4 GB machine:
 
-* a **custom texture pack** is the biggest remaining lever after that, because
-  the client decodes, decompresses and re-uploads every texture of a pack when it
-  loads it — including its own animated strips, which replace the optimised ones.
-  Run the tool on the pack itself (`--pack`) before handing it out, and prefer
-  packs whose `entity/end_portal.png` is not huge;
+* a **custom texture pack** is the biggest remaining lever after that, because a
+  pack replaces the optimised assets with its own — its animated strips are
+  uploaded on their own timers and its `entity/end_portal.png` is what the portal
+  passes sample. The same rules run on a pack: `--pack` takes the `.zip` the
+  client imports (or an EPK) and gives the same container back, so
+  `python3 tools/optimize_client.py --pack mypack.zip` is what to hand out;
 * if the game still hitches with a pack loaded, it is the pack load, not the
   server: the pack is decoded on the machine, once per load.
 
