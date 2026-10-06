@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+
+# client/1.12.html IS committed: it is the client you hand out, and it does not
+# give the brand away. The brand is sealed inside its payload (readable only
+# after the login) and the file itself carries nothing but a PBKDF2 verifier of
+# it; start.sh keeps the same pair in the same spirit (see the XOR'd blob in it).
+# The plain text pair stays out of the repository:
+#   .verified-client.env    the brand + UUID, also copied into the Space secrets
+.verified-client.env
+
+# local scratch
+server-logs/
