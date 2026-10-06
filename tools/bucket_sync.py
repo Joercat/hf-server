@@ -132,12 +132,19 @@ def cmd_sync(args):
     if not root.is_dir():
         fail(f"{root} is not a directory")
 
-    local = {rel: size for rel, _path, size in iter_local(root)}
     remote = list_remote(api, args.bucket_id, args.prefix)
 
-    add = [(str(path), join(args.prefix, rel), size)
-           for rel, path, size in iter_local(root)
-           if remote.get(rel) != size]
+    # Walk/stat the staged tree once. The previous two-pass implementation
+    # repeated os.walk + stat over every world file on every Python fallback
+    # sync, even though the staging tree is immutable for the duration of the
+    # upload. Keep only the local names needed by --delete and the changed-file
+    # upload list; this reduces work and avoids comparing two different walks.
+    local = set()
+    add = []
+    for rel, path, size in iter_local(root):
+        local.add(rel)
+        if remote.get(rel) != size:
+            add.append((str(path), join(args.prefix, rel), size))
     delete = [join(args.prefix, rel) for rel in remote
               if args.delete and rel not in local]
 

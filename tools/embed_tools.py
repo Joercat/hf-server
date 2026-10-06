@@ -19,6 +19,9 @@ START = ROOT / "start.sh"
 TOOLS = [
     {"name": "bucket_sync.py", "var": "BUCKET_SYNC_PY", "marker": "BUCKET_SYNC_PY_EOF",
      "write": "write_bucket_sync_py", "ensure": "ensure_bucket_sync_py"},
+    {"name": "log_migrate.py", "var": "LOG_MIGRATOR_PY", "marker": "LOG_MIGRATOR_PY_EOF",
+     "write": "write_log_migrator_py", "ensure": "ensure_log_migrator_py",
+     "anchor": "# <<< embedded bucket_sync.py <<<"},
     {"name": "forward_ip_probe.py", "var": "FORWARD_IP_PROBE_PY", "marker": "FORWARD_IP_PROBE_EOF",
      "write": "write_forward_ip_probe_py", "ensure": "ensure_forward_ip_probe_py"},
     {"name": "proxy_peers.py", "var": "PROXY_PEERS_PY", "marker": "PROXY_PEERS_EOF",

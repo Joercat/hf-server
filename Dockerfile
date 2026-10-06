@@ -1,6 +1,7 @@
 FROM debian:12-slim
 ENV DEBIAN_FRONTEND=noninteractive
 ENV LANG=C.UTF-8
+ENV TZ=America/New_York
 
 RUN mkdir -p /usr/share/binfmts && \
     apt-get update && \
@@ -14,6 +15,8 @@ RUN mkdir -p /usr/share/binfmts && \
         python3-pip \
         python3-setuptools \
         python3-wheel \
+        tzdata \
+        util-linux \
         ca-certificates && \
     dpkg --configure -a || true && \
     rm -rf /var/lib/apt/lists/* && \

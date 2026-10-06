@@ -6,8 +6,8 @@
 #      expects (so client and server can never drift apart silently)
 #   2. the log-parsing / detection helpers in start.sh classify console answers
 #      from EaglerXBungee correctly (VERIFIED / UNVERIFIED / VANILLA)
-#   3. the verified client is hidden in the logs (ip=hidden, no client=... tag)
-#      while everyone else is logged with their IP
+#   3. the verified client's IP/brand/UUID are hidden while the explicit
+#      VERIFIED CLIENT marker is retained; everyone else's resolved IP is logged
 #   4. verified-only enforcement: everyone else is kicked (vanilla too), the
 #      verified client and bypassed players are not, and an unresolved check
 #      never kicks
@@ -19,6 +19,7 @@
 set -u
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
+export TZ=America/New_York LC_ALL=C
 PASS=0
 FAIL=0
 ok()   { PASS=$((PASS+1)); echo "  ok   - $1"; }
@@ -130,12 +131,21 @@ trap 'rm -rf "$WORK"; kill ${MOCK_PID:-0} 2>/dev/null' EXIT
 BLOG="$WORK/bungee.log"
 FIFO="$WORK/console.pipe"
 PIDFILE="$WORK/bungee.pid"
+export ACTIVITY_LOG="$WORK/activity.log"
 export CLIENT_LOG="$WORK/client-checks.log"
 export LOGIN_LOG="$WORK/logins.log"
 export CMD_LOG="$WORK/commands.log"
-export SHARED_REPORT="$WORK/shared-ips.txt"
+export ADDRESS_REPORT="$WORK/security/addresses.txt"
+export STATUS_FILE="$WORK/security/status.txt"
+export PRIVATE_ADDRESS_REPORT="$WORK/private/addresses.txt"
 export AUTH_LOG="$WORK/auth.log"
-export IP_MAP_FILE="$WORK/player-ips.log"
+export IP_MAP_FILE="$WORK/addresses.log"
+export VERIFIED_PLAYER_STATE="$WORK/verified-players.txt"
+export REPORT_STATE="$WORK/report-last-update"
+export REPORT_INTERVAL=0
+export BUCKET_SYNC_LOCK="$WORK/bucket-sync.lock"
+export LOG_MIGRATOR_PY="$WORK/log_migrate.py"
+export BG_PRIORITY=()
 export IP_MAP="$WORK/client-ips.txt"
 export VERDICT_CACHE="$WORK/client-verdicts.txt"
 export PENDING_AUTH="$WORK/pending-auth.tsv"
@@ -169,21 +179,21 @@ export BUCKET_METHOD="auto"
 export BUCKET_SYNC_PY="$WORK/bucket_sync.py"
 export BUCKET_VIA=""
 export BUCKET_ERROR=""
-export LOGIN_CLIENT_FIELD=""   # set by start.sh from HIDE_VERIFIED_IP
+export LOGIN_CLIENT_FIELD=" | client=CHECK PENDING"
 export PROXY_PEERS_PY="$WORK/proxy_peers.py"
 export PROXY_PEERS_STATE="$WORK/proxy-peers.log"
-export PROXY_PEERS_VIEW="$WORK/security/proxy-peers.txt"
 export GAME_PORT=7860
 export FORWARD_IP_RETRY_INTERVAL=600
 export FORWARD_IP_STATE="$WORK/forward-ip.state"
 : > "$VERDICT_CACHE"; : > "$IP_MAP"; : > "$PENDING_AUTH"; : > "$AUTH_SEEN"
-touch "$BLOG" "$CLIENT_LOG" "$LOGIN_LOG" "$CMD_LOG" "$AUTH_LOG" "$IP_MAP_FILE"
+touch "$BLOG" "$ACTIVITY_LOG" "$CLIENT_LOG" "$LOGIN_LOG" "$CMD_LOG" "$AUTH_LOG" "$IP_MAP_FILE"
 : > "$WORK/kicks"
 
 extract() { awk "/^$1\(\) \{/,/^\}/" "$ROOT/start.sh"; }
 FUNCS="$WORK/funcs.sh"
 for f in strip_colours bungee_console bungee_alive query_client_brand check_player_client \
-         is_real_ip record_ip last_ip_for ips_for ip_report_body write_logger_status \
+         is_real_ip record_ip restore_ip_map last_ip_for ips_for ip_report_body write_logger_status \
+         now_eastern format_epoch_eastern append_dated_log remember_verified_player \
          mask_cmd write_auth_masked is_auth_cmd queue_auth auth_seen_recently record_auth_seen \
          flush_pending_auth ip_field hide_ip_for client_field forward_ip_setting \
          set_forward_ip_in_listeners read_forward_ip_state write_forward_ip_state \
@@ -192,7 +202,8 @@ for f in strip_colours bungee_console bungee_alive query_client_brand check_play
          bungee_restart discover_forward_ip_header forward_ip_probe_once \
          write_forward_ip_probe_py ensure_forward_ip_probe_py \
          set_verdict verdict_for verdict_label is_bypassed enforce_client_policy \
-         shared_report_body report_shared_ips hf_push_logs hf_push_saves \
+         report_shared_ips hf_push_logs hf_push_saves write_console_snapshot \
+         bucket_sync_lock bucket_sync_unlock \
          is_online mark_online mark_offline record_login record_logout \
          playerlist_names playerlist_check playerlist_loop \
          bucket_id_of bucket_prefix_of bucket_sync_dir bucket_write_probe bucket_py \
@@ -209,6 +220,41 @@ for f in strip_colours bungee_console bungee_alive query_client_brand check_play
 done | sed "s|/tmp/bungee.log|$BLOG|g" > "$FUNCS"
 # shellcheck disable=SC1090
 source "$FUNCS"
+
+# The timestamp function is explicit about Eastern time, uses a 12-hour clock,
+# and inserts exactly one spaced divider when the local calendar date changes.
+DATE_LOG="$WORK/date-dividers.log"
+EPOCH_A=$(TZ=UTC date -d '2024-01-01 12:00:00' +%s)
+EPOCH_B=$(TZ=UTC date -d '2024-01-01 16:30:00' +%s)
+EPOCH_C=$(TZ=UTC date -d '2024-01-02 12:00:00' +%s)
+append_dated_log "$DATE_LOG" "$EPOCH_A" 'LOGIN | Alice | hidden'
+append_dated_log "$DATE_LOG" "$EPOCH_B" 'COMMAND | Alice | /spawn'
+append_dated_log "$DATE_LOG" "$EPOCH_C" 'LOGOUT | Alice | hidden'
+check "log timestamps use the Eastern 12-hour format" \
+      "$(grep -Fc '2024-01-01 07:00:00 AM EST | LOGIN | Alice | hidden' "$DATE_LOG")" "1"
+check "the day divider appears once for each Eastern date" \
+      "$(grep -c '^==================== ' "$DATE_LOG")" "2"
+python3 - "$DATE_LOG" <<'PYDATE'
+import pathlib, re, sys
+lines = pathlib.Path(sys.argv[1]).read_text().splitlines()
+headers = [i for i, line in enumerate(lines) if line.startswith('==================== ')]
+assert len(headers) == 2
+for i in headers:
+    assert i + 2 < len(lines) and lines[i + 1] == ""
+    assert re.match(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} (AM|PM) (EST|EDT) \| ", lines[i + 2])
+assert headers[1] > 0 and lines[headers[1] - 1] == ""
+assert sum("| COMMAND | Alice | /spawn" in line for line in lines) == 1
+print("ok")
+PYDATE
+check "date dividers and event spacing remain readable" \
+      "$(python3 - "$DATE_LOG" <<'PYDATE'
+import pathlib, sys
+lines = pathlib.Path(sys.argv[1]).read_text().splitlines()
+headers = [i for i, line in enumerate(lines) if line.startswith('==================== ')]
+print("yes" if len(headers) == 2 and all(lines[i+1] == "" for i in headers)
+      and lines[headers[1]-1] == "" else "no")
+PYDATE
+)" "yes"
 
 # capture kicks instead of talking to the server
 mc_command() { printf '%s\n' "$*" >> "$WORK/kicks"; }
@@ -264,37 +310,38 @@ login CreppyBitch 1.2.3.4
 sleep 4.5
 played CreppyBitch "/gamemode 1"
 check "login recorded" "$(grep -c '| LOGIN | CreppyBitch' "$LOGIN_LOG")" "1"
-check "the verified client's IP is hidden" "$(grep -c '| LOGIN | CreppyBitch | hidden$' "$LOGIN_LOG")" "1"
-check "no client=... tag gives the verified client away" "$(grep -c '| LOGIN | CreppyBitch | hidden | client=' "$LOGIN_LOG")" "0"
-check "no VERIFY line for the verified client" "$(grep -c '| VERIFY | CreppyBitch' "$LOGIN_LOG")" "0"
-check "nothing about the verified client says VERIFIED CLIENT" "$(grep -c 'VERIFIED CLIENT' "$LOGIN_LOG")" "0"
-check "client-checks.log keeps the verdict but hides the IP" \
-      "$(grep -c '| VERIFIED | CreppyBitch | hidden |' "$CLIENT_LOG")" "1"
-check "commands are logged, hidden and without a tag" \
-      "$(grep -c '| CreppyBitch | hidden | /gamemode 1$' "$CMD_LOG")" "1"
+check "the verified client's IP is hidden while its check is pending" \
+      "$(grep -c '| LOGIN | CreppyBitch | hidden | client=CHECK PENDING' "$LOGIN_LOG")" "1"
+check "there is no redundant VERIFY row in the login stream" "$(grep -c '| VERIFY | CreppyBitch' "$LOGIN_LOG")" "0"
+check "the client check clearly marks the owner and hides the IP" \
+      "$(grep -c '| CHECK | CreppyBitch | hidden | client=VERIFIED CLIENT' "$CLIENT_LOG")" "1"
+check "the owner brand and UUID are redacted from the synced check" \
+      "$(grep -c 'brand=redacted.*uuid=redacted' "$CLIENT_LOG")" "1"
+check "commands are logged, hidden and marked as verified" \
+      "$(grep -c '| COMMAND | CreppyBitch | hidden | /gamemode 1 | client=VERIFIED CLIENT$' "$CMD_LOG")" "1"
 check "the verified client is NOT kicked" "$(kick_count CreppyBitch)" "0"
-check_at_least "the hidden IP was kept in private-logs/player-ips.log" \
-      "$(grep -c '| CreppyBitch | 1.2.3.4' "$IP_MAP_FILE")" 1
+check_at_least "the hidden IP was kept in private-logs/addresses.log" \
+      "$(grep -c '| IP | CreppyBitch | 1.2.3.4' "$IP_MAP_FILE")" 1
 
 # a stock Eaglercraft client: visible + kicked
 stock_answer
 login RandomGuy 5.6.7.8
 sleep 4.5
 played RandomGuy "/gamemode 1"
-check "the stranger's login line is hidden too, the VERIFY line carries the IP" \
-      "$(grep -c '5.6.7.8' "$LOGIN_LOG")" "1"
-check "the stranger gets a VERIFY line with the real IP" \
-      "$(grep -c '| VERIFY | RandomGuy | 5.6.7.8 | OTHER EAGLERCRAFT CLIENT |' "$LOGIN_LOG")" "1"
+check "the stranger's login row stays hidden while CHECK carries the real IP" \
+      "$(grep -Fc '| LOGIN | RandomGuy | hidden' "$LOGIN_LOG")" "1"
+check "the stranger gets a client-check row with the real IP" \
+      "$(grep -c '| CHECK | RandomGuy | 5.6.7.8 | client=OTHER EAGLERCRAFT CLIENT |' "$CLIENT_LOG")" "1"
 check "the stranger's commands are tagged" \
-      "$(grep -c '| RandomGuy | 5.6.7.8 | /gamemode 1 | client=OTHER EAGLERCRAFT CLIENT$' "$CMD_LOG")" "1"
+      "$(grep -c '| COMMAND | RandomGuy | 5.6.7.8 | /gamemode 1 | client=OTHER EAGLERCRAFT CLIENT$' "$CMD_LOG")" "1"
 check "the stranger is kicked" "$(kick_count RandomGuy)" "1"
 
 # a Java client
 vanilla_answer
 login Notch 9.9.9.9
 sleep 4.5
-check "the Java client gets a VERIFY line" \
-      "$(grep -c '| VERIFY | Notch | 9.9.9.9 | JAVA CLIENT |' "$LOGIN_LOG")" "1"
+check "the Java client gets a client-check row" \
+      "$(grep -c '| CHECK | Notch | 9.9.9.9 | client=JAVA CLIENT |' "$CLIENT_LOG")" "1"
 check "the Java client is kicked (ENFORCE_KICK_VANILLA=true)" "$(kick_count Notch)" "1"
 
 # a check that never resolves: logged, but not kicked
@@ -302,7 +349,7 @@ rm -f "$PIDFILE"
 login Ghost 6.6.6.6
 sleep 4.5
 check "unresolved check is logged as UNKNOWN" \
-      "$(grep -c '| VERIFY | Ghost | hidden | UNKNOWN CLIENT |' "$LOGIN_LOG")" "1"
+      "$(grep -c '| CHECK | Ghost | hidden | client=UNKNOWN CLIENT |' "$CLIENT_LOG")" "1"
 check "unresolved check does not kick" "$(kick_count Ghost)" "0"
 echo $MOCK_PID > "$PIDFILE"
 
@@ -312,14 +359,14 @@ brand_answer "Eaglercraft[VER]" "51b2ebf3-ddab-35e7-8646-94f7bcbfd7ff"
 login OldV1 8.8.8.1
 sleep 4.5
 check "the revoked V1 client is not verified" \
-      "$(grep -c '| VERIFY | OldV1 | 8.8.8.1 | OTHER EAGLERCRAFT CLIENT | brand=Eaglercraft\[VER\] |' "$LOGIN_LOG")" "1"
+      "$(grep -c '| CHECK | OldV1 | 8.8.8.1 | client=OTHER EAGLERCRAFT CLIENT | brand=Eaglercraft\[VER\] |' "$CLIENT_LOG")" "1"
 brand_answer "EaglercraftX[V2]" "355d0b9f-14ce-359f-8c9f-97cc1a7c92ca"
 login OldV2 8.8.8.2
 sleep 4.5
 check "the revoked V2 client is not verified either" \
-      "$(grep -c '| VERIFY | OldV2 | 8.8.8.2 | OTHER EAGLERCRAFT CLIENT | brand=EaglercraftX\[V2\] |' "$LOGIN_LOG")" "1"
+      "$(grep -c '| CHECK | OldV2 | 8.8.8.2 | client=OTHER EAGLERCRAFT CLIENT | brand=EaglercraftX\[V2\] |' "$CLIENT_LOG")" "1"
 check "…and nothing in the logs calls either of them the verified client" \
-      "$(grep -c 'VERIFIED CLIENT' "$LOGIN_LOG")" "0"
+      "$(grep -c 'VERIFIED CLIENT' "$CLIENT_LOG")" "1"
 
 # policy units
 before=$(wc -l < "$WORK/kicks")
@@ -336,12 +383,12 @@ check "the kick message is the configured one" "$(tail -1 "$WORK/kicks")" \
 # hiding turned off puts everything back
 check "HIDE_VERIFIED_IP=false shows the IP again" \
       "$( HIDE_VERIFIED_IP=false; ip_field CreppyBitch 1.2.3.4 VERIFIED )" "1.2.3.4"
-check "HIDE_VERIFIED_IP=false brings the client= tag back" \
+check "the verified-client marker remains present when IP hiding is disabled" \
       "$( HIDE_VERIFIED_IP=false; client_field VERIFIED )" " | client=VERIFIED CLIENT"
 check "client= tags for others are unaffected by the hiding" \
       "$( client_field UNVERIFIED )" " | client=OTHER EAGLERCRAFT CLIENT"
-check "an unresolved verdict gets no tag either (nothing points at the owner)" \
-      "$( client_field UNKNOWN )" ""
+check "an unresolved verdict is labeled without revealing the IP" \
+      "$( client_field UNKNOWN )" " | client=UNKNOWN CLIENT"
 
 # --------------------------------------------------------------------------- #
 echo "== 4. full /login logging except for the verified client =="
@@ -355,16 +402,16 @@ played CreppyBitch "/login ownersecret"
 sleep 0.3
 check "the verified client's /login is not logged in full" "$(grep -c 'ownersecret' "$AUTH_LOG")" "0"
 check "the verified client's /login is not queued" "$(wc -l < "$PENDING_AUTH")" "0"
-check "the verified client's /login is masked in commands.log" \
-      "$(grep -c '| CreppyBitch | hidden | /login \*\*\*\*\*\*\*\*$' "$CMD_LOG")" "1"
+check "the verified client's /login is masked and marked in activity.log" \
+      "$(grep -Fc '| COMMAND | CreppyBitch | hidden | /login ******** | client=VERIFIED CLIENT' "$CMD_LOG")" "1"
 
 # a stranger whose verdict is already known: logged immediately, in full
 played RandomGuy "/login strangerpass"
 sleep 0.3
 check "the stranger's /login is kept in full in private-logs/auth.log" \
       "$(grep -c '| RandomGuy | 5.6.7.8 | /login strangerpass | client=OTHER EAGLERCRAFT CLIENT$' "$AUTH_LOG")" "1"
-check "the stranger's /login is masked in commands.log" \
-      "$(grep -c '/login \*\*\*\*\*\*\*\*' "$CMD_LOG")" "2"
+check "the stranger's /login is masked in activity.log" \
+      "$(grep -Fc '/login ********' "$CMD_LOG")" "2"
 
 # a stranger still PENDING: queued, then written when the verdict arrives
 stock_answer
@@ -441,13 +488,13 @@ check "without a configured pair the boot log says so" \
 record_ip Somebody 9.9.9.9 paper
 mask_cmd Somebody "/login hunter2" UNKNOWN > /dev/null
 check "unconfigured: the password is not written in clear" "$(grep -c 'hunter2' "$AUTH_LOG")" "0"
-check "…but the command is still recorded (masked)" "$(grep -c '| /login \*\*\*\*\*\*\*\* |' "$AUTH_LOG")" "1"
+check "…but the command is still recorded (masked)" "$(grep -Fc '| /login ******** |' "$AUTH_LOG")" "1"
 check "…and marked as unconfigured" "$(grep -c 'client=UNCONFIGURED' "$AUTH_LOG")" "1"
 printf '%s\t%s\t%s\n' "$(date +%s)" QueuedGuy "/login queuedpw" >> "$PENDING_AUTH"
 set_verdict QueuedGuy UNVERIFIED
 flush_pending_auth
 check "…and a command queued earlier is masked too" \
-      "$(grep -c '| QueuedGuy | .* | /login \*\*\*\*\*\*\*\* | client=UNCONFIGURED' "$AUTH_LOG")" "1"
+      "$(grep -Fc '| QueuedGuy | ' "$AUTH_LOG")" "1"
 check "…still without the password" "$(grep -c 'queuedpw' "$AUTH_LOG")" "0"
 
 # back to the normal test configuration
@@ -461,15 +508,16 @@ export PUBLISHED_CLIENT_BRANDS
 ENFORCE_VERIFIED_CLIENT=true
 : > "$WORK/kicks"
 
-echo "== 5. reports =="
+echo "== 5. address reports =="
 report_shared_ips
-check "the synced shared-IP report hides the verified client's IP" \
-      "$(grep -c '1\.2\.3\.4' "$SHARED_REPORT")" "0"
-check "the report counts the verdicts" "$(grep -c 'UNVERIFIED: ' "$SHARED_REPORT")" "1"
-check_at_least "private-logs/shared-ips-private.txt has the real IPs" \
-      "$(grep -c '1\.2\.3\.4' "$PRIV_DIR/shared-ips-private.txt")" 1
-check "private-logs/logins-real-ips.log has no 'hidden' left" \
-      "$(grep -c 'hidden' "$PRIV_DIR/logins-real-ips.log")" "0"
+check "the public address report hides the verified client's IP" \
+      "$(grep -Fc '1.2.3.4' "$ADDRESS_REPORT")" "0"
+check "the private address report keeps the verified client's IP" \
+      "$(grep -Fxc $'CreppyBitch\t1.2.3.4\tpaper (seen 1 time(s))' "$PRIVATE_ADDRESS_REPORT")" "1"
+check "the public report is clearly titled and timestamped in Eastern time" \
+      "$(grep -c 'IP ADDRESS REPORT' "$ADDRESS_REPORT")$(grep -c 'Updated: .* EDT' "$ADDRESS_REPORT")" "11"
+check "the redundant public report variables are gone" \
+      "$(grep -Ec '^SHARED_REPORT=|^VERIFICATION_REPORT=' "$ROOT/start.sh")" "0"
 
 for pair in "VERIFIED:VERIFIED CLIENT" "UNVERIFIED:OTHER EAGLERCRAFT CLIENT" \
             "VANILLA:JAVA CLIENT" "PENDING:CHECK PENDING" "GARBAGE:UNKNOWN CLIENT"; do
@@ -485,55 +533,69 @@ export HF_BUCKET_HANDLE="hf://buckets/test/1.12"
 export FULL_STAGING="$WORK/stage-full"
 export LOG_STAGING="$WORK/stage-logs"
 export SAVE_DIRS="security-logs private-logs"
+export ACTIVITY_LOG="$SEC_DIR/activity.log"
+export LOGIN_LOG="$ACTIVITY_LOG" CMD_LOG="$ACTIVITY_LOG" CLIENT_LOG="$ACTIVITY_LOG"
+export AUTH_LOG="$PRIV_DIR/auth.log"
+export IP_MAP_FILE="$PRIV_DIR/addresses.log"
+export ADDRESS_REPORT="$SEC_DIR/addresses.txt" STATUS_FILE="$SEC_DIR/status.txt"
+export PRIVATE_ADDRESS_REPORT="$PRIV_DIR/addresses.txt"
+export VERIFIED_PLAYER_STATE="$PRIV_DIR/verified-players.txt"
+export PROXY_PEERS_STATE="$PRIV_DIR/proxy-peers.log"
+export REPORT_STATE="$WORK/report-last-update" REPORT_INTERVAL=0
+export BUCKET_SYNC_LOCK="$WORK/bucket-sync.lock"
 mkdir -p "$SEC_DIR" "$PRIV_DIR"
-touch "$SEC_DIR/logins.log" "$SEC_DIR/commands.log" "$SEC_DIR/client-checks.log" \
-      "$SEC_DIR/shared-ips.txt" "$PRIV_DIR/auth.log" "$PRIV_DIR/player-ips.log"
+touch "$ACTIVITY_LOG" "$AUTH_LOG" "$IP_MAP_FILE" "$VERIFIED_PLAYER_STATE" "$PROXY_PEERS_STATE"
+check "LOGIN, COMMAND and CHECK handlers share one physical activity log" \
+      "$( [ "$LOGIN_LOG" = "$ACTIVITY_LOG" ] && [ "$CMD_LOG" = "$ACTIVITY_LOG" ] && [ "$CLIENT_LOG" = "$ACTIVITY_LOG" ] && echo yes )" "yes"
 HF_CALLS="$WORK/hf-calls.txt"; HF_STAGED="$WORK/hf-staged.txt"
 : > "$HF_CALLS"; : > "$HF_STAGED"
-hf() {   # fake the HF CLI: record the call and the staged files
+hf() {   # fake the HF CLI: record each scoped upload and staged file list
     printf 'hf %s\n' "$*" >> "$HF_CALLS"
     [ -d "${3:-}" ] && find "$3" -type f -printf '%P\n' | sort >> "$HF_STAGED"
+    if [ -f "${3:-}/console.log" ]; then cp "$3/console.log" "$WORK/staged-console.log"; fi
     return 0
 }
 
-log_sync_cmd() { grep -m1 'buckets sync' "$HF_CALLS"; }
-
 : > "$HF_CALLS"; : > "$HF_STAGED"
 SYNC_PRIVATE_LOGS=true hf_push_logs
-check "the log sync pushes to the bucket" \
-      "$(grep -c "hf buckets sync $LOG_STAGING $HF_BUCKET_HANDLE/game-data" "$HF_CALLS")" "1"
-check "the log sync never uses --delete" "$(grep -c -- '--delete' "$HF_CALLS")" "0"
-check "security-logs are staged" "$(grep -c '^security-logs/logins.log$' "$HF_STAGED")" "1"
-check "commands.log is staged" "$(grep -c '^security-logs/commands.log$' "$HF_STAGED")" "1"
-check "client-checks.log is staged" "$(grep -c '^security-logs/client-checks.log$' "$HF_STAGED")" "1"
-check "shared-ips.txt is staged" "$(grep -c '^security-logs/shared-ips.txt$' "$HF_STAGED")" "1"
-check "auth.log (full /login) is staged" "$(grep -c '^private-logs/auth.log$' "$HF_STAGED")" "1"
-check "player-ips.log (the hidden IPs) is staged" "$(grep -c '^private-logs/player-ips.log$' "$HF_STAGED")" "1"
+check "log sync uploads the security prefix, not the whole world" \
+      "$(grep -c "hf buckets sync $LOG_STAGING/security-logs $HF_BUCKET_HANDLE/game-data/security-logs --delete" "$HF_CALLS")" "1"
+check "log sync serializes three small, deletable prefixes" "$(grep -c 'hf buckets sync' "$HF_CALLS")$(grep -c -- '--delete' "$HF_CALLS")" "33"
+check "the single activity log is staged" "$(grep -c '^activity.log$' "$HF_STAGED")" "1"
+check "public and private address summaries plus one status snapshot are staged" \
+      "$(grep -c '^addresses.txt$' "$HF_STAGED")$(grep -c '^status.txt$' "$HF_STAGED")" "21"
+check "security-logs contains only its three curated files" \
+      "$(find "$SEC_DIR" -maxdepth 1 -type f -printf '%f\n' | sort | tr '\n' ' ')" "activity.log addresses.txt status.txt "
+check "the full /login file is staged privately" "$(grep -c '^auth.log$' "$HF_STAGED")" "1"
+check "the full private address history is staged" "$(grep -c '^addresses.log$' "$HF_STAGED")" "1"
 check "the log staging dir is cleaned up" "$([ -d "$LOG_STAGING" ] && echo yes || echo no)" "no"
 
 : > "$HF_CALLS"; : > "$HF_STAGED"
 SYNC_PRIVATE_LOGS=false hf_push_logs
-check "SYNC_PRIVATE_LOGS=false keeps auth.log out of the bucket" \
-      "$(grep -c '^private-logs/' "$HF_STAGED")" "0"
-check "…and still uploads the sanitised logs" "$(grep -c '^security-logs/logins.log$' "$HF_STAGED")" "1"
+check "SYNC_PRIVATE_LOGS=false clears the private bucket prefix" \
+      "$(grep -c "hf buckets sync $LOG_STAGING/private-logs $HF_BUCKET_HANDLE/game-data/private-logs --delete" "$HF_CALLS")" "1"
+check "…and uploads no private files" "$(grep -c 'auth.log\\|addresses.log' "$HF_STAGED")" "0"
+check "…while the sanitized activity log is still uploaded" "$(grep -c '^activity.log$' "$HF_STAGED")" "1"
 
-# raw console tails, so a boot failure is readable without Space access
+# One masked console snapshot replaces separate Paper and Bungee files.
 export CONSOLE_LOG_LINES=1000
 printf 'line1\n%s\n' "$(seq 1 5 | tr '\n' ' ')" > /tmp/paper.log
-printf 'bungee line\n' > /tmp/bungee.log
+printf 'bungee line\n' > "$BLOG"
 : > "$HF_STAGED"
 SYNC_CONSOLE_LOGS=true SYNC_PRIVATE_LOGS=true hf_push_logs
-check "paper.log tail is uploaded" "$(grep -c '^logs/paper.log$' "$HF_STAGED")" "1"
-check "bungee.log tail is uploaded" "$(grep -c '^logs/bungee.log$' "$HF_STAGED")" "1"
+check "one combined console.log snapshot is uploaded" "$(grep -c '^console.log$' "$HF_STAGED")" "1"
+check "the combined snapshot contains both labeled console sources" \
+      "$(grep -Fc '[PAPER]' "$WORK/staged-console.log")$(grep -Fc '[BUNGEE]' "$WORK/staged-console.log")" "21"
 : > "$HF_STAGED"
 SYNC_CONSOLE_LOGS=false SYNC_PRIVATE_LOGS=true hf_push_logs
-check "SYNC_CONSOLE_LOGS=false skips the console tails" "$(grep -c '^logs/' "$HF_STAGED")" "0"
+check "SYNC_CONSOLE_LOGS=false uploads no console snapshot" "$(grep -c '^console.log$' "$HF_STAGED")" "0"
 
 : > "$HF_CALLS"; : > "$HF_STAGED"
-hf_push_saves
+SYNC_CONSOLE_LOGS=true hf_push_saves
 check "the full game-data sync still mirrors with --delete" "$(grep -c -- '--delete' "$HF_CALLS")" "1"
-check "the full sync includes security-logs" "$(grep -c '^security-logs/logins.log$' "$HF_STAGED")" "1"
-check "the full sync includes private-logs" "$(grep -c '^private-logs/auth.log$' "$HF_STAGED")" "1"
+check "the full sync preserves the curated activity log" "$(grep -c '^security-logs/activity.log$' "$HF_STAGED")" "1"
+check "the full sync preserves private auth logs" "$(grep -c '^private-logs/auth.log$' "$HF_STAGED")" "1"
+check "the full mirror includes a console snapshot, not separate tails" "$(grep -c '^logs/console.log$' "$HF_STAGED")" "1"
 check "the full staging dir is cleaned up" "$([ -d "$FULL_STAGING" ] && echo yes || echo no)" "no"
 
 # the real SAVE_DIRS from start.sh must contain private-logs (and follow the switch)
@@ -553,11 +615,79 @@ check "start.sh has a dedicated fast log sync loop" \
       "$(grep -c '^log_sync_loop &\?$' "$ROOT/start.sh")" "1"
 check "the log sync interval defaults to 60s" \
       "$(grep -c '^LOG_SYNC_INTERVAL="\${LOG_SYNC_INTERVAL:-60}"$' "$ROOT/start.sh")" "1"
+check "the full world snapshot defaults to 600s" \
+      "$(grep -c '^SYNC_INTERVAL="\${SYNC_INTERVAL:-600}"$' "$ROOT/start.sh")" "1"
+check "the player-list polling default is 60s" \
+      "$(grep -c '^PLAYERLIST_POLL="\${PLAYERLIST_POLL:-60}"$' "$ROOT/start.sh")" "1"
 check "the shutdown pushes the last log lines" \
       "$(grep -c 'hf_push_logs     # make sure the last log lines reached the bucket' "$ROOT/start.sh")" "1"
 
+# A one-time fixture for legacy files verifies conversion, privacy and
+# idempotence before the compact layout is deployed to the bucket.
+echo "== 6b. legacy logs migrate once without leaking the verified client =="
+MIG_SEC="$WORK/migration/security-logs"; MIG_PRIV="$WORK/migration/private-logs"
+mkdir -p "$MIG_SEC" "$MIG_PRIV"
+cat > "$MIG_SEC/logins.log" <<'LEGACY_LOGIN'
+2024-01-01 12:00:00 | LOGIN | Owner | hidden | client=CHECK PENDING
+2024-01-01 12:02:00 | VERIFY | Owner | VERIFIED | brand=SecretBrand | uuid=SecretUUID
+2024-01-01 12:03:00 | LOGIN | Stranger | 5.6.7.8 | client=OTHER EAGLERCRAFT CLIENT
+LEGACY_LOGIN
+cat > "$MIG_SEC/commands.log" <<'LEGACY_COMMAND'
+2024-01-01 12:04:00 | Owner | hidden | /spawn | client=VERIFIED CLIENT
+LEGACY_COMMAND
+cat > "$MIG_SEC/client-checks.log" <<'LEGACY_CHECK'
+2024-01-01 12:02:00 | VERIFIED | Owner | 1.2.3.4 | brand=SecretBrand | version=1.12 | uuid=SecretUUID
+LEGACY_CHECK
+cat > "$MIG_PRIV/auth.log" <<'LEGACY_AUTH'
+2024-01-01 12:05:00 | Owner | 1.2.3.4 | /login ownersecret | client=VERIFIED CLIENT
+2024-01-01 12:06:00 | Stranger | 5.6.7.8 | /login othersecret | client=OTHER EAGLERCRAFT CLIENT
+LEGACY_AUTH
+cat > "$MIG_PRIV/player-ips.log" <<'LEGACY_IPS'
+2024-01-01 12:00:01 | Owner | 1.2.3.4 | paper
+2024-01-01 12:03:01 | Stranger | 5.6.7.8 | paper
+LEGACY_IPS
+cat > "$MIG_PRIV/logins-real-ips.log" <<'LEGACY_REAL_IPS'
+2024-01-01 12:00:01 | LOGIN | Owner | 1.2.3.4 | source=paper
+LEGACY_REAL_IPS
+for old in "$MIG_SEC/shared-ips.txt" "$MIG_SEC/ip-report.log" \
+           "$MIG_SEC/logger-status.log" "$MIG_SEC/proxy-peers.txt" \
+           "$MIG_PRIV/ip-report-private.log" "$MIG_PRIV/shared-ips-private.txt"; do
+    : > "$old"
+done
+MIGRATION_RESULT=$(python3 "$ROOT/tools/log_migrate.py" "$MIG_SEC" "$MIG_PRIV")
+check "legacy events and unique IP sightings are migrated" \
+      "$(printf '%s' "$MIGRATION_RESULT" | grep -o 'activity_rows=[0-9]* address_rows=[0-9]*')" "activity_rows=4 address_rows=2"
+check "old UTC wall time becomes 07:00 AM Eastern in winter" \
+      "$(grep -Fc '2024-01-01 07:00:00 AM EST | LOGIN | Owner' "$MIG_SEC/activity.log")" "1"
+check "the richer client check replaces the duplicate VERIFY row" \
+      "$(grep -Fc 'CHECK | Owner | hidden | client=VERIFIED CLIENT' "$MIG_SEC/activity.log")" "1"
+check "the legacy activity copy redacts owner brand, UUID and IP" \
+      "$(grep -Ec 'SecretBrand|SecretUUID|1\.2\.3\.4' "$MIG_SEC/activity.log")" "0"
+check "the verified owner's old password is masked in private auth history" \
+      "$(grep -Fc 'Owner | hidden | /login ******** | client=VERIFIED CLIENT (password not recorded)' "$MIG_PRIV/auth.log")" "1"
+check "other players' private auth history is preserved in full" \
+      "$(grep -Fc 'Stranger | 5.6.7.8 | /login othersecret' "$MIG_PRIV/auth.log")" "1"
+check "the private address history keeps both real addresses" \
+      "$(grep -c '^2024-01-01 07:.* | IP | ' "$MIG_PRIV/addresses.log")" "2"
+check "all redundant legacy report/log copies are removed" \
+      "$(find "$MIG_SEC" "$MIG_PRIV" -type f \
+            \( -name 'logins.log' -o -name 'commands.log' -o -name 'client-checks.log' \
+               -o -name 'shared-ips*' -o -name 'ip-report*' -o -name 'logger-status.log' \
+               -o -name 'proxy-peers.txt' -o -name 'player-ips.log' -o -name 'logins-real-ips.log' \) | wc -l | tr -d ' ')" "0"
+MIGRATION_BEFORE=$(sha256sum "$MIG_SEC/activity.log" "$MIG_PRIV/auth.log" "$MIG_PRIV/addresses.log" | sha256sum | cut -d' ' -f1)
+MIGRATION_SECOND=$(python3 "$ROOT/tools/log_migrate.py" "$MIG_SEC" "$MIG_PRIV")
+MIGRATION_AFTER=$(sha256sum "$MIG_SEC/activity.log" "$MIG_PRIV/auth.log" "$MIG_PRIV/addresses.log" | sha256sum | cut -d' ' -f1)
+check "a repeat migration leaves all curated logs unchanged" \
+      "$( [ "$MIGRATION_BEFORE" = "$MIGRATION_AFTER" ] && echo yes )" "yes"
+check "the repeat run reports no migrated rows" \
+      "$(printf '%s' "$MIGRATION_SECOND" | grep -o 'activity_rows=[0-9]* address_rows=[0-9]*')" "activity_rows=0 address_rows=0"
+
 # --------------------------------------------------------------------------- #
 echo "== 7. the Space only needs a couple of files =="
+check "the Dockerfile pins the container to Eastern time" \
+      "$(grep -c '^ENV TZ=America/New_York$' "$ROOT/Dockerfile")" "1"
+check "the Dockerfile installs timezone data and ionice support" \
+      "$(grep -c 'tzdata' "$ROOT/Dockerfile")$(grep -c 'util-linux' "$ROOT/Dockerfile")" "11"
 check "the Dockerfile does not depend on client/ (kept out of the Space)" \
       "$(grep -c '^COPY client/' "$ROOT/Dockerfile")" "0"
 check "the Dockerfile copies the files the Space has" \
@@ -773,7 +903,7 @@ export FAKE_HF_LOG="$WORK/fake-hf.log"
 # force the CLI to fail: the uploader has to fall back to the Python API
 hf() { printf 'hf %s\n' "$*" >> "$HF_CALLS"; return 1; }   # missing / read-only / too old
 STAGING="$WORK/stage-bucket"; mkdir -p "$STAGING/security-logs" "$STAGING/private-logs"
-echo "a login"    > "$STAGING/security-logs/logins.log"
+echo "a login"    > "$STAGING/security-logs/activity.log"
 echo "a password" > "$STAGING/private-logs/auth.log"
 : > "$FAKE_HF_LOG"; : > "$HF_CALLS"
 BUCKET_METHOD=auto
@@ -785,13 +915,42 @@ fi
 check "…and says so" "$(grep -c 'retrying with the Python API' "$WORK/sync.out")" "1"
 check "…and reports the CLI error instead of swallowing it" \
       "$(grep -c 'hf buckets sync failed' "$WORK/sync.out")" "1"
-check "…the security log lands in the bucket" \
-      "$(grep -c '^add tester/1.12 game-data/security-logs/logins.log ' "$FAKE_HF_LOG")" "1"
+check "…the consolidated activity log lands in the bucket" \
+      "$(grep -c '^add tester/1.12 game-data/security-logs/activity.log ' "$FAKE_HF_LOG")" "1"
 check "…the private log (passwords) lands in the bucket too" \
       "$(grep -c '^add tester/1.12 game-data/private-logs/auth.log ' "$FAKE_HF_LOG")" "1"
 check "…and the sync line says which path was used" \
       "$(grep -c 'bucket-sync:' "$WORK/sync.out")" "1"
 check "BUCKET_VIA reports python for the caller" "$BUCKET_VIA" "python"
+
+# The Python fallback should walk/stat the immutable staging tree once, not
+# twice. Also make sure its --delete list still contains stale remote objects.
+WALK_TEST=$(python3 - "$ROOT" "$STAGING" <<'PYWALK'
+import sys
+from argparse import Namespace
+sys.path.insert(0, sys.argv[1] + "/tools")
+import bucket_sync
+
+calls = 0
+original = bucket_sync.iter_local
+def counted(root):
+    global calls
+    calls += 1
+    yield from original(root)
+bucket_sync.iter_local = counted
+bucket_sync.list_remote = lambda *args: {"stale.log": 12}
+args = Namespace(local_dir=sys.argv[2], bucket_id="tester/1.12", prefix="game-data",
+                 token=None, delete=True)
+bucket_sync.cmd_sync(args)
+print(f"iter_local_calls={calls}")
+PYWALK
+)
+check "the Python fallback walks the staged tree once" \
+      "$(grep -c '^iter_local_calls=1$' <<<"$WALK_TEST")" "1"
+check "the one-pass Python sync still removes stale remote files" \
+      "$(grep -c 'deleted=1' <<<"$WALK_TEST")" "1"
+check "the stale remote object is named in the delete request" \
+      "$(grep -c '^delete tester/1.12 game-data/stale.log$' "$FAKE_HF_LOG")" "1"
 
 # the write probe: CLI broken -> the Python API, and the banner can say OK
 : > "$FAKE_HF_LOG"
@@ -815,24 +974,19 @@ unset -f python3
 hf() {   # fake the HF CLI: record the call and the staged files
     printf 'hf %s\n' "$*" >> "$HF_CALLS"
     [ -d "${3:-}" ] && find "$3" -type f -printf '%P\n' | sort >> "$HF_STAGED"
+    if [ -f "${3:-}/console.log" ]; then cp "$3/console.log" "$WORK/staged-console.log"; fi
     return 0
 }
 
 if [ "${PRINT_LOGS:-0}" = "1" ]; then
     echo
-    echo "############ security-logs/logins.log"
-    cat "$LOGIN_LOG"
+    echo "############ security-logs/activity.log"
+    cat "$ACTIVITY_LOG"
     echo
-    echo "############ security-logs/commands.log"
-    cat "$CMD_LOG"
-    echo
-    echo "############ security-logs/client-checks.log"
-    cat "$CLIENT_LOG"
-    echo
-    echo "############ private-logs/auth.log   (full passwords, never synced)"
+    echo "############ private-logs/auth.log   (full other-player passwords)"
     cat "$AUTH_LOG"
     echo
-    echo "############ private-logs/player-ips.log   (the IPs hidden above)"
+    echo "############ private-logs/addresses.log   (real IP history)"
     sort -u "$IP_MAP_FILE"
 fi
 
@@ -885,27 +1039,32 @@ check "every sighting is kept with its source" \
       "$(awk -F'\t' '$1=="Alice"{print $3}' "$IP_MAP" | sort | tr '\n' ',' )" "bungee-handshake,paper,"
 check "the private IP log lists them too" "$(grep -c 'Alice' "$IP_MAP_FILE")" "2"
 
-ip_report_body "$IP_MAP" "$SEC_DIR/ip-report.log" no
-check "the report names both Alice IPs, with where each came from" \
-      "$(grep -c '^  Alice -> 1.2.3.4 (paper) x1$' "$SEC_DIR/ip-report.log")$(grep -c '^  Alice -> 9.9.9.9 (bungee-handshake) x1$' "$SEC_DIR/ip-report.log")" "11"
-check "…and flags the account pair behind one IP" \
-      "$(grep -c '^  1.2.3.4 -> Alice Bob$' "$SEC_DIR/ip-report.log")" "1"
-check "…but never 'unknown' as an address" "$(grep -c 'unknown' "$SEC_DIR/ip-report.log")" "0"
+ip_report_body "$IP_MAP" "$WORK/private-address-report.txt" no
+check "the report lists both Alice IPs and their sources" \
+      "$(grep -Fxc $'Alice\t1.2.3.4\tpaper (seen 1 time(s))' "$WORK/private-address-report.txt")$(grep -Fxc $'Alice\t9.9.9.9\tbungee-handshake (seen 1 time(s))' "$WORK/private-address-report.txt")" "11"
+check "the shared-address section names both accounts once" \
+      "$(grep -Fxc $'1.2.3.4\tAlice, Bob' "$WORK/private-address-report.txt")" "1"
+check "the report has an Eastern, 12-hour timestamp" \
+      "$(grep -Ec '^Updated: [0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2} (AM|PM) (EDT|EST)$' "$WORK/private-address-report.txt")" "1"
+check "the report has no placeholder address" "$(grep -c 'unknown' "$WORK/private-address-report.txt")" "0"
 
-# the synced copy must not carry the owner's addresses
+# Public snapshot omits the verified account; private snapshot retains it.
 : > "$IP_MAP"
 record_ip CreppyBitch 7.7.7.7 paper
 record_ip Alice 1.2.3.4 paper
 : > "$VERDICT_CACHE"; set_verdict CreppyBitch VERIFIED
-ip_report_body "$IP_MAP" "$SEC_DIR/ip-report.log" yes
-check "the synced IP report has the other players" "$(grep -c 'Alice' "$SEC_DIR/ip-report.log")" "1"
-check "…and not the owner" "$(grep -c 'CreppyBitch\|7\.7\.7\.7' "$SEC_DIR/ip-report.log")" "0"
-ip_report_body "$IP_MAP" "$PRIV_DIR/ip-report-private.log" no
-check "the private IP report still has the owner (that is how you check it)" \
-      "$(grep -c '^  CreppyBitch -> 7.7.7.7 (paper) x1$' "$PRIV_DIR/ip-report-private.log")" "1"
-check "an empty map still produces a report" \
-      "$( : > "$WORK/empty-map.tsv"; ip_report_body "$WORK/empty-map.tsv" "$WORK/empty-report.txt" no; grep -c 'no IPs recorded yet' "$WORK/empty-report.txt" )" \
+ip_report_body "$IP_MAP" "$ADDRESS_REPORT" yes
+check "the synced address summary has other players" "$(grep -c 'Alice' "$ADDRESS_REPORT")" "1"
+check "the synced summary omits the verified account and its address" \
+      "$(grep -Ec 'CreppyBitch|7\.7\.7\.7' "$ADDRESS_REPORT")" "0"
+ip_report_body "$IP_MAP" "$PRIVATE_ADDRESS_REPORT" no
+check "the private address summary retains the verified account" \
+      "$(grep -Fxc $'CreppyBitch\t7.7.7.7\tpaper (seen 1 time(s))' "$PRIVATE_ADDRESS_REPORT")" "1"
+check "an empty map still produces a readable report" \
+      "$( : > "$WORK/empty-map.tsv"; ip_report_body "$WORK/empty-map.tsv" "$WORK/empty-report.txt" no; grep -c '(no real addresses recorded yet)' "$WORK/empty-report.txt" )" \
       "1"
+check "report entries are date/time-prefixed, not split into duplicate files" \
+      "$(grep -c '^IP ADDRESS REPORT$' "$PRIVATE_ADDRESS_REPORT")$(grep -c '^Updated: ' "$PRIVATE_ADDRESS_REPORT")" "11"
 
 # --------------------------------------------------------------------------- #
 echo "== 13. real client IPs: the header is proven before it is trusted =="
@@ -1044,6 +1203,7 @@ def extract(marker):
 bad = [n for n, m in [("bucket_sync.py", "BUCKET_SYNC_PY_EOF"),
                       ("forward_ip_probe.py", "FORWARD_IP_PROBE_EOF"),
                       ("proxy_peers.py", "PROXY_PEERS_EOF"),
+                      ("log_migrate.py", "LOG_MIGRATOR_PY_EOF"),
                       ("patch_auth_filter.py", "AUTH_FILTER_PATCH_PY_EOF")]
        if extract(m) != (root / "tools" / n).read_text()]
 print("MISMATCH:" + ",".join(bad) if bad else "OK")
@@ -1073,18 +1233,25 @@ export ONLINE_STATE="$WORK/online-state.txt"
 printf 'Alice\n' > "$ONLINE_STATE"
 printf '[12:00:00 INFO]: Alice[/1.2.3.4:5555] logged in with entity id 42\n' > /tmp/paper.log
 printf '[12:00:01 INFO] Alice[/1.2.3.4:5555] <-> InitialHandler has connected\n' > "$BLOG"
-printf '%s | LOGIN | Alice | 1.2.3.4\n' "$(date '+%F %T')" > "$LOGIN_LOG"
-printf 'x | Alice | 1.2.3.4 | /login pw | client=OTHER EAGLERCRAFT CLIENT\n' >> "$CMD_LOG"
+ACTIVITY_LOG="$WORK/activity-status.log"
+printf '%s | LOGIN | Alice | 1.2.3.4\n' "$(now_eastern)" > "$ACTIVITY_LOG"
 PLAYERLIST_LAST="18:00:00 got: There are 1 of a max 20 players online: Alice"
-FORWARD_IP="auto"; FORWARD_IP_HEADER=""; SEC_DIR="$WORK/security"; PRIVATE_IP_LOG=true
+FORWARD_IP="auto"; FORWARD_IP_HEADER=""; SEC_DIR="$WORK/security"; STATUS_FILE="$SEC_DIR/status.txt"; PRIVATE_IP_LOG=true
 write_logger_status
-STATUS="$SEC_DIR/logger-status.log"
-check "the status file is written" "$([ -s "$STATUS" ] && echo yes)" "yes"
-check "…with the paper line count" "$(grep -c '^paper.log      : 1 lines' "$STATUS")" "1"
-check "…the login count" "$(grep -c '^logins.log     : 1 logins, 0 logouts' "$STATUS")" "1"
-check "…the last player-list answer" "$(grep -c '^playerlist     : 18:00:00 got: There are 1' "$STATUS")" "1"
-check "…the forward_ip setting" "$(grep -c '^real client IPs: ' "$STATUS")" "1"
-check_at_least "…and the raw lines the parser sees" "$(grep -c 'Alice\[\|logged in with entity id' "$STATUS")" "1"
+STATUS="$STATUS_FILE"
+check "the status snapshot is written at the curated path" "$([ -s "$STATUS" ] && echo yes)" "yes"
+check "…with the Eastern timezone and 12-hour clock" \
+      "$(grep -c '^Timezone      : America/New_York (EST/EDT), 12-hour clock$' "$STATUS")" "1"
+check "…with the activity log byte count" "$(grep -c '^Activity log  : [0-9][0-9]* bytes$' "$STATUS")" "1"
+check "…and the latest activity row" "$(grep -c '^Last activity : .* | LOGIN | Alice | 1.2.3.4$' "$STATUS")" "1"
+check "…the player-list answer" "$(grep -c '^Player list   : 18:00:00 got: There are 1' "$STATUS")" "1"
+check "…the forward-IP setting" "$(grep -c '^Client IPs    : ' "$STATUS")" "1"
+check "…with the Paper console file size" \
+      "$(grep -c '^Paper console : [0-9][0-9]* bytes in /tmp/paper.log$' "$STATUS")" "1"
+check "…and the Bungee console file size" \
+      "$(grep -F 'Bungee console:' "$STATUS" | grep -Fc "$BLOG")" "1"
+check "the status timestamp is Eastern and uses a 12-hour clock" \
+      "$(grep -Ec '^Updated       : [0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2} (AM|PM) (EDT|EST)$' "$STATUS")" "1"
 
 
 # --------------------------------------------------------------------------- #
@@ -1262,8 +1429,8 @@ record_ip Steve 1.2.3.4 paper
 handle_paper_line "[12:00:10 INFO]: Steve issued server command: /login Tr0ub4dor&3"
 check "the password lands in private-logs/auth.log" \
       "$(grep -c '| Steve | 1.2.3.4 | /login Tr0ub4dor&3 | client=OTHER EAGLERCRAFT CLIENT' "$AUTH_LOG")" "1"
-check "the synced commands.log only shows the mask" \
-      "$(grep -c 'Steve | 1.2.3.4 | /login \*\*\*\*\*\*\*\*' "$CMD_LOG")" "1"
+check "the synced activity.log only shows a masked command" \
+      "$(grep -Fc '| COMMAND | Steve | 1.2.3.4 | /login ******** | client=OTHER EAGLERCRAFT CLIENT' "$CMD_LOG")" "1"
 check "…and never the password" "$(grep -c 'Tr0ub4dor' "$CMD_LOG")" "0"
 handle_paper_line "[12:00:20 INFO]: Steve issued server command: /register S3cret!"
 handle_paper_line "[12:00:30 INFO]: Steve issued server command: /changepassword N3wPass"
@@ -1283,15 +1450,17 @@ printf '%s\n' \
 mask_console_tail < "$WORK/tail.log" > "$WORK/tail-masked.log"
 check "no password survives in the synced console copy" "$(grep -c 'hunter2' "$WORK/tail-masked.log")" "0"
 check "…the command stays readable (masked)" \
-      "$(grep -c 'issued server command: /login \*\*\*\*\*\*\*\*' "$WORK/tail-masked.log")" "2"
+      "$(grep -Fc 'issued server command: /login ********' "$WORK/tail-masked.log")" "2"
 check "other players keep their address" "$(grep -c 'Steve\[/1\.2\.3\.4:5555\]' "$WORK/tail-masked.log")" "1"
 check "the verified client's address is written as hidden" \
       "$(grep -c 'CreppyBitch\[/hidden\]' "$WORK/tail-masked.log")" "1"
 check "…and never appears in the copy" "$(grep -c '7\.7\.7\.7' "$WORK/tail-masked.log")" "0"
-check "mask_console_tail is wired into the bucket upload" \
-      "$(grep -c 'mask_console_tail > "\$STAGING/logs/paper.log"' "$ROOT/start.sh")" "1"
+check "both raw console sources pass through the masking filter" \
+      "$(grep -Fc 'mask_console_tail | sed' "$ROOT/start.sh")" "2"
+check "full and log sync use one combined console snapshot" \
+      "$(grep -Fc 'write_console_snapshot "$STAGING/logs/console.log"' "$ROOT/start.sh")" "2"
 check "the logger status reports the login capture state" \
-      "$(grep -c 'login capture  : \${AUTH_PATCH_STATUS:-not run}' "$ROOT/start.sh")" "1"
+      "$(grep -Fc 'Login capture : ${AUTH_PATCH_STATUS:-not run}' "$ROOT/start.sh")" "1"
 
 # --------------------------------------------------------------------------- #
 echo "== 19. three accounts, one device: the addresses stay put =="
@@ -1358,8 +1527,8 @@ export PROXY_PEERS_PY="$WORK/peers_py.py"
 proxy_peers_record > "$WORK/peers-record.log" 2>&1
 check "the proxy peers are written into private-logs (so they survive a restart)" \
       "$(grep -c '10.0.0.5' "$PROXY_PEERS_STATE")" "1"
-check "…and a readable copy goes to the synced folder" \
-      "$(grep -c 'is the PROXY' "$PROXY_PEERS_VIEW")" "1"
+check "the peer is saved in private-logs for report classification" \
+      "$(awk -F'\t' '$2=="10.0.0.5"{n++} END{print n+0}' "$PROXY_PEERS_STATE")" "1"
 proxy_peers_record > /dev/null 2>&1
 check "…and the same peer is never recorded twice" "$(grep -c . "$PROXY_PEERS_STATE")" "3"
 check "an address equal to a peer is the proxy's" "$(is_proxy_addr 10.0.0.5 && echo yes || echo no)" "yes"
@@ -1371,28 +1540,28 @@ printf '%s\t%s\t%s\t%s\n' Bob 203.0.113.9 paper "$(date +%s)" >> "$IP_MAP"
 check "the evidence notices that a logged address is the proxy's" \
       "$(logged_ip_is_proxy && echo yes || echo no)" "yes"
 check "…and says it in one sentence" "$(ip_evidence_line | grep -c "ARE THE PROXY'S")" "1"
-ip_report_body "$IP_MAP" "$WORK/ip-report.log" no
-check "the report marks a proxy address as the proxy's" \
-      "$(grep -c '^  10.0.0.5 -> the PROXY address (not a player), 1 account' "$WORK/ip-report.log")" "1"
-check "…and a non-peer address as a real client address" \
-      "$(grep -c '^  203.0.113.9 -> a real client address (not a proxy peer), 1 account' "$WORK/ip-report.log")" "1"
-check "…with a verdict for a mixture" \
-      "$(grep -c 'both kinds are present' "$WORK/ip-report.log")" "1"
+ip_report_body "$IP_MAP" "$WORK/ip-report.txt" no
+check "the report classifies the proxy's address" \
+      "$(grep -Fxc $'10.0.0.5\tPROXY address (not a player)\t1 account(s)' "$WORK/ip-report.txt")" "1"
+check "…and classifies the player's address" \
+      "$(grep -Fxc $'203.0.113.9\treal client address\t1 account(s)' "$WORK/ip-report.txt")" "1"
+check "…with the mixed forwarding diagnosis" \
+      "$(grep -c 'Both proxy and client addresses are present' "$WORK/ip-report.txt")" "1"
 : > "$IP_MAP"
 printf '%s\t%s\t%s\t%s\n' Alice 10.0.0.5 bungee-handshake "$(date +%s)" >> "$IP_MAP"
-ip_report_body "$IP_MAP" "$WORK/ip-report.log" no
-check "a log that only has the proxy's address is called out" \
-      "$(grep -c 'every address here is the PROXY address' "$WORK/ip-report.log")" "1"
-check "…and none of that is mistaken for a shareable player address" \
-      "$(grep -c 'unknown' "$WORK/ip-report.log")" "0"
+ip_report_body "$IP_MAP" "$WORK/ip-report.txt" no
+check "a report with only peer addresses says forwarded IPs are unavailable" \
+      "$(grep -c 'Every logged address is a proxy peer; forwarded client IPs are unavailable' "$WORK/ip-report.txt")" "1"
+check "…and never calls a placeholder a player address" \
+      "$(grep -c 'unknown' "$WORK/ip-report.txt")" "0"
 
 # one device using both protocols is not two machines
 : > "$IP_MAP"
 printf '%s\t%s\t%s\t%s\n' Cara 203.0.113.9 paper "$(date +%s)" >> "$IP_MAP"
 printf '%s\t%s\t%s\t%s\n' Cara 2001:db8::5 paper "$(date +%s)" >> "$IP_MAP"
-ip_report_body "$IP_MAP" "$WORK/ip-report.log" no
+ip_report_body "$IP_MAP" "$WORK/ip-report.txt" no
 check "IPv4 + IPv6 for one account is reported as one device" \
-      "$(grep -c 'seen over IPv4 and IPv6 - that is one device, not two' "$WORK/ip-report.log")" "1"
+      "$(grep -Fxc $'Cara\tone device/account using both protocols' "$WORK/ip-report.txt")" "1"
 
 # when is the header discovery retried? only with nobody online, and only when
 # the addresses in the logs really are the proxy's
@@ -1433,10 +1602,10 @@ check "the discovered header is remembered where the README says (private-logs)"
       "$(grep -c '^FORWARD_IP_STATE="\$PRIV_DIR/forward-ip.state"$' "$ROOT/start.sh")" "1"
 : > "$IP_MAP"; : > "$IP_MAP_FILE"
 write_logger_status
-check "logger-status prints the proxy peers" \
-      "$(grep -c '^proxy peers    :' "$SEC_DIR/logger-status.log")" "1"
+check "status.txt prints the proxy peers" \
+      "$(grep -c '^Proxy peers   :' "$SEC_DIR/status.txt")" "1"
 check "…and what the addresses in the logs are" \
-      "$(grep -c '^ip evidence    :' "$SEC_DIR/logger-status.log")" "1"
+      "$(grep -c '^IP evidence   :' "$SEC_DIR/status.txt")" "1"
 
 # --------------------------------------------------------------------------- #
 echo "== 21. the client is optimised for low-end machines =="
@@ -1801,17 +1970,23 @@ for MB_SIZE in 2048 4096 8192 16384 32768; do
           "$([ "$XMX" -ge 1024 ] && [ "$XMX" -le 8192 ] && [ "$XMS" -ge 512 ] && [ "$XMX" -le "$MB_SIZE" ] && echo ok || echo broken)" "ok"
 done
 
-# The bucket sync, the world copy and the log parsers must run below the game's
-# priority: they share two cores with Paper, and a full world copy every
-# SYNC_INTERVAL seconds otherwise competes with the tick loop.
+# Bucket sync, world copies and log staging should yield CPU/I/O priority to
+# Paper; a full snapshot still walks the whole game-data tree, so avoid running
+# it as a foreground, high-priority job against the tick loop.
 BG_PRIORITY=()
 eval "$(awk '/^BG_PRIORITY=\(\)/,/^fi$/ { print }' "$ROOT/start.sh" 2>/dev/null || true)"
 check "the sync runs behind a nice/ionice prefix" \
       "$(grep -c 'BG_PRIORITY=(nice' "$ROOT/start.sh")" "2"      # nice alone + nice with ionice
 check "…the ionice class is probed before it is used" \
       "$(grep -c 'ionice -c3 true' "$ROOT/start.sh")" "1"
-check "…both bucket paths and the world copy use it" \
-      "$(grep -c '"\${BG_PRIORITY\[@\]}"' "$ROOT/start.sh")" "3"
+check "the Python uploader runs at background priority" \
+      "$(grep -Fc '"${BG_PRIORITY[@]}" python3 "$BUCKET_SYNC_PY"' "$ROOT/start.sh")" "1"
+check "the CLI sync and restore run at background priority" \
+      "$(grep -Fc '"${BG_PRIORITY[@]}" hf buckets sync' "$ROOT/start.sh")" "2"
+check "all full/log staging copies run at background priority" \
+      "$(grep -Fc '"${BG_PRIORITY[@]}" cp -a' "$ROOT/start.sh")" "3"
+check "full/log staging cleanup also runs at background priority" \
+      "$(grep -Fc '"${BG_PRIORITY[@]}" rm -rf "$STAGING"' "$ROOT/start.sh")" "4"
 if command -v nice >/dev/null 2>&1; then
     check_at_least "…and the probe really picks a prefix here" "${#BG_PRIORITY[@]}" "1"
 fi

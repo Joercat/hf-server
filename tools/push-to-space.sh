@@ -73,9 +73,10 @@ if hf upload "$SPACE" "$STAGE" . --repo-type space; then
     echo "    without them nobody is marked as the verified client and every"
     echo "    password in private-logs/auth.log is masked. The boot log says"
     echo "    'VERIFIED CLIENT: NOT CONFIGURED' in that case."
-    echo "    the console the build/run produces is mirrored to:"
-    echo "      $BUCKET/game-data/logs/paper.log"
-    echo "      $BUCKET/game-data/logs/bungee.log"
+    echo "    the combined, masked Paper/Bungee console tail is mirrored to:"
+    echo "      $BUCKET/game-data/logs/console.log"
+    echo "    curated player events are in:"
+    echo "      $BUCKET/game-data/security-logs/activity.log"
 else
     echo
     echo "upload failed - run 'hf auth login' with a token that can write to $SPACE"

@@ -33,7 +33,6 @@ saved_model/**/* filter=lfs diff=lfs merge=lfs -text
 *.zip filter=lfs diff=lfs merge=lfs -text
 *.zst filter=lfs diff=lfs merge=lfs -text
 *tfevents* filter=lfs diff=lfs merge=lfs -text
-config/bungee/EaglerXBungee.jar filter=lfs diff=lfs merge=lfs -text
 config/bungee/EaglerXServer.jar filter=lfs diff=lfs merge=lfs -text
 plugins/LoginSecurity-Spigot-3.3.0.jar filter=lfs diff=lfs merge=lfs -text
 plugins/AuthMe-6.0.1-Bungee.jar filter=lfs diff=lfs merge=lfs -text

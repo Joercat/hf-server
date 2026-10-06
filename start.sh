@@ -1,5 +1,11 @@
 #!/bin/bash
 
+# The container can be rescheduled onto hosts with different default zones.
+# Pin shell tools and JVMs to New York time so timestamps do not jump between
+# UTC/local time; 12-hour formatting is applied to the curated log files.
+export TZ="America/New_York"
+export LC_ALL=C
+
 JAVA_HOME_DIR=$(find /usr/lib/jvm -maxdepth 1 -name "java-17-openjdk-*" -type d 2>/dev/null | head -1)
 if [ -z "$JAVA_HOME_DIR" ]; then
     echo "ERROR: Java 17 not found!"
@@ -11,28 +17,24 @@ BUNGEE_DIR="/opt/server/bungee"
 BACKEND_DIR="/opt/server/backend"
 PLUGIN_DIR="$BACKEND_DIR/plugins"
 
-# Security log locations (append-only, synced to the HF bucket every
-# $SYNC_INTERVAL seconds, see SAVE_DIRS below):
-#   hf://buckets/smodusermc/1.12/game-data/security-logs/logins.log
-#   hf://buckets/smodusermc/1.12/game-data/security-logs/commands.log
-#   hf://buckets/smodusermc/1.12/game-data/security-logs/client-checks.log
-#   hf://buckets/smodusermc/1.12/game-data/security-logs/shared-ips.txt
+# Human-readable logs. One activity stream replaces the old login, command and
+# client-check files; separate copies of those same events were hard to follow.
 SEC_DIR="$BACKEND_DIR/security-logs"
-LOGIN_LOG="$SEC_DIR/logins.log"
-CMD_LOG="$SEC_DIR/commands.log"
-SHARED_REPORT="$SEC_DIR/shared-ips.txt"
-CLIENT_LOG="$SEC_DIR/client-checks.log"
+ACTIVITY_LOG="$SEC_DIR/activity.log"
+LOGIN_LOG="$ACTIVITY_LOG"       # aliases used by the event handlers below
+CMD_LOG="$ACTIVITY_LOG"
+CLIENT_LOG="$ACTIVITY_LOG"
+ADDRESS_REPORT="$SEC_DIR/addresses.txt"
+STATUS_FILE="$SEC_DIR/status.txt"
 
-# Private log locations - NEVER synced to the bucket (private-logs is not in
-# SAVE_DIRS, see the check further down):
-#   auth.log        full /login, /register, /changepassword lines (passwords in
-#                   clear, for password resets) - everything except the
-#                   verified client, i.e. your own password is never written
-#   player-ips.log  the real IPs that were hidden as "ip=hidden" in the synced
-#                   logs, in case you ever need to look your own up
+# Private logs are synced to the private bucket folder by default. auth.log
+# keeps other players' full /login lines for password resets (never yours);
+# addresses.log is the private address history, including your hidden IP.
 PRIV_DIR="$BACKEND_DIR/private-logs"
 AUTH_LOG="$PRIV_DIR/auth.log"
-IP_MAP_FILE="$PRIV_DIR/player-ips.log"
+IP_MAP_FILE="$PRIV_DIR/addresses.log"
+PRIVATE_ADDRESS_REPORT="$PRIV_DIR/addresses.txt"
+LOG_MIGRATOR_PY="${LOG_MIGRATOR_PY:-/tmp/log_migrate.py}"
 
 # Runtime caches (in /tmp, never written to disk)
 #   VERDICT_CACHE : "<name>\t<VERDICT>" - last verdict per player
@@ -54,16 +56,14 @@ mkdir -p "$PLUGIN_DIR" "$SEC_DIR" "$PRIV_DIR"
 HF_BUCKET_HANDLE="hf://buckets/smodusermc/1.12"
 
 # The bucket is the only place the logs can be read from outside the Space, so
-# BOTH log folders are synced:
-#   game-data/security-logs/  logins.log, commands.log, client-checks.log, shared-ips.txt
-#   game-data/private-logs/   auth.log (full /login lines), player-ips.log (the
-#                             real IPs that show as "hidden"), the private reports
-# SYNC_PRIVATE_LOGS=false uploads only the sanitised security-logs (then
-# auth.log and the real IPs stay inside the Space - and you cannot read them
-# from outside either).
+# the curated activity/address/status files and the private password/IP history
+# are synced there. The private folder contains clear-text passwords and real
+# IPs: keep this bucket private. SYNC_PRIVATE_LOGS=false disables its upload.
 SYNC_PRIVATE_LOGS="${SYNC_PRIVATE_LOGS:-true}"
 
-SAVE_DIRS="world world_nether world_the_end players banned-ips.json banned-players.json ops.json whitelist.json plugins security-logs"
+# `logs` is included in the full mirror so --delete never erases the console
+# snapshot. The two log-only syncs below target only their own folder prefixes.
+SAVE_DIRS="world world_nether world_the_end players banned-ips.json banned-players.json ops.json whitelist.json plugins security-logs logs"
 [ "$SYNC_PRIVATE_LOGS" = true ] && SAVE_DIRS="$SAVE_DIRS private-logs"
 
 if [ "$SYNC_PRIVATE_LOGS" = true ]; then
@@ -72,15 +72,20 @@ if [ "$SYNC_PRIVATE_LOGS" = true ]; then
     echo "      Keep $HF_BUCKET_HANDLE private."
 fi
 
-SYNC_INTERVAL="${SYNC_INTERVAL:-300}"
-# logs are small, so they get their own much faster sync (in seconds)
+# Full world snapshots do a lot of file walking and hashing. Paper autosaves
+# every 10 minutes; a 10-minute backup interval avoids a redundant full scan
+# every five minutes while keeping the normal rollback window short.
+SYNC_INTERVAL="${SYNC_INTERVAL:-600}"
+# Curated logs stay fresh independently of world snapshots (seconds).
 LOG_SYNC_INTERVAL="${LOG_SYNC_INTERVAL:-60}"
-# also upload the tail of the raw Paper/Bungee consoles (boot errors, crashes)
-# to game-data/logs/ so they can be read without access to the Space
+# One combined, password/IP-redacted console snapshot is kept for boot errors.
 SYNC_CONSOLE_LOGS="${SYNC_CONSOLE_LOGS:-true}"
 CONSOLE_LOG_LINES="${CONSOLE_LOG_LINES:-1000}"
 FULL_STAGING="/tmp/hf-staging"
 LOG_STAGING="/tmp/hf-log-staging"
+BUCKET_SYNC_LOCK="${BUCKET_SYNC_LOCK:-/tmp/hf-bucket-sync.lock}"
+REPORT_INTERVAL="${REPORT_INTERVAL:-300}"
+REPORT_STATE="${REPORT_STATE:-/tmp/addresses-report-last-update}"
 
 # How the bucket is written: `auto` tries the hf CLI first and falls back to
 # the Python API (huggingface_hub ships in the image), `cli` / `python` force
@@ -95,7 +100,7 @@ BUCKET_ERROR=""
 ONLINE_STATE="${ONLINE_STATE:-/tmp/online-players.txt}"
 # how often the RCON player list is polled as the safety net for logins that
 # never showed up in a log line (a different Paper version, a rotated file, ...)
-PLAYERLIST_POLL="${PLAYERLIST_POLL:-20}"
+PLAYERLIST_POLL="${PLAYERLIST_POLL:-60}"
 IDLE_MODE=false
 
 # =============================================
@@ -199,9 +204,8 @@ unset _pair
 
 # true = ONLY the verified client may stay on the server; everybody else is
 # kicked right after the login. DEFAULT IS FALSE: everybody may join with any
-# client and the verified client is only *marked* in the logs (your IP is
-# hidden, your lines carry no client=... tag). Turn it on if you ever want the
-# server to be exclusive.
+# client and the verified client is marked in the logs while its IP and private
+# brand/UUID are hidden. Turn it on if you ever want the server to be exclusive.
 ENFORCE_VERIFIED_CLIENT=false
 # also kick real (Java) Minecraft clients - only has an effect while
 # ENFORCE_VERIFIED_CLIENT is true
@@ -255,7 +259,7 @@ FORWARD_IP_RETRY_INTERVAL="${FORWARD_IP_RETRY_INTERVAL:-600}"
 #   a logged address that equals a peer is the proxy's, never a player's.
 PROXY_PEERS_PY="${PROXY_PEERS_PY:-/tmp/proxy_peers.py}"
 PROXY_PEERS_STATE="$PRIV_DIR/proxy-peers.log"
-PROXY_PEERS_VIEW="$SEC_DIR/proxy-peers.txt"
+VERIFIED_PLAYER_STATE="$PRIV_DIR/verified-players.txt"
 GAME_PORT="${GAME_PORT:-7860}"
 
 # =============================================
@@ -1097,7 +1101,7 @@ javap_verify_patch() {   # $1 patched jar, $2 original jar, $3 dotted class
 
 # Patch every auth plugin jar before Paper starts, so that /login reaches the
 # console again.  Prints what happened and leaves a one line summary in
-# AUTH_PATCH_STATUS (written to logger-status.log, which is synced).
+# AUTH_PATCH_STATUS (shown in security-logs/status.txt, which is synced).
 apply_auth_filter_patch() {
     ensure_auth_filter_patch_py
     local jar name status plugin class markers backup err dotted rc verify found=0 summary=""
@@ -1207,15 +1211,46 @@ auth_patch_post_start_check() {
 }
 
 # -------------------------------------------------------------
-# The console tails that are synced to the bucket are copies of the raw logs, so
-# they must not become a second place where the verified client's password or
-# address shows up.  private-logs/auth.log stays the one place passwords can be
-# read from (full for everybody except the verified client); in the bucket copy
-# every auth command argument is masked and the verified client's address is
-# written as "hidden".
+# One timestamp style for all curated append-only logs: Eastern time with the
+# date, 12-hour clock and an explicit EST/EDT marker. A dated divider is added
+# on the first event of each day. `flock` makes the divider + row atomic even
+# when Paper, Bungee and the RCON safety-net report at nearly the same time.
 # -------------------------------------------------------------
+now_eastern() {
+    date '+%Y-%m-%d %I:%M:%S %p %Z'
+}
+
+format_epoch_eastern() {
+    local epoch="${1:-$(date +%s)}"
+    date -d "@$epoch" '+%Y-%m-%d %I:%M:%S %p %Z'
+}
+
+append_dated_log() {   # $1=file, $2=epoch seconds, $3=message (without timestamp)
+    local file="$1" epoch="${2:-$(date +%s)}" message="$3"
+    local stamp day weekday last_line last_day
+    [[ "$epoch" =~ ^[0-9]+$ ]] || epoch=$(date +%s)
+    stamp=$(format_epoch_eastern "$epoch") || return 1
+    day="${stamp:0:10}"
+    weekday=$(date -d "@$epoch" '+%A, %B %-d, %Y')
+    mkdir -p "$(dirname "$file")" 2>/dev/null || return 1
+    {
+        flock -x 8
+        last_line=$(tail -n 1 "$file" 2>/dev/null || true)
+        last_day="${last_line:0:10}"
+        if [ "$last_day" != "$day" ]; then
+            [ -s "$file" ] && printf '\n' >&8
+            printf '%s\n\n' "==================== $weekday | $day ====================" >&8
+        fi
+        printf '%s | %s\n' "$stamp" "$message" >&8
+        flock -u 8
+    } 8>>"$file"
+}
+
+# The console snapshot is deliberately the only raw-console copy. It is a tail,
+# while activity.log records structured player events. Mask passwords, hide the
+# verified client's address, and redact the brand UUID from the synced copy.
 mask_console_tail() {
-    awk -v cache="$VERDICT_CACHE" -v hide="${HIDE_VERIFIED_IP:-true}" '
+    "${BG_PRIORITY[@]}" awk -v cache="$VERDICT_CACHE" -v hide="${HIDE_VERIFIED_IP:-true}" '
         BEGIN {
             while ((getline l < cache) > 0) {
                 n = index(l, "\t")
@@ -1240,24 +1275,26 @@ mask_console_tail() {
                     }
                 }
             }
+            # The console log has no reliable player marker on these replies,
+            # so redact protocol identity fields for every client.
+            if (index(line, "Eagler Client Brand:") > 0)
+                sub(/Eagler Client Brand:.*/, "Eagler Client Brand: [redacted]", line)
+            if (index(line, "Eagler Client UUID:") > 0)
+                sub(/Eagler Client UUID:.*/, "Eagler Client UUID: [redacted]", line)
             print line
         }'
 }
 
 
-# how the login logger is reported: logins.log row format + a status file so
-# "it is not logging logins" can be answered from the bucket in one look
+# One compact status snapshot is refreshed periodically; detailed events live
+# in activity.log and raw diagnostics in logs/console.log.
 LOG_STATUS_INTERVAL="${LOG_STATUS_INTERVAL:-60}"
-SCRIPT_VERSION="${SCRIPT_VERSION:-v2-gated-client}"
+SCRIPT_VERSION="${SCRIPT_VERSION:-v3-compact-logs}"
 
-# The login line is written before the client check has finished. When the IP
-# is hidden the tag is left off as well, so a login by the verified client is
-# just "DATE | LOGIN | name | hidden" with nothing marking it.
-if [ "$HIDE_VERIFIED_IP" = true ]; then
-    LOGIN_CLIENT_FIELD=""
-else
-    LOGIN_CLIENT_FIELD=" | client=CHECK PENDING"
-fi
+# A login is written immediately (so a failed client check cannot erase it).
+# The following CHECK row adds the final marker, and the IP stays hidden while
+# the verdict is pending or verified.
+LOGIN_CLIENT_FIELD=" | client=CHECK PENDING"
 
 # Open the Bungee console pipe now, before any background subshell exists, so
 # every part of this script can push console commands into the proxy.
@@ -1297,29 +1334,28 @@ echo " Java: $($JAVA -version 2>&1 | head -1)"
 echo " Bucket: $HF_BUCKET_HANDLE"
 [ -n "$OP_USERNAME" ] && echo " OP Account: $OP_USERNAME"
 echo " Plugins synced: WorldEdit, WorldGuard, MineResetLite, Shopkeepers, SafeTrade, Skript, PvPManager"
-echo " Security logs: $SEC_DIR"
-echo " Private logs:  $PRIV_DIR"
-echo " Both are synced to the bucket every ${LOG_SYNC_INTERVAL}s (full game-data sync: ${SYNC_INTERVAL}s):"
-echo "   ${HF_BUCKET_HANDLE}/game-data/security-logs/logins.log        logins + verdicts"
-echo "   ${HF_BUCKET_HANDLE}/game-data/security-logs/commands.log      every command"
-echo "   ${HF_BUCKET_HANDLE}/game-data/security-logs/client-checks.log verified/other/vanilla per login"
-echo "   ${HF_BUCKET_HANDLE}/game-data/security-logs/shared-ips.txt    shared-IP report"
+echo " Security logs: $ACTIVITY_LOG, addresses.txt, status.txt"
+echo " Private logs:  $PRIV_DIR (private bucket folder; passwords and real IPs)"
+echo " Curated logs sync every ${LOG_SYNC_INTERVAL}s; full game-data snapshot every ${SYNC_INTERVAL}s"
+echo "   ${HF_BUCKET_HANDLE}/game-data/security-logs/activity.log      logins, checks, commands, dated in Eastern time"
+echo "   ${HF_BUCKET_HANDLE}/game-data/security-logs/addresses.txt    one public IP summary (verified account omitted)"
+echo "   ${HF_BUCKET_HANDLE}/game-data/security-logs/status.txt       current logger health"
 if [ "$SYNC_PRIVATE_LOGS" = true ]; then
-    echo "   ${HF_BUCKET_HANDLE}/game-data/private-logs/auth.log          full /login lines (passwords!)"
-    echo "   ${HF_BUCKET_HANDLE}/game-data/private-logs/player-ips.log     real IPs of \"hidden\" lines"
-    echo "   ${HF_BUCKET_HANDLE}/game-data/private-logs/logins-real-ips.log, shared-ips-private.txt"
+    echo "   ${HF_BUCKET_HANDLE}/game-data/private-logs/auth.log          full other-player auth commands (passwords!)"
+    echo "   ${HF_BUCKET_HANDLE}/game-data/private-logs/addresses.log     full address history; keep the bucket private"
+    echo "   ${HF_BUCKET_HANDLE}/game-data/private-logs/addresses.txt    private address summary"
 else
-    echo "   (SYNC_PRIVATE_LOGS=false: auth.log / player-ips.log stay inside the Space)"
+    echo "   SYNC_PRIVATE_LOGS=false: prior private bucket logs are removed and no new ones upload"
 fi
 [ "$SYNC_CONSOLE_LOGS" = true ] && \
-    echo "   ${HF_BUCKET_HANDLE}/game-data/logs/{paper,bungee}.log        last ${CONSOLE_LOG_LINES} console lines (passwords masked)"
-echo " Login capture: the LoginSecurity/AuthMe password filters are neutralised at"
-echo "                startup, so /login reaches the console (see logger-status.log)"
+    echo "   ${HF_BUCKET_HANDLE}/game-data/logs/console.log               one masked Paper + Bungee tail"
+echo " Login capture: LoginSecurity filters are neutralised before Paper starts"
+echo "                (health details are in security-logs/status.txt)"
 if [ "$HIDE_VERIFIED_IP" = true ]; then
-    echo " The verified client is hidden in the security-logs: its IP is written as"
-    echo " \"hidden\" and it gets no client=... tag / VERIFY line"
+    echo " The verified client's IP is hidden in the public activity/address logs;"
+    echo " the client marker remains visible so the owner can identify their lines."
 fi
-echo " Verified client: $VERIFIED_CLIENT_BRAND ($VERIFIED_CLIENT_UUID)"
+echo " Verified client: configured (brand/UUID values are not printed to logs)"
 if [ "$ENFORCE_VERIFIED_CLIENT" = true ]; then
     echo " Enforce verified client: ON - only the verified client may join"
     echo "   -> kick vanilla clients too: $ENFORCE_KICK_VANILLA | kick unresolved checks: $ENFORCE_KICK_ON_UNKNOWN"
@@ -1360,6 +1396,7 @@ PAPER_JVM_FLAGS=(
     -XX:-UseCodeCacheFlushing
     -Xss256k
     -Djline.terminal=jline.UnsupportedTerminal
+    -Duser.timezone=America/New_York
     -Dio.netty.allocator.maxCachedBufferCapacity=524288
     -Dio.netty.recycler.maxCapacityPerThread=0
     -Dio.netty.eventLoopThreads=${NETTY_THREADS}
@@ -1402,6 +1439,7 @@ BUNGEE_JVM_FLAGS=(
     -XX:MaxMetaspaceSize=128M
     -XX:ReservedCodeCacheSize=64M
     -Xss256k
+    -Duser.timezone=America/New_York
     -Dio.netty.allocator.maxCachedBufferCapacity=524288
     -Dio.netty.recycler.maxCapacityPerThread=0
     -Dio.netty.eventLoopThreads=${NETTY_THREADS}
@@ -1594,29 +1632,21 @@ proxy_peer_addrs() {   # the proxy's own addresses (kernel tables, no ss needed)
     python3 "$PROXY_PEERS_PY" --port "$GAME_PORT" 2>/dev/null
 }
 
-# Remember every peer we have seen: the proxy is not a single machine, and a
-# peer may be gone by the time a report is written. The list is written into
-# private-logs/ (which is restored from the bucket, so it survives a restart)
-# and a readable copy goes into the synced security-logs/.
+# Remember proxy peers in private state so a later address report can classify
+# them. The same list is included in addresses.txt; there is no second public
+# proxy-peers.txt copy to keep in sync.
 proxy_peers_record() {
     local addr new=0
     [ -n "$PRIV_DIR" ] || return 0
-    mkdir -p "$PRIV_DIR" "$SEC_DIR" 2>/dev/null
+    mkdir -p "$PRIV_DIR" 2>/dev/null
     touch "$PROXY_PEERS_STATE" 2>/dev/null
     while IFS= read -r addr; do
         [ -n "$addr" ] || continue
         grep -qF "$(printf '\t')$addr" "$PROXY_PEERS_STATE" 2>/dev/null && continue
-        printf '%s\t%s\n' "$(date '+%F %T')" "$addr" >> "$PROXY_PEERS_STATE" 2>/dev/null
+        printf '%s\t%s\n' "$(now_eastern)" "$addr" >> "$PROXY_PEERS_STATE" 2>/dev/null
         new=$((new + 1))
     done <<< "$(proxy_peer_addrs)"
     [ "${new:-0}" -gt 0 ] 2>/dev/null && echo "   proxy peers: $new new address(es) recorded"
-    {
-        echo "The addresses the proxy in front of the server connects from."
-        echo "An address in the logs that equals one of these is the PROXY's, not a player's."
-        echo "updated: $(date '+%F %T')"
-        echo ""
-        awk -F'\t' 'NF>1 {print "  " $2 "   (first seen " $1 ")"}' "$PROXY_PEERS_STATE" 2>/dev/null | sort -u
-    } > "$PROXY_PEERS_VIEW" 2>/dev/null
     return 0
 }
 
@@ -1642,7 +1672,7 @@ logged_ip_is_proxy() {
     return 1
 }
 
-# What a log line's address really is, in one sentence, for logger-status.log
+# What a log line's address really is, in one sentence, for security-logs/status.txt
 ip_evidence_line() {
     if ! proxy_peer_list 2>/dev/null | grep -q .; then
         echo "no proxy peer recorded yet - the players' addresses cannot be told from the proxy's"
@@ -1829,32 +1859,17 @@ start_bungee() {
 }
 
 # =============================================================
-# SECURITY LOGGER — logins/IPs + commands (append-only)
+# SECURITY LOGGER — one append-only activity stream
 # =============================================================
-# logins.log   : DATE | LOGIN  | name | ip | client=CHECK PENDING
-#                DATE | VERIFY | name | ip | <label> | brand=... | version=... | uuid=...
-#                DATE | LOGOUT | name | ip | client=...
-# commands.log : DATE | name | ip | command | client=...
-# shared-ips.txt : report of shared IPs / multi-IP accounts
+# security-logs/activity.log combines LOGIN, LOGOUT, CHECK and COMMAND rows.
+# It uses New York time, a 12-hour clock and a day divider, so the duplicate
+# login/command/check files from older builds are no longer needed.
 #
-# When HIDE_VERIFIED_IP=true the IP of the verified client is written as
-# "hidden" everywhere in these files and its "client=..." tag and VERIFY line
-# are left out, so a verified login is just "DATE | LOGIN | name | hidden".
-# Everybody else keeps the full ip / client=... information.
-#
-# VERIFIED CLIENT
-# client-checks.log : DATE | VERDICT | name | ip | brand=... | version=... | uuid=...
-#   VERIFIED   = the client from this repo (unique Eagler brand UUID)
-#   UNVERIFIED = some other Eaglercraft client / fork
-#   VANILLA    = a real Minecraft client (not Eaglercraft)
-#   UNKNOWN    = could not be checked
-#
-# private-logs/auth.log : DATE | name | ip | full /login command | client=...
-#                         (verified client: "/login ********" with ip=hidden,
-#                          password never written; everybody else: full command)
-#   every password-reset relevant command from everybody EXCEPT the verified
-#   client, so you can read "what password did they set" without ever writing
-#   your own password down. Never synced to the bucket.
+# Public activity/address reports hide the verified client's real IP, but keep
+# the explicit VERIFIED CLIENT marker visible. The private address history has
+# the full IPs. Password commands are masked in activity.log and kept in full
+# only in private-logs/auth.log for everyone except the verified client.
+# The verified brand and UUID are redacted from all synced logs.
 # =============================================================
 
 # last known (real) IP of a player - from the runtime map, so it also works
@@ -1870,14 +1885,35 @@ is_real_ip() {
     return 0
 }
 
-# record one sighting: every source is kept, with where it came from
+# Record one sighting in memory and in the private, date-divided history.
 record_ip() {
-    local name="$1" ip="$2" source="${3:-?}"
+    local name="$1" ip="$2" source="${3:-?}" epoch
     [ -n "$name" ] || return 0
-    printf '%s\t%s\t%s\t%s\n' "$name" "${ip:-unknown}" "$source" "$(date +%s)" >> "$IP_MAP"
+    epoch=$(date +%s)
+    printf '%s\t%s\t%s\t%s\n' "$name" "${ip:-unknown}" "$source" "$epoch" >> "$IP_MAP"
     if [ "$PRIVATE_IP_LOG" = true ]; then
-        printf '%s | %s | %s | source=%s\n' "$(date '+%F %T')" "$name" "${ip:-unknown}" "$source" >> "$IP_MAP_FILE"
+        append_dated_log "$IP_MAP_FILE" "$epoch" "IP | $name | ${ip:-unknown} | source=$source"
     fi
+}
+
+# Recover the persistent private address history after a Space restart. The
+# runtime TSV stays a fast, per-account cache; it is never copied to the bucket.
+restore_ip_map() {
+    local stamp type name ip source epoch
+    [ -s "$IP_MAP_FILE" ] || return 0
+    while IFS='|' read -r stamp type name ip source; do
+        stamp="${stamp# }"; stamp="${stamp% }"
+        type="${type# }"; type="${type% }"
+        [ "$type" = IP ] || continue
+        name="${name# }"; name="${name% }"
+        ip="${ip# }"; ip="${ip% }"
+        source="${source# }"; source="${source% }"
+        source="${source#source=}"
+        [[ "$stamp" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2} ]] || continue
+        epoch=$(date -d "$stamp" +%s 2>/dev/null) || continue
+        [ -n "$name" ] && [ -n "$ip" ] || continue
+        printf '%s\t%s\t%s\t%s\n' "$name" "$ip" "${source:-?}" "$epoch" >> "$IP_MAP"
+    done < "$IP_MAP_FILE"
 }
 
 # The most recent *real* address of a player. Sources are treated equally but
@@ -1915,19 +1951,10 @@ hide_ip_for() {
     esac
 }
 
-# " | client=LABEL" for a log line. While the owner's identity is hidden only
-# the clients that are definitely not the verified one are tagged (and those
-# are the lines that also carry a real IP), so nothing in the synced logs
-# points back at the verified client.
+# The explicit client marker is useful to the owner and does not expose the
+# address: verified/pending IPs are still rendered as "hidden" separately.
 client_field() {
-    local v="${1:-UNKNOWN}"
-    if [ "$HIDE_VERIFIED_IP" = true ]; then
-        case "$v" in
-            UNVERIFIED|VANILLA) ;;
-            *) return 0 ;;
-        esac
-    fi
-    printf ' | client=%s' "$(verdict_label "$v")"
+    printf ' | client=%s' "$(verdict_label "${1:-UNKNOWN}")"
 }
 
 # -------------------------------------------------------------
@@ -1948,7 +1975,7 @@ verdict_for() {
 
 # Human readable form used next to logins/commands so the raw logs say it
 # plainly. VERIFIED CLIENT is the only label containing that phrase, so
-# "grep 'VERIFIED CLIENT' logins.log" always means "this was my client".
+# "grep 'VERIFIED CLIENT' activity.log" identifies the verified account.
 verdict_label() {
     case "${1:-UNKNOWN}" in
         VERIFIED)   echo "VERIFIED CLIENT" ;;
@@ -1962,8 +1989,8 @@ verdict_label() {
 # -------------------------------------------------------------
 # Password / register / login commands
 # -------------------------------------------------------------
-# auth-style commands are masked in commands.log (which can be read by other
-# people and is synced) but kept in full in private-logs/auth.log, so a lost
+# auth-style commands are masked in activity.log (which is synced) but kept
+# in full in private-logs/auth.log, so a lost
 # password can be looked up. The verified client's own commands are the one
 # exception: your password is never written anywhere.
 is_auth_cmd() {
@@ -2008,9 +2035,9 @@ flush_pending_auth() {
             # command happened, so auth.log shows the capture path working
             write_auth_masked "$name" "$cmd" "VERIFIED CLIENT" "$v" "$epoch"
         elif [ "$v" != "PENDING" ]; then
-            echo "$(date -d "@$epoch" '+%F %T') | $name | $ip | $cmd | client=$(verdict_label "$v")" >> "$AUTH_LOG"
+            append_dated_log "$AUTH_LOG" "$epoch" "$name | $ip | $cmd | client=$(verdict_label "$v")"
         elif [ $(( $(date +%s) - epoch )) -gt 300 ]; then
-            echo "$(date -d "@$epoch" '+%F %T') | $name | $ip | $cmd | client=UNKNOWN CLIENT (check never resolved)" >> "$AUTH_LOG"
+            append_dated_log "$AUTH_LOG" "$epoch" "$name | $ip | $cmd | client=UNKNOWN CLIENT (check never resolved)"
         else
             printf '%s\t%s\t%s\n' "$epoch" "$name" "$cmd" >> "$tmp"
         fi
@@ -2031,7 +2058,7 @@ write_auth_masked() {
         fi
     fi
     [ -n "$epoch" ] || epoch=$(date +%s)
-    echo "$(date -d "@$epoch" '+%F %T') | $name | $ip | ${cmd%% *} ******** | client=$label (password not recorded)" >> "$AUTH_LOG"
+    append_dated_log "$AUTH_LOG" "$epoch" "$name | $ip | ${cmd%% *} ******** | client=$label (password not recorded)"
 }
 
 # mask passwords in the log lines that leave the Space; the full command is
@@ -2065,7 +2092,7 @@ mask_cmd() {
                             if ! auth_seen_recently "$name" "$cmd"; then
                                 record_auth_seen "$name" "$cmd"
                                 ip=$(last_ip_for "$name"); ip="${ip:-unknown}"
-                                echo "$(date '+%F %T') | $name | $ip | $cmd | client=$(verdict_label "$verdict")" >> "$AUTH_LOG"
+                                append_dated_log "$AUTH_LOG" "$(date +%s)" "$name | $ip | $cmd | client=$(verdict_label "$verdict")"
                             fi ;;
                     esac ;;
             esac
@@ -2108,12 +2135,12 @@ record_login() {
     local name="$1" ip="${2:-unknown}" src="${3:-?}"
     is_real_ip "$ip" && record_ip "$name" "$ip" "$src"
     if is_online "$name"; then
-        return 0                     # this join is already in logins.log
+        return 0                     # this join is already in activity.log
     fi
     mark_online "$name"
-    echo "$(date '+%F %T') | LOGIN | $name | $(ip_field "$name" "$ip" PENDING)${LOGIN_CLIENT_FIELD:-}" >> "$LOGIN_LOG"
+    append_dated_log "$LOGIN_LOG" "$(date +%s)" "LOGIN | $name | $(ip_field "$name" "$ip" PENDING)${LOGIN_CLIENT_FIELD:-}"
     set_verdict "$name" PENDING
-    echo "[LOG] LOGIN  $name (seen by $src)"
+    echo "[$(now_eastern)] [LOG] LOGIN  $name (seen by $src)"
     check_player_client "$name" "$ip" &
 }
 
@@ -2123,8 +2150,8 @@ record_logout() {
     mark_offline "$name"
     v=$(verdict_for "$name")
     ip=$(last_ip_for "$name")
-    echo "$(date '+%F %T') | LOGOUT | $name | $(ip_field "$name" "${ip:-unknown}" "$v")$(client_field "$v")" >> "$LOGIN_LOG"
-    echo "[LOG] LOGOUT $name (seen by $src)"
+    append_dated_log "$LOGIN_LOG" "$(date +%s)" "LOGOUT | $name | $(ip_field "$name" "${ip:-unknown}" "$v")$(client_field "$v")"
+    echo "[$(now_eastern)] [LOG] LOGOUT $name (seen by $src)"
 }
 
 # -------------------------------------------------------------
@@ -2152,7 +2179,7 @@ playerlist_names() {   # pull the names out of a `list` answer
 
 playerlist_check() {
     local raw names name ip
-    PLAYERLIST_LAST="$(date '+%T')"
+    PLAYERLIST_LAST="$(now_eastern)"
     raw=$(mc_command "list" 2>/dev/null)
     if [ -n "$raw" ]; then
         PLAYERLIST_LAST="$PLAYERLIST_LAST got: $(printf '%s' "$raw" | tr -d '\n' | cut -c1-120)"
@@ -2184,7 +2211,7 @@ playerlist_check() {
 
 playerlist_loop() {
     while true; do
-        sleep "${PLAYERLIST_POLL:-20}"
+        sleep "${PLAYERLIST_POLL:-60}"
         playerlist_check || true
     done
 }
@@ -2195,11 +2222,10 @@ playerlist_loop() {
 # so the patterns match the payload only and never the prefix. Anything the
 # patterns miss is still caught by the RCON player list (see playerlist_check).
 handle_paper_line() {
-    local line="${1%$'\r'}" name ip cmd v NOW
+    local line="${1%$'\r'}" name ip cmd v
     local LOGIN_RE='([A-Za-z0-9_.-]{1,16})\[/([^]]+):[0-9]+\] logged in with entity id'
     local CMD_RE='([A-Za-z0-9_.-]{1,16}) issued server command: (.*)$'
     local LEAVE_RE='([A-Za-z0-9_.-]{1,16}) (left the game|lost connection)'
-    NOW=$(date '+%F %T')
 
     if [[ "$line" =~ $LOGIN_RE ]]; then
         name="${BASH_REMATCH[1]}"; ip="${BASH_REMATCH[2]}"
@@ -2209,7 +2235,7 @@ handle_paper_line() {
         v=$(verdict_for "$name")
         cmd=$(mask_cmd "$name" "${BASH_REMATCH[2]}" "$v")
         ip=$(last_ip_for "$name")
-        echo "$NOW | $name | $(ip_field "$name" "${ip:-unknown}" "$v") | $cmd$(client_field "$v")" >> "$CMD_LOG"
+        append_dated_log "$CMD_LOG" "$(date +%s)" "COMMAND | $name | $(ip_field "$name" "${ip:-unknown}" "$v") | $cmd$(client_field "$v")"
     elif [[ "$line" =~ $LEAVE_RE ]]; then
         record_logout "${BASH_REMATCH[1]}" paper
     fi
@@ -2227,12 +2253,11 @@ handle_paper_line() {
 # never appear here - the auth lines come from Paper's console instead, which is
 # why the plugins' password filters have to be patched (see AUTH LOG CAPTURE).
 handle_bungee_line() {
-    local line="${1%$'\r'}" name ip cmd v NOW
+    local line="${1%$'\r'}" name ip cmd v
     local JOIN_RE='([A-Za-z0-9_.-]{1,16})\[/([^]]+):[0-9]+\] <-> ServerConnector \[?[^]]*\]? has connected'
     local SEEN_RE='([A-Za-z0-9_.-]{1,16})\[/([^]]+):[0-9]+\] <-> InitialHandler has connected'
     local QUIT_RE='([A-Za-z0-9_.-]{1,16})\[/([^]]+):[0-9]+\] <-> UpstreamBridge has disconnected'
     local BC_RE='([A-Za-z0-9_.-]+)\]? executed command: (.*)$'
-    NOW=$(date '+%F %T')
 
     if [[ "$line" =~ $JOIN_RE ]]; then
         name="${BASH_REMATCH[1]}"; ip="${BASH_REMATCH[2]}"
@@ -2250,7 +2275,7 @@ handle_bungee_line() {
         v=$(verdict_for "$name")
         cmd=$(mask_cmd "$name" "${BASH_REMATCH[2]}" "$v")
         ip=$(last_ip_for "$name")
-        echo "$NOW | $name | $(ip_field "$name" "${ip:-unknown}" "$v") | [bungee] $cmd$(client_field "$v")" >> "$CMD_LOG"
+        append_dated_log "$CMD_LOG" "$(date +%s)" "COMMAND | $name | $(ip_field "$name" "${ip:-unknown}" "$v") | [bungee] $cmd$(client_field "$v")"
     fi
 }
 
@@ -2371,7 +2396,7 @@ warn_verified_client_mismatch() {
     [ "${builtin%%|*}" = "$VERIFIED_CLIENT_BRAND" ] && return 0
     echo ""
     echo "!! VERIFIED CLIENT: the pair in the environment (${VERIFIED_CLIENT_BRAND})"
-    echo "!!   is not the one this build was made for (hidden, see logger-status.log)."
+    echo "!!   is not the one this build was made for (hidden, see security-logs/status.txt)."
     echo "!!   If you just rotated the client, delete the old secrets"
     echo "!!   (VERIFIED_CLIENT_BRAND / VERIFIED_CLIENT_UUID) and restart."
     echo ""
@@ -2386,8 +2411,18 @@ warn_verified_client_problem() {
     echo ""
 }
 
+remember_verified_player() {
+    local name="$1"
+    mkdir -p "$PRIV_DIR" 2>/dev/null
+    {
+        flock -x 8
+        grep -qxF "$name" "$VERIFIED_PLAYER_STATE" 2>/dev/null || printf '%s\n' "$name" >&8
+        flock -u 8
+    } 8>>"$VERIFIED_PLAYER_STATE"
+}
+
 check_player_client() {
-    local name="$1" ip="$2" res verdict brand version uuid mcbrand now
+    local name="$1" ip="$2" res verdict brand version uuid mcbrand now shown_ip
     sleep 1   # give the Eagler handshake a moment to finish
     res=$(query_client_brand "$name")
     IFS='|' read -r verdict brand version uuid mcbrand <<< "$res"
@@ -2397,20 +2432,20 @@ check_player_client() {
         IFS='|' read -r verdict brand version uuid mcbrand <<< "$res"
     fi
 
-    now=$(date '+%F %T')
+    now=$(date +%s)
     verdict="${verdict:-UNKNOWN}"
     set_verdict "$name" "$verdict"
+    [ "$verdict" = VERIFIED ] && remember_verified_player "$name"
     flush_pending_auth
-    local shown_ip=$(ip_field "$name" "$ip" "$verdict")
-    echo "$now | ${verdict} | $name | $shown_ip | brand=${brand:-?} | version=${version:-?} | uuid=${uuid:-?}" >> "$CLIENT_LOG"
-    # Everybody except the verified client also gets a plainly readable VERIFY
-    # line in logins.log, so logins.log alone answers "was this me?" with
-    # "grep 'VERIFIED CLIENT' logins.log". For the verified client the line is
-    # omitted (see client_field) - a login by it is just LOGIN + LOGOUT.
-    if [ "$verdict" != "VERIFIED" ] || [ "$HIDE_VERIFIED_IP" != true ]; then
-        echo "$now | VERIFY | $name | $shown_ip | $(verdict_label "$verdict") | brand=${brand:-?} | version=${version:-?} | uuid=${uuid:-?}" >> "$LOGIN_LOG"
+    shown_ip=$(ip_field "$name" "$ip" "$verdict")
+    if [ "$verdict" = VERIFIED ]; then
+        # Keep the verified marker useful, but do not put the current brand or
+        # UUID in the synced activity or console snapshots.
+        brand="redacted"
+        uuid="redacted"
     fi
-    echo "[CLIENT] $(date '+%H:%M:%S') $name ($shown_ip): ${verdict} / $(verdict_label "$verdict") brand=${brand:-?} version=${version:-?}"
+    append_dated_log "$CLIENT_LOG" "$now" "CHECK | $name | $shown_ip | client=$(verdict_label "$verdict") | brand=${brand:-?} | version=${version:-?} | uuid=${uuid:-?}"
+    echo "[$(format_epoch_eastern "$now")] [CLIENT] $name ($shown_ip): ${verdict} / $(verdict_label "$verdict")"
 
     enforce_client_policy "$name" "$verdict"
 }
@@ -2461,116 +2496,108 @@ enforce_client_policy() {
 }
 
 # =============================================================
-# Shared IP / verified client report
+# Address report (one public view and one private view)
 # =============================================================
-# $1 = logins.log-style file to analyse, $2 = file to write
-shared_report_body() {
-    awk -F' [|] ' '
-        $2=="LOGIN" {
-            ip=$4; n=$3
-            if (!((ip SUBSEP n) in s1)) { s1[ip,n]=1; ipn[ip]=ipn[ip] " " n; ipc[ip]++ }
-            if (!((n SUBSEP ip) in s2)) { s2[n,ip]=1; nip[n]=nip[n] " " ip; nc[n]++ }
-        }
-        END {
-            print "=== IPs used by MULTIPLE accounts ==="
-            for (i in ipc) if (ipc[i]>1) print i " ->" ipn[i]
-            print ""
-            print "=== Accounts logged in from MULTIPLE IPs ==="
-            for (n in nc) if (nc[n]>1) print n " ->" nip[n]
-        }' "$1" > "$2"
-
-    {
-        echo ""
-        echo "=== Verified client checks (client-checks.log) ==="
-        if [ -s "$CLIENT_LOG" ]; then
-            awk -F' \\| ' '
-                { c[$2]++; last[$2]=$0 }
-                END {
-                    for (k in c) print k ": " c[k] " login(s)    (last seen " last[k] ")"
-                }' "$CLIENT_LOG" | sort
-            echo ""
-            echo "=== Logins NOT using the verified client ==="
-            grep -E "UNVERIFIED|VANILLA" "$CLIENT_LOG" 2>/dev/null | tail -20
-        else
-            echo "no client checks recorded yet"
-        fi
-    } >> "$2"
-}
-
-# Per-account IP report: every address a player was seen from, where it came
-# from and how often. This is the file to look at when two accounts show the
-# same IP (or one account turns up with several) - a proxy address appears here
-# for every account, a real client address does not.  With $3=yes the owner's
-# own addresses are left out, for the copy that gets synced.
+# Builds one deterministic snapshot with account/address pairs, shared IPs,
+# proxy-vs-player classification and dual-stack notes. The public report omits
+# every account ever marked VERIFIED; the private address history remains the
+# place to read the owner's real address.
 ip_report_body() {
-    local map="$1" out="$2" skip_verified="${3:-no}" skip=""
+    local map="$1" out="$2" skip_verified="${3:-no}" skip="" name tmp
     if [ "$skip_verified" = yes ]; then
-        skip=$(awk -F'\t' '{print $1}' "$map" 2>/dev/null | sort -u | while IFS= read -r n; do
-                   [ -n "$n" ] || continue
-                   [ "$(verdict_for "$n")" = "VERIFIED" ] && printf '%s,' "$n"
-               done)
+        while IFS= read -r name; do
+            [ -n "$name" ] || continue
+            if [ "$(verdict_for "$name")" = VERIFIED ] || \
+               grep -qxF "$name" "${VERIFIED_PLAYER_STATE:-/dev/null}" 2>/dev/null; then
+                skip="${skip}${skip:+,}$name"
+            fi
+        done < <(awk -F'\t' 'NF>0 {print $1}' "$map" 2>/dev/null | sort -u)
     fi
-    awk -F'\t' -v skip="$skip" -v peersfile="${PROXY_PEERS_STATE:-}" '
-        BEGIN {
-            m = split(skip, a, ","); for (i = 1; i <= m; i++) if (a[i] != "") hidden[a[i]] = 1
-            if (peersfile != "") {
-                while ((getline l < peersfile) > 0) {
-                    p = index(l, "\t")
-                    if (p > 1) {
-                        addr = substr(l, p + 1)
-                        if (addr != "") { peer[addr] = 1; npeer++ }
+    tmp="${out}.tmp"
+    mkdir -p "$(dirname "$out")" 2>/dev/null
+    {
+        printf '00\tIP ADDRESS REPORT\n'
+        printf '01\tUpdated: %s\n' "$(now_eastern)"
+        if [ "$skip_verified" = yes ]; then
+            printf '02\tVerified-client addresses are omitted from this public report.\n'
+        else
+            printf '02\tPrivate report includes the verified-client real address.\n'
+        fi
+        awk -F'\t' -v skip="$skip" -v peersfile="${PROXY_PEERS_STATE:-}" '
+            BEGIN {
+                m = split(skip, a, ",")
+                for (i = 1; i <= m; i++) if (a[i] != "") hidden[a[i]] = 1
+                if (peersfile != "") {
+                    while ((getline l < peersfile) > 0) {
+                        p = index(l, "\t")
+                        if (p > 1) {
+                            addr = substr(l, p + 1)
+                            if (addr != "" && !(addr in peer)) { peer[addr] = 1; npeer++ }
+                        }
+                    }
+                    close(peersfile)
+                }
+            }
+            $1 != "" && $2 != "" && $2 != "unknown" && $2 != "hidden" && !($1 in hidden) {
+                pair = $1 SUBSEP $2
+                if (!(pair in seen_pair)) {
+                    seen_pair[pair] = 1
+                    owner[pair] = $1
+                    address[pair] = $2
+                }
+                hits[pair]++
+                if (!source_seen[pair SUBSEP $3]++)
+                    sources[pair] = sources[pair] (sources[pair] ? ", " : "") $3
+                if (!account_seen[$2 SUBSEP $1]++) {
+                    accounts[$2] = accounts[$2] (accounts[$2] ? ", " : "") $1
+                    account_count[$2]++
+                }
+                rows++
+                if (!($2 in peer)) families[$1] = families[$1] (index($2, ":") ? "6" : "4")
+            }
+            END {
+                print "03\t"
+                print "04\tACCOUNTS AND ADDRESSES"
+                if (rows == 0) print "05\t(no real addresses recorded yet)"
+                for (pair in hits)
+                    print "05\t" owner[pair] "\t" address[pair] "\t" sources[pair] " (seen " hits[pair] " time(s))"
+                print "06\t"
+                print "07\tADDRESSES SHARED BY ACCOUNTS"
+                found = 0
+                for (ip in account_count) if (account_count[ip] > 1) {
+                    print "08\t" ip "\t" accounts[ip]
+                    found = 1
+                }
+                if (!found) print "08\t(none)"
+                print "09\t"
+                print "10\tPROXY VS PLAYER ADDRESSES"
+                if (npeer == 0) print "11\t(no proxy peer recorded yet)"
+                proxied = 0; client = 0
+                for (ip in account_count) {
+                    if (ip in peer) {
+                        print "11\t" ip "\tPROXY address (not a player)\t" account_count[ip] " account(s)"
+                        proxied++
+                    } else {
+                        print "11\t" ip "\treal client address\t" account_count[ip] " account(s)"
+                        client++
                     }
                 }
-            }
-        }
-        $1 != "" && $2 != "" && $2 != "unknown" && $2 != "hidden" && !($1 in hidden) {
-            pair = $1 SUBSEP $2
-            if (!(pair in seen)) {
-                seen[pair] = 1
-                sources[pair] = $3
-                ips[$1] = ips[$1] (ips[$1] ? ", " : "") $2 " (" $3 ")"
-            }
-            hits[pair]++
-            rows++
-            who[$2] = who[$2] " " $1
-            users[$2]++
-            if (!($2 in peer)) fam[$1] = fam[$1] (index($2, ":") ? "6" : "4")
-        }
-        END {
-            print "=== Accounts and the IPs they were seen from ==="
-            for (pair in hits) {
-                split(pair, parts, SUBSEP)
-                print "  " parts[1] " -> " parts[2] " (" sources[pair] ") x" hits[pair]
-            }
-            if (rows == 0) print "  (no IPs recorded yet)"
-            print ""
-            print "=== One IP, several accounts ==="
-            for (ip in users) if (users[ip] > 1) print "  " ip " ->" who[ip]
-            print ""
-            print "=== Which address is a real client address ==="
-            if (npeer == 0) print "  (no proxy peer recorded yet - see security-logs/proxy-peers.txt)"
-            for (ip in users) {
-                if (ip in peer) print "  " ip " -> the PROXY address (not a player), " users[ip] " account(s)"
-                else            print "  " ip " -> a real client address (not a proxy peer), " users[ip] " account(s)"
-            }
-            proxied = 0; own = 0
-            for (ip in users) { if (ip in peer) proxied++; else own++ }
-            if (rows > 0) {
-                if (own == 0)          print "  verdict: every address here is the PROXY address - the real client IPs are not in these logs"
-                else if (proxied == 0) print "  verdict: the addresses here are the real client addresses (a forwarded header is in use)"
-                else                   print "  verdict: both kinds are present - a row with the PROXY address had no forwarded header"
-            }
-            print ""
-            print "=== One device, two protocols (IPv4 + IPv6) ==="
-            duals = 0
-            for (n in fam) {
-                if (fam[n] ~ /4/ && fam[n] ~ /6/) {
-                    print "  " duals + 1 " account(s) -> seen over IPv4 and IPv6 - that is one device, not two"
+                if (rows > 0) {
+                    if (client == 0) print "12\tEvery logged address is a proxy peer; forwarded client IPs are unavailable."
+                    else if (proxied == 0) print "12\tAll logged addresses are client addresses (forwarded IP is working)."
+                    else print "12\tBoth proxy and client addresses are present; some connections lack a forwarded IP."
+                }
+                print "13\t"
+                print "14\tACCOUNTS SEEN OVER BOTH IPv4 AND IPv6"
+                duals = 0
+                for (n in families) if (families[n] ~ /4/ && families[n] ~ /6/) {
+                    print "15\t" n "\tone device/account using both protocols"
                     duals++
                 }
-            }
-            if (duals == 0) print "  (none)"
-        }' "$map" 2>/dev/null | sort > "$out"
+                if (!duals) print "15\t(none)"
+            }' "$map"
+    } | LC_ALL=C sort -t "$(printf '\t')" -k1,1 -k2,2 -k3,3 | cut -f2- > "$tmp"
+    mv "$tmp" "$out"
 }
 
 # What "the IP in the log" really is: the player's own address when a forwarded
@@ -2588,87 +2615,63 @@ real_client_ip_line() {
 }
 
 # =============================================================
-# LOGGER STATUS  (security-logs/logger-status.log)
+# LOGGER STATUS (security-logs/status.txt)
 # =============================================================
-# "It is not logging logins" used to be unanswerable from outside: the file was
-# empty and there was no way to tell whether the server saw no joins, or the
-# lines arrived in a shape the parser did not know. This file says which, and
-# prints the raw lines the parser is being fed, so a mismatch is visible in the
-# bucket without access to the Space.
+# This is a small, replace-in-place health snapshot. It deliberately avoids
+# rescanning the growing event log once a minute; raw parser input is in the
+# single, masked console snapshot instead.
 write_logger_status() {
-    local out="$SEC_DIR/logger-status.log" tmp
+    local out="${STATUS_FILE:-$SEC_DIR/status.txt}" tmp paper_bytes bungee_bytes activity_bytes
     [ -n "$SEC_DIR" ] || return 0
     mkdir -p "$SEC_DIR" 2>/dev/null
     tmp="${out}.tmp"
+    paper_bytes=$(stat -c%s /tmp/paper.log 2>/dev/null || echo 0)
+    bungee_bytes=$(stat -c%s /tmp/bungee.log 2>/dev/null || echo 0)
+    activity_bytes=$(stat -c%s "$ACTIVITY_LOG" 2>/dev/null || echo 0)
     {
-        echo "verified-client logger status   $(date '+%F %T')"
-        echo "version        : ${SCRIPT_VERSION:-unknown}"
-        echo "paper.log      : $(wc -l < /tmp/paper.log 2>/dev/null || echo 0) lines"
-        echo "bungee.log     : $(wc -l < /tmp/bungee.log 2>/dev/null || echo 0) lines"
-        echo "online now     : $(tr '\n' ' ' < "${ONLINE_STATE:-/dev/null}" 2>/dev/null)"
-        echo "logins.log     : $(grep -c '| LOGIN |' "$LOGIN_LOG" 2>/dev/null) logins, $(grep -c '| LOGOUT |' "$LOGIN_LOG" 2>/dev/null) logouts"
-        echo "commands.log   : $(wc -l < "$CMD_LOG" 2>/dev/null || echo 0) rows"
-        echo "client-checks  : $(wc -l < "$CLIENT_LOG" 2>/dev/null || echo 0) rows"
-        echo "playerlist     : ${PLAYERLIST_LAST:-not polled yet}"
-        echo "real client IPs: $(real_client_ip_line)"
-        echo "proxy peers    : $(proxy_peer_list 2>/dev/null | tr '\n' ' ')"
-        echo "ip evidence    : $(ip_evidence_line)"
-        echo "login capture  : ${AUTH_PATCH_STATUS:-not run}"
+        echo "Server log status"
+        echo "Updated       : $(now_eastern)"
+        echo "Timezone      : America/New_York (EST/EDT), 12-hour clock"
+        echo "Build         : ${SCRIPT_VERSION:-unknown}"
+        echo "Online now    : $(tr '\n' ' ' < "${ONLINE_STATE:-/dev/null}" 2>/dev/null)"
+        echo "Activity log  : $activity_bytes bytes"
+        echo "Last activity : $(tail -n 1 "$ACTIVITY_LOG" 2>/dev/null || echo none)"
+        echo "Paper console : $paper_bytes bytes in /tmp/paper.log"
+        echo "Bungee console: $bungee_bytes bytes in /tmp/bungee.log"
+        echo "Player list   : ${PLAYERLIST_LAST:-not polled yet}"
+        echo "Client IPs    : $(real_client_ip_line)"
+        echo "Proxy peers   : $(proxy_peer_list 2>/dev/null | tr '\n' ' ')"
+        echo "IP evidence   : $(ip_evidence_line)"
+        echo "Login capture : ${AUTH_PATCH_STATUS:-not run}"
         if [ "$VERIFIED_CLIENT_CONFIGURED" = true ]; then
-            echo "verified client: ${VERIFIED_CLIENT_BRAND} (uuid ${VERIFIED_CLIENT_UUID})"
-            echo "  from         : ${VERIFIED_CLIENT_SOURCE:-?}$([ "$VERIFIED_CLIENT_SOURCE" = environment ] && echo " - the Space secrets win over the built-in pair")"
+            echo "Verified client: configured (value kept out of synced logs)"
         else
-            echo "verified client: NOT CONFIGURED (nobody is marked as you)"
+            echo "Verified client: NOT CONFIGURED (nobody is marked as you)"
         fi
         local _vcproblem
         _vcproblem=$(verified_client_problem)
         [ -n "$_vcproblem" ] && printf '%s\n' "$_vcproblem" | sed 's/^/  !! /'
-        echo "enforcement    : ENFORCE_VERIFIED_CLIENT=${ENFORCE_VERIFIED_CLIENT:-false} (false = everybody may join)"
-        echo "tail of logins.log:"
-        tail -3 "$LOGIN_LOG" 2>/dev/null | sed 's/^/  /'
-        echo ""
-        echo "--- raw lines the parsers see (last 6 login/command-like lines of each) ---"
-        echo "if a join is missing from logins.log, compare its shape with the patterns"
-        echo "paper.log:"
-        grep -a -E 'logged in|left the game|lost connection|issued server command|\.\[IP' /tmp/paper.log 2>/dev/null | tail -6 | sed 's/^/  /'
-        echo "bungee.log:"
-        grep -a -E 'has connected|has disconnected|executed command|disconnecting' /tmp/bungee.log 2>/dev/null | tail -6 | sed 's/^/  /'
+        echo "Enforcement   : ENFORCE_VERIFIED_CLIENT=${ENFORCE_VERIFIED_CLIENT:-false} (false = everybody may join)"
     } > "$tmp" 2>/dev/null
     mv "$tmp" "$out" 2>/dev/null
 }
 
 report_shared_ips() {
+    local now last
     flush_pending_auth
-    [ -s "$LOGIN_LOG" ] || return
-    ip_report_body "$IP_MAP" "$SEC_DIR/ip-report.log" yes
-    [ "$PRIVATE_IP_LOG" = true ] && ip_report_body "$IP_MAP" "$PRIV_DIR/ip-report-private.log" no
-    {
-        echo "=== Shared IP report $(date '+%F %T') ==="
-        [ "$HIDE_VERIFIED_IP" = true ] && \
-            echo "(the verified client's own IP shows as \"hidden\" here - see private-logs/shared-ips-private.txt)"
-    } > "$SHARED_REPORT"
-    shared_report_body "$LOGIN_LOG" "$SHARED_REPORT"
-
-    # private copy with the real IPs put back in, for your own analysis
-    if [ "$HIDE_VERIFIED_IP" = true ] && [ "$PRIVATE_IP_LOG" = true ]; then
-        local name ip line
-        : > "$PRIV_DIR/logins-real-ips.log"
-        while IFS= read -r line; do
-            if [[ "$line" == *"| hidden"* ]]; then
-                name=$(awk -F' [|] ' '{print $3}' <<<"$line")
-                ip=$(last_ip_for "$name")
-                line="${line//| hidden/| ${ip:-unknown}}"
-            fi
-            printf '%s\n' "$line" >> "$PRIV_DIR/logins-real-ips.log"
-        done < "$LOGIN_LOG"
-        echo "=== Shared IP report (real IPs) $(date '+%F %T') ===" > "$PRIV_DIR/shared-ips-private.txt"
-        shared_report_body "$PRIV_DIR/logins-real-ips.log" "$PRIV_DIR/shared-ips-private.txt"
-        {
-            echo ""
-            echo "=== Last 20 logins with their real IPs ==="
-            tail -20 "$PRIV_DIR/logins-real-ips.log"
-        } >> "$PRIV_DIR/shared-ips-private.txt"
+    now=$(date +%s)
+    last=$(cat "$REPORT_STATE" 2>/dev/null || echo 0)
+    if [[ "$last" =~ ^[0-9]+$ ]] && [ $((now - last)) -lt "$REPORT_INTERVAL" ] && \
+       [ -s "$ADDRESS_REPORT" ] && \
+       { [ "$PRIVATE_IP_LOG" != true ] || [ -s "$PRIVATE_ADDRESS_REPORT" ]; }; then
+        return 0
     fi
+    proxy_peers_record
+    ip_report_body "$IP_MAP" "$ADDRESS_REPORT" yes
+    if [ "$PRIVATE_IP_LOG" = true ]; then
+        ip_report_body "$IP_MAP" "$PRIVATE_ADDRESS_REPORT" no
+    fi
+    printf '%s\n' "$now" > "$REPORT_STATE"
 }
 
 # =============================================================
@@ -2829,12 +2832,19 @@ def cmd_sync(args):
     if not root.is_dir():
         fail(f"{root} is not a directory")
 
-    local = {rel: size for rel, _path, size in iter_local(root)}
     remote = list_remote(api, args.bucket_id, args.prefix)
 
-    add = [(str(path), join(args.prefix, rel), size)
-           for rel, path, size in iter_local(root)
-           if remote.get(rel) != size]
+    # Walk/stat the staged tree once. The previous two-pass implementation
+    # repeated os.walk + stat over every world file on every Python fallback
+    # sync, even though the staging tree is immutable for the duration of the
+    # upload. Keep only the local names needed by --delete and the changed-file
+    # upload list; this reduces work and avoids comparing two different walks.
+    local = set()
+    add = []
+    for rel, path, size in iter_local(root):
+        local.add(rel)
+        if remote.get(rel) != size:
+            add.append((str(path), join(args.prefix, rel), size))
     delete = [join(args.prefix, rel) for rel in remote
               if args.delete and rel not in local]
 
@@ -2920,12 +2930,363 @@ ensure_bucket_sync_py() {
 }
 # <<< embedded bucket_sync.py <<<
 
-# The bucket sync, the world copy and the log parsers run on the same two cores
-# as Paper.  They are pushed to the lowest CPU (and disk) priority so the tick
-# loop always wins the core: the upload then takes a little longer, but a player
-# never feels it as a lag spike.  Both tools are probed once - a container
-# without ionice (or without the permission to set an I/O class) silently falls
-# back to nice, and a container without nice runs them as before.
+# >>> embedded log_migrate.py (generated from tools/log_migrate.py) >>>
+write_log_migrator_py() {
+    mkdir -p "$(dirname "$LOG_MIGRATOR_PY")" 2>/dev/null
+    cat > "$LOG_MIGRATOR_PY" <<'LOG_MIGRATOR_PY_EOF'
+#!/usr/bin/env python3
+"""Migrate the old many-file logs into the compact, date-divided log layout.
+
+The old Docker image used UTC by default. Its timestamps are converted to the
+requested display timezone; new events are timestamped by start.sh directly in
+that zone. This does not rewrite or guess timestamps in the live Paper logs.
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import sys
+import tempfile
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+FORMAT_MARKER = "# log-format: 2"
+LEGACY_STAMP = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) \| (.*)$")
+
+VERDICT_LABELS = {
+    "VERIFIED": "VERIFIED CLIENT",
+    "UNVERIFIED": "OTHER EAGLERCRAFT CLIENT",
+    "VANILLA": "JAVA CLIENT",
+    "PENDING": "CHECK PENDING",
+    "CONSOLE_DOWN": "CONSOLE DOWN",
+    "UNKNOWN": "UNKNOWN CLIENT",
+}
+
+
+@dataclass(frozen=True)
+class Record:
+    epoch: float
+    order: int
+    message: str
+
+
+def _legacy_epoch(value: str) -> float:
+    """The old Debian image used UTC (its default); convert that wall time."""
+    parsed = datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
+    return parsed.replace(tzinfo=timezone.utc).timestamp()
+
+
+def _local_stamp(epoch: float, zone: ZoneInfo) -> tuple[str, str, str]:
+    local = datetime.fromtimestamp(epoch, zone)
+    day = local.strftime("%Y-%m-%d")
+    stamp = local.strftime("%Y-%m-%d %I:%M:%S %p %Z")
+    weekday = f"{local.strftime('%A, %B')} {local.day}, {local.year}"
+    return day, stamp, weekday
+
+
+def _read_timestamped(path: Path, zone: ZoneInfo, convert, order_start: int) -> list[Record]:
+    records: list[Record] = []
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return records
+
+    for index, line in enumerate(lines):
+        match = LEGACY_STAMP.match(line)
+        if not match:
+            if not line.strip() or line.startswith("#") or line.startswith("==="):
+                continue
+            # Do not silently throw away a malformed historical row. Keep it
+            # in a dated LEGACY event with an explicit unavailable timestamp.
+            epoch = datetime.now(timezone.utc).timestamp()
+            records.append(Record(epoch, order_start + index, f"LEGACY | timestamp unavailable | {line}"))
+            continue
+        epoch = _legacy_epoch(match.group(1))
+        message = convert(match.group(2))
+        if message:
+            records.append(Record(epoch, order_start + index, message))
+    return records
+
+
+def _activity_records(security_dir: Path) -> list[Record]:
+    records: list[Record] = []
+    checks_path = security_dir / "client-checks.log"
+    has_checks = checks_path.is_file() and checks_path.stat().st_size > 0
+
+    def keep_login(payload: str) -> str:
+        parts = payload.split(" | ", 1)
+        kind = parts[0]
+        if kind == "VERIFY":
+            # The old login file and client-checks.log both stored the same
+            # result. Prefer the richer check row below, exactly once.
+            if has_checks:
+                return ""
+            legacy = parts[1] if len(parts) > 1 else "legacy verification"
+            legacy = re.sub(r"(?i)(brand|uuid)=([^|]*)", r"\1=redacted", legacy)
+            return "CHECK | " + legacy
+        return payload
+
+    def command(payload: str) -> str:
+        return "COMMAND | " + payload
+
+    def check(payload: str) -> str:
+        parts = payload.split(" | ")
+        if len(parts) < 4:
+            return "CHECK | " + payload
+        verdict, name, ip = parts[0], parts[1], parts[2]
+        label = VERDICT_LABELS.get(verdict, "UNKNOWN CLIENT")
+        details = parts[3:]
+        if verdict == "VERIFIED":
+            # Do not move the verified client's real address, brand or UUID
+            # into the public activity log. The private address history remains
+            # the owner-readable source of the actual IP.
+            ip = "hidden"
+            version = next((p for p in details if p.startswith("version=")), "version=redacted")
+            details = ["brand=redacted", version, "uuid=redacted"]
+        return "CHECK | " + " | ".join([name, ip, f"client={label}", *details])
+
+    sources = (
+        ("logins.log", keep_login),
+        ("commands.log", command),
+        ("client-checks.log", check),
+    )
+    for source_index, (filename, transform) in enumerate(sources):
+        path = security_dir / filename
+        records.extend(_read_timestamped(path, ZoneInfo("UTC"), transform,
+                                         source_index * 1_000_000))
+    records.sort(key=lambda row: (row.epoch, row.order))
+    return records
+
+
+def _write_dated(path: Path, records: list[Record], zone: ZoneInfo, marker_note: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = [f"{FORMAT_MARKER}; timezone={zone.key}; 12-hour clock", marker_note]
+    current_day = None
+    for record in records:
+        day, stamp, weekday = _local_stamp(record.epoch, zone)
+        if day != current_day:
+            if current_day is not None:
+                lines.append("")
+            lines.append(f"==================== {weekday} | {day} ====================")
+            lines.append("")
+            current_day = day
+        lines.append(f"{stamp} | {record.message}")
+    payload = "\n".join(lines) + "\n"
+    mode = 0o600 if "private-logs" in path.parts else 0o644
+    try:
+        mode = path.stat().st_mode & 0o777
+    except OSError:
+        pass
+    fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(temp_name, mode)
+        os.replace(temp_name, path)
+    finally:
+        try:
+            os.unlink(temp_name)
+        except FileNotFoundError:
+            pass
+
+
+def _has_marker(path: Path) -> bool:
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as stream:
+            return FORMAT_MARKER in stream.readline()
+    except OSError:
+        return False
+
+
+def _migrate_append_log(path: Path, zone: ZoneInfo, transform=lambda x: x) -> bool:
+    if _has_marker(path):
+        return False
+    records = _read_timestamped(path, zone, transform, 0)
+    note = f"# Previous timestamps converted from the old container's UTC clock to {zone.key}."
+    _write_dated(path, records, zone, note)
+    return bool(records)
+
+
+def _verified_names(security_dir: Path, private_dir: Path) -> set[str]:
+    """Names already identified as the owner, from durable historical evidence."""
+    names: set[str] = set()
+
+    state = private_dir / "verified-players.txt"
+    if state.is_file():
+        names.update(line.strip().casefold() for line in state.read_text(
+            encoding="utf-8", errors="replace").splitlines() if line.strip())
+
+    for filename in ("client-checks.log", "logins.log"):
+        path = security_dir / filename
+        if not path.is_file():
+            continue
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            match = LEGACY_STAMP.match(line)
+            if not match:
+                continue
+            parts = match.group(2).split(" | ")
+            if not parts:
+                continue
+            if filename == "client-checks.log" and parts[0].upper() == "VERIFIED" and len(parts) > 1:
+                names.add(parts[1].casefold())
+            elif filename == "client-checks.log" and parts[0].upper() == "CHECK" and len(parts) > 1:
+                if any("VERIFIED CLIENT" in part.upper() for part in parts[2:]):
+                    names.add(parts[1].casefold())
+            elif filename == "logins.log" and parts[0].upper() in {"VERIFY", "CHECK"} and len(parts) > 1:
+                if any("VERIFIED" in part.upper() for part in parts[2:]):
+                    names.add(parts[1].casefold())
+    return names
+
+
+def _mask_verified_auth(names: set[str]):
+    """Never migrate a verified owner's historical auth password in clear."""
+    auth_command = re.compile(
+        r"^([^|]+) \| ([^|]+) \| (/(?:login|l|log|register|reg|unregister|unreg|"
+        r"changepassword|changepass|cp|authme))\b.*$", re.IGNORECASE)
+
+    def transform(payload: str) -> str:
+        match = auth_command.match(payload)
+        if not match or match.group(1).strip().casefold() not in names:
+            return payload
+        name = match.group(1).strip()
+        command = match.group(3)
+        return f"{name} | hidden | {command} ******** | client=VERIFIED CLIENT (password not recorded)"
+
+    return transform
+
+
+def _migrate_activity(security_dir: Path, zone: ZoneInfo) -> int:
+    target = security_dir / "activity.log"
+    if _has_marker(target):
+        return 0
+    records = _activity_records(security_dir)
+    note = (f"# Previous timestamps converted from UTC to {zone.key}; "
+            "VERIFIED brand and UUID values are redacted.")
+    _write_dated(target, records, zone, note)
+    return len(records)
+
+
+def _migrate_addresses(private_dir: Path, zone: ZoneInfo) -> int:
+    target = private_dir / "addresses.log"
+    if _has_marker(target):
+        return 0
+
+    records: list[Record] = []
+    candidates = [private_dir / "player-ips.log"]
+    # The old real-IP login file is another copy of information in the IP map.
+    # Only use it to fill a missing account/address pair; keep all sightings
+    # from player-ips.log as the canonical private history.
+    seen: set[tuple[str, str]] = set()
+
+    for line_index, line in enumerate(candidates[0].read_text(encoding="utf-8", errors="replace").splitlines()
+                                        if candidates[0].exists() else []):
+        match = LEGACY_STAMP.match(line)
+        if not match:
+            continue
+        rest = match.group(2).split(" | ")
+        if len(rest) < 3:
+            continue
+        name, ip, source = rest[0], rest[1], rest[2]
+        source = source.removeprefix("source=")
+        seen.add((name, ip))
+        records.append(Record(_legacy_epoch(match.group(1)), line_index,
+                              f"IP | {name} | {ip} | source={source}"))
+
+    private_logins = private_dir / "logins-real-ips.log"
+    if private_logins.exists():
+        for line_index, line in enumerate(private_logins.read_text(encoding="utf-8", errors="replace").splitlines(),
+                                           start=len(records)):
+            match = LEGACY_STAMP.match(line)
+            if not match:
+                continue
+            rest = match.group(2).split(" | ")
+            if len(rest) < 4 or rest[0] != "LOGIN":
+                continue
+            name, ip = rest[1], rest[2]
+            if ip in {"", "unknown", "hidden"} or (name, ip) in seen:
+                continue
+            seen.add((name, ip))
+            records.append(Record(_legacy_epoch(match.group(1)), line_index,
+                                  f"IP | {name} | {ip} | source=legacy-login"))
+
+    records.sort(key=lambda row: (row.epoch, row.order))
+    note = f"# Private address history; previous timestamps converted from UTC to {zone.key}."
+    _write_dated(target, records, zone, note)
+    return len(records)
+
+
+def migrate(security_dir: Path, private_dir: Path, zone_name: str) -> tuple[int, int, list[Path]]:
+    try:
+        zone = ZoneInfo(zone_name)
+    except ZoneInfoNotFoundError as exc:
+        raise SystemExit(f"unknown timezone {zone_name!r}; install tzdata") from exc
+    security_dir.mkdir(parents=True, exist_ok=True)
+    private_dir.mkdir(parents=True, exist_ok=True)
+
+    # Read ownership evidence before any legacy inputs are removed. The old
+    # private auth log remains available for other players, but a verified
+    # owner's legacy credentials are never copied into the new bucket log.
+    verified_names = _verified_names(security_dir, private_dir)
+    activity_count = _migrate_activity(security_dir, zone)
+    _migrate_append_log(private_dir / "auth.log", zone, _mask_verified_auth(verified_names))
+    address_count = _migrate_addresses(private_dir, zone)
+
+    # These were duplicate views of the same login/check/IP data. The new
+    # per-directory sync uses --delete so these also disappear from the bucket.
+    legacy_paths = [
+        security_dir / name for name in (
+            "logins.log", "commands.log", "client-checks.log", "shared-ips.txt",
+            "ip-report.log", "logger-status.log", "proxy-peers.txt",
+        )
+    ] + [
+        private_dir / name for name in (
+            "player-ips.log", "ip-report-private.log", "logins-real-ips.log",
+            "shared-ips-private.txt",
+        )
+    ]
+    removed = []
+    for path in legacy_paths:
+        try:
+            path.unlink()
+            removed.append(path)
+        except FileNotFoundError:
+            pass
+    return activity_count, address_count, removed
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("security_dir", type=Path)
+    parser.add_argument("private_dir", type=Path)
+    parser.add_argument("--timezone", default="America/New_York")
+    args = parser.parse_args(argv)
+    activity_count, address_count, removed = migrate(args.security_dir, args.private_dir, args.timezone)
+    print(f"log-migrate: activity_rows={activity_count} address_rows={address_count} "
+          f"legacy_files_removed={len(removed)} timezone={args.timezone}", flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+LOG_MIGRATOR_PY_EOF
+}
+ensure_log_migrator_py() {
+    [ -s "$LOG_MIGRATOR_PY" ] || write_log_migrator_py
+}
+# <<< embedded log_migrate.py <<<
+
+
+# Bucket sync, staging copies and log parsing compete with Paper for the
+# container's CPU and disk. Run their heavyweight subprocesses at lower
+# scheduling priority where the container allows it. This reduces contention,
+# but it does not impose a CPU cap or guarantee a particular TPS/lag outcome;
+# measure a live Space before claiming a gameplay improvement. Probe ionice and
+# retain nice as a fallback when I/O priority is unavailable.
 BG_PRIORITY=()
 if command -v ionice >/dev/null 2>&1 && ionice -c3 true >/dev/null 2>&1; then
     BG_PRIORITY=(nice -n 19 ionice -c3)
@@ -3033,73 +3394,132 @@ bucket_write_probe() {
 }
 
 hf_restore_saves() {
+    local out rc
     echo " Restoring game data..."
-    hf buckets sync "${HF_BUCKET_HANDLE}/game-data" "$BACKEND_DIR" 2>&1 | tail -5
+    out=$("${BG_PRIORITY[@]}" hf buckets sync "${HF_BUCKET_HANDLE}/game-data" "$BACKEND_DIR" 2>&1); rc=$?
+    printf '%s\n' "$out" | tail -5
+    [ $rc -eq 0 ] || echo "   [BUCKET] restore returned $rc; starting with whatever data is available"
     for dir in $SAVE_DIRS; do
         [ -e "$BACKEND_DIR/$dir" ] && echo "   Found: $dir"
     done
 }
 
-# Copying the whole world out and hashing it in the bucket costs CPU (and disk)
-# on the same two cores Paper runs on, so every run reports how long it took:
-# if the game hitches in a regular rhythm, these lines are the first thing to
-# look at (SYNC_INTERVAL is a Space variable if you want it less often).
+bucket_sync_lock() {
+    mkdir -p "$(dirname "$BUCKET_SYNC_LOCK")" 2>/dev/null || return 1
+    exec 8>>"$BUCKET_SYNC_LOCK"
+    flock -x 8
+}
+
+bucket_sync_unlock() {
+    flock -u 8 2>/dev/null || true
+    exec 8>&-
+}
+
+write_console_snapshot() {   # $1 = destination file
+    local out="$1" tmp captured
+    mkdir -p "$(dirname "$out")" 2>/dev/null
+    tmp="${out}.tmp"
+    captured=$(now_eastern)
+    {
+        echo "Server console snapshot"
+        echo "Captured: $captured (America/New_York; 12-hour ET)"
+        echo "Player events are in security-logs/activity.log."
+        if [ -f /tmp/paper.log ]; then
+            echo ""
+            echo "==================== PAPER (last ${CONSOLE_LOG_LINES} lines) ===================="
+            "${BG_PRIORITY[@]}" tail -n "$CONSOLE_LOG_LINES" /tmp/paper.log 2>/dev/null \
+                | mask_console_tail | sed 's/^/[PAPER] /'
+        fi
+        if [ -f /tmp/bungee.log ]; then
+            echo ""
+            echo "==================== BUNGEE (last ${CONSOLE_LOG_LINES} lines) ===================="
+            "${BG_PRIORITY[@]}" tail -n "$CONSOLE_LOG_LINES" /tmp/bungee.log 2>/dev/null \
+                | mask_console_tail | sed 's/^/[BUNGEE] /'
+        fi
+    } > "$tmp"
+    mv "$tmp" "$out"
+}
+
+# A full world snapshot is the only sync that walks the entire game-data tree.
+# It runs at low CPU/I/O priority and, by default, only every ten minutes. Log
+# reports are not regenerated here and this loop cannot overlap the log sync.
 hf_push_saves() {
-    report_shared_ips
-    local STAGING="$FULL_STAGING" out rc STARTED TOOK
+    local STAGING="$FULL_STAGING" item STARTED TOOK rc
     STARTED=$(date +%s)
-    rm -rf "$STAGING" && mkdir -p "$STAGING"
+    bucket_sync_lock || { echo "[SYNC] FAIL $(now_eastern) - could not acquire bucket lock"; return 1; }
+    "${BG_PRIORITY[@]}" rm -rf "$STAGING" && mkdir -p "$STAGING"
     for item in $SAVE_DIRS; do
+        # The current console snapshot is generated below; do not copy an old
+        # paper.log/bungee.log pair from a previous Space instance.
+        [ "$item" = logs ] && continue
         if [ -e "$BACKEND_DIR/$item" ]; then
             mkdir -p "$STAGING/$(dirname "$item")"
             "${BG_PRIORITY[@]}" cp -a "$BACKEND_DIR/$item" "$STAGING/$item"
         fi
     done
+    mkdir -p "$STAGING/logs"
+    if [ "$SYNC_CONSOLE_LOGS" = true ]; then
+        write_console_snapshot "$STAGING/logs/console.log"
+    fi
     if bucket_sync_dir "$STAGING" "${HF_BUCKET_HANDLE}/game-data" --delete; then
         TOOK=$(($(date +%s) - STARTED))
-        echo "[SYNC] OK $(date '+%H:%M:%S') via ${BUCKET_VIA:-?} (took ${TOOK}s)"
+        echo "[SYNC] OK $(now_eastern) via ${BUCKET_VIA:-?} (took ${TOOK}s)"
+        rc=0
     else
         TOOK=$(($(date +%s) - STARTED))
-        echo "[SYNC] FAIL $(date '+%H:%M:%S') - ${BUCKET_ERROR:-unknown error} (took ${TOOK}s)"
+        echo "[SYNC] FAIL $(now_eastern) - ${BUCKET_ERROR:-unknown error} (took ${TOOK}s)"
+        rc=1
     fi
-    rm -rf "$STAGING"
+    "${BG_PRIORITY[@]}" rm -rf "$STAGING"
+    bucket_sync_unlock
+    return "$rc"
 }
 
-# Fast log-only sync: the bucket is the only way to read the logs from outside
-# the Space, so the log folders are pushed every $LOG_SYNC_INTERVAL seconds
-# instead of waiting for the full game-data sync. No --delete here: this must
-# never remove anything from game-data (world, plugins, ...).
+# Log uploads are scoped to their own bucket prefixes. The old implementation
+# synced the whole game-data tree every minute (including all world regions),
+# and ran concurrently with the full backup; that duplicated file walking and
+# caused the large CPU bursts. The three small prefix syncs are serialized with
+# the world snapshot and prune obsolete duplicate log files safely.
 hf_push_logs() {
+    local STAGING="$LOG_STAGING" STARTED TOOK rc failed=0 files
+    STARTED=$(date +%s)
+    bucket_sync_lock || { echo "[LOGSYNC] FAIL $(now_eastern) - could not acquire bucket lock"; return 1; }
     flush_pending_auth
     report_shared_ips
-    proxy_peers_record
-    local STAGING="$LOG_STAGING" out rc STARTED TOOK
-    STARTED=$(date +%s)
-    rm -rf "$STAGING" && mkdir -p "$STAGING"
-    [ -d "$SEC_DIR" ] && cp -a "$SEC_DIR" "$STAGING/security-logs"
+    write_logger_status 2>/dev/null
+    "${BG_PRIORITY[@]}" rm -rf "$STAGING" && mkdir -p "$STAGING/security-logs" "$STAGING/private-logs" "$STAGING/logs"
+    [ -d "$SEC_DIR" ] && "${BG_PRIORITY[@]}" cp -a "$SEC_DIR/." "$STAGING/security-logs/"
     if [ "$SYNC_PRIVATE_LOGS" = true ] && [ -d "$PRIV_DIR" ]; then
-        cp -a "$PRIV_DIR" "$STAGING/private-logs"
+        "${BG_PRIORITY[@]}" cp -a "$PRIV_DIR/." "$STAGING/private-logs/"
     fi
     if [ "$SYNC_CONSOLE_LOGS" = true ]; then
-        mkdir -p "$STAGING/logs"
-        # mask_console_tail: no password and no verified-client address in the
-        # copies that leave the Space (auth.log keeps the full commands)
-        [ -f /tmp/paper.log ]  && tail -n "$CONSOLE_LOG_LINES" /tmp/paper.log  | mask_console_tail > "$STAGING/logs/paper.log"  2>/dev/null
-        [ -f /tmp/bungee.log ] && tail -n "$CONSOLE_LOG_LINES" /tmp/bungee.log | mask_console_tail > "$STAGING/logs/bungee.log" 2>/dev/null
+        write_console_snapshot "$STAGING/logs/console.log"
     fi
-    LOG_SYNC_FILES=$(cd "$STAGING" 2>/dev/null && find . -type f -printf '%P(%s) ' 2>/dev/null | sort)
-    if bucket_sync_dir "$STAGING" "${HF_BUCKET_HANDLE}/game-data"; then
-        TOOK=$(($(date +%s) - STARTED))
-        echo "[LOGSYNC] OK $(date '+%H:%M:%S') via ${BUCKET_VIA:-?} (took ${TOOK}s) (security-logs$([ "$SYNC_PRIVATE_LOGS" = true ] && echo ' + private-logs')$([ "$SYNC_CONSOLE_LOGS" = true ] && echo ' + console tails'))"
-        echo "          $(printf '%s' "$LOG_SYNC_FILES")"
+    files=$(cd "$STAGING" 2>/dev/null && find . -type f -printf '%P(%s) ' 2>/dev/null | sort)
+
+    bucket_sync_dir "$STAGING/security-logs" "${HF_BUCKET_HANDLE}/game-data/security-logs" --delete || failed=1
+    # When disabled, sync an empty prefix to remove previously uploaded private
+    # passwords/IPs rather than leaving sensitive stale copies in the bucket.
+    bucket_sync_dir "$STAGING/private-logs" "${HF_BUCKET_HANDLE}/game-data/private-logs" --delete || failed=1
+    # An empty directory intentionally removes stale paper.log/bungee.log copies.
+    bucket_sync_dir "$STAGING/logs" "${HF_BUCKET_HANDLE}/game-data/logs" --delete || failed=1
+
+    TOOK=$(($(date +%s) - STARTED))
+    if [ "$failed" -eq 0 ]; then
+        echo "[LOGSYNC] OK $(now_eastern) via ${BUCKET_VIA:-?} (took ${TOOK}s)"
+        echo "          $(printf '%s' "$files")"
+        rc=0
     else
-        TOOK=$(($(date +%s) - STARTED))
-        echo "[LOGSYNC] FAIL $(date '+%H:%M:%S') - ${BUCKET_ERROR:-unknown error} (took ${TOOK}s)"
+        echo "[LOGSYNC] FAIL $(now_eastern) - ${BUCKET_ERROR:-one or more log prefixes failed} (took ${TOOK}s)"
+        rc=1
     fi
-    rm -rf "$STAGING"
+    "${BG_PRIORITY[@]}" rm -rf "$STAGING"
+    bucket_sync_unlock
+    return "$rc"
 }
 
 hf_sync_loop() {
+    renice -n 19 -p "$BASHPID" >/dev/null 2>&1 || true
     while true; do
         sleep "$SYNC_INTERVAL"
         hf_push_saves
@@ -3107,6 +3527,7 @@ hf_sync_loop() {
 }
 
 log_sync_loop() {
+    renice -n 19 -p "$BASHPID" >/dev/null 2>&1 || true
     while true; do
         hf_push_logs
         sleep "$LOG_SYNC_INTERVAL"
@@ -3122,7 +3543,10 @@ hf_ensure_bucket
 bucket_write_probe || true
 hf_restore_saves
 mkdir -p "$SEC_DIR" "$PRIV_DIR"
-touch "$LOGIN_LOG" "$CMD_LOG" "$CLIENT_LOG" "$AUTH_LOG"
+ensure_log_migrator_py
+python3 "$LOG_MIGRATOR_PY" "$SEC_DIR" "$PRIV_DIR" --timezone "$TZ"
+touch "$ACTIVITY_LOG" "$AUTH_LOG"
+restore_ip_map
 : > "$ONLINE_STATE"
 echo ""
 
@@ -3467,10 +3891,11 @@ if [ "$PORT_READY" = true ]; then
     else
         echo "   bucket uploads: FAILING - see the [BUCKET] lines above"
     fi
-    echo "   security-logs/{logins,commands,client-checks}.log"
-    echo "                  + shared-ips.txt, ip-report.log, logger-status.log"
+    echo "   security-logs/{activity.log,addresses.txt,status.txt}"
     [ "$SYNC_PRIVATE_LOGS" = true ] && \
-        echo "   private-logs/{auth,player-ips,logins-real-ips,ip-report-private}.log"
+        echo "   private-logs/{auth.log,addresses.log,addresses.txt}"
+    [ "$SYNC_CONSOLE_LOGS" = true ] && \
+        echo "   logs/console.log (masked Paper + Bungee snapshot)"
     if [ "$VERIFIED_CLIENT_CONFIGURED" = true ]; then
         echo " Verified client: $VERIFIED_CLIENT_BRAND  (uuid $VERIFIED_CLIENT_UUID)"
         echo "   pair from: $VERIFIED_CLIENT_SOURCE$([ "$VERIFIED_CLIENT_SOURCE" = environment ] && echo ' (Space secrets override the built-in pair)')"
@@ -3479,7 +3904,7 @@ if [ "$PORT_READY" = true ]; then
         echo "                  the Space's Variables and secrets (nobody is marked as you)"
     fi
     echo "   everybody may join (ENFORCE_VERIFIED_CLIENT=$ENFORCE_VERIFIED_CLIENT); the"
-    echo "   verified client is only marked in the logs (IP hidden, no client= tag)"
+    echo "   verified marker is retained; IP and brand/UUID are hidden from synced logs"
     echo "   every brand ever committed to the repo (Eaglercraft[VER], EaglercraftX[V2],"
     echo "   the stock one) is refused - it cannot make anybody 'verified' any more"
     echo "   real client IPs: $(forward_ip_setting 2>/dev/null)"
@@ -3567,7 +3992,7 @@ while true; do
     fi
 
     if ! kill -0 $BACKEND_PID 2>/dev/null; then
-        echo "[$(date '+%H:%M:%S')] Paper crashed — restarting..."
+        echo "[$(now_eastern)] Paper crashed — restarting..."
         hf_push_saves
         IDLE_MODE=false
         start_paper
@@ -3586,7 +4011,7 @@ while true; do
     fi
 
     if ! kill -0 $BUNGEE_PID 2>/dev/null; then
-        echo "[$(date '+%H:%M:%S')] BungeeCord crashed — restarting..."
+        echo "[$(now_eastern)] BungeeCord crashed — restarting..."
         patch_eagler_port
         start_bungee
     fi
@@ -3597,7 +4022,7 @@ while true; do
     fi
 
     if [ -z "${LOGSYNC_PID:-}" ] || ! kill -0 "$LOGSYNC_PID" 2>/dev/null; then
-        echo "[$(date '+%H:%M:%S')] Log sync died — restarting..."
+        echo "[$(now_eastern)] Log sync died — restarting..."
         log_sync_loop &
         LOGSYNC_PID=$!
     fi
@@ -3608,7 +4033,7 @@ while true; do
     fi
 
     if ! kill -0 "$SECLOG_PID" 2>/dev/null; then
-        echo "[$(date '+%H:%M:%S')] Security logger died — restarting..."
+        echo "[$(now_eastern)] Security logger died — restarting..."
         start_security_logger
     fi
 
@@ -3630,7 +4055,7 @@ while true; do
         CURRENT_LINE=$(wc -l < /tmp/paper.log 2>/dev/null || echo 0)
         if [ "$CURRENT_LINE" -gt "$LAST_LOG_LINE" ]; then
             NEW_ERRORS=$(tail -n +"$((LAST_LOG_LINE + 1))" /tmp/paper.log | grep -c "ERROR\|SEVERE" || echo 0)
-            [ "$NEW_ERRORS" -gt 0 ] && echo "[$(date '+%H:%M:%S')] $NEW_ERRORS errors" && \
+            [ "$NEW_ERRORS" -gt 0 ] && echo "[$(now_eastern)] $NEW_ERRORS errors" && \
                 tail -n +"$((LAST_LOG_LINE + 1))" /tmp/paper.log | grep "ERROR\|SEVERE" | tail -3
             LAST_LOG_LINE=$CURRENT_LINE
         fi
@@ -3643,7 +4068,7 @@ while true; do
                 # Truncate in place so Java and the security logger keep working
                 tail -1000 "$LF" > "${LF}.old"
                 : > "$LF"
-                echo "[$(date '+%H:%M:%S')] Trimmed $(basename $LF)"
+                echo "[$(now_eastern)] Trimmed $(basename $LF)"
             fi
         done
         LAST_LOG_LINE=$(wc -l < /tmp/paper.log 2>/dev/null || echo 0)

@@ -211,312 +211,143 @@ prefers over the literals in the file). "Keeping the brand secret" in
 `README.md` has the four steps.
 Treat the pair (brand UUID + sealed payload) as an identification aid plus a
 speed bump: keep the file itself private, rotate (`--rotate`) when it leaks, and
-watch `client-checks.log` for logins that are not you.
+watch `security-logs/activity.log` for `CHECK` rows that are not you.
 
 ---
 
 ## 4. What `start.sh` does
 
 1. `start_bungee()` opens a FIFO (`/opt/server/bungee/console.pipe`) read+write
-   and gives it to BungeeCord as stdin. That keeps the console alive **and**
-   lets the script inject console commands from anywhere (including background
-   log-reader subshells, which is why the FIFO is opened before they start).
-2. When Paper logs a login (`... [/ip:port] logged in with entity id ...`) the
-   security logger records it and spawns `check_player_client` in the
-   background.
-3. `check_player_client` runs
+   and gives it to BungeeCord as stdin. That keeps the console alive **and** lets
+   the script inject console commands from anywhere.
+2. Paper, BungeeCord and an RCON `list` safety poll can report joins. The first
+   source writes one `LOGIN` row and marks the name online; duplicate reports
+   are ignored. The poll defaults to every 60 seconds.
+3. `check_player_client` runs `client-brand name <player>` on the proxy console,
+   reads the answer out of `/tmp/bungee.log`, strips legacy/ANSI color codes and
+   retries once if the handshake has not completed.
+4. The result is compared with the configured brand/UUID. `LOGIN`, `LOGOUT`,
+   `CHECK` and `COMMAND` events all go to the same append-only
+   `security-logs/activity.log`. Each event has an Eastern 12-hour timestamp;
+   the logger inserts a spaced divider when the local date changes. The verdict
+   marker `VERIFIED CLIENT` is retained, but the owner's IP is hidden and their
+   brand/UUID are redacted from synced output. Other clients receive their
+   resolved labels and, when available, their IP.
+5. **Enforcement** is off by default: all clients may join. Setting
+   `ENFORCE_VERIFIED_CLIENT=true` enables the kick policy. A check that did not
+   resolve does not kick unless `ENFORCE_KICK_ON_UNKNOWN=true`; bypass names are
+   configured with `ENFORCE_BYPASS_PLAYERS`.
+6. **Passwords**: auth command arguments are masked in the activity log and the
+   console snapshot. Other players' full auth commands are retained in private
+   `private-logs/auth.log`; the verified client's own password is never saved.
+   With no verified pair configured, all auth rows are masked as
+   `client=UNCONFIGURED`.
+7. **Why `/login` needs a jar patch**: LoginSecurity 3.3.1 and AuthMe can filter
+   the console line before the parser sees it. `start.sh` neutralises only the
+   relevant deny-string constants before Paper starts (`tools/patch_auth_filter.py`),
+   verifies with `javap` when available, keeps a backup, and restores/restarts
+   if the patched plugin fails to load. `AUTH_FILTER_PATCH=false` disables it.
+8. **IPs**: behind the ingress, the game sees a proxy address unless a
+   forwarded header works. The script probes candidates after startup and only
+   enables one if the upgrade succeeds and the plugin does not refuse it. The
+   result is remembered in private `private-logs/forward-ip.state`; see the IP
+   section in `README.md`.
+9. **Reports/status**: public `security-logs/addresses.txt` omits the verified
+   client's address; private `private-logs/addresses.txt` includes it. The
+   full dated sightings are in `private-logs/addresses.log`. The compact
+   `security-logs/status.txt` reports logger health, the last player-list
+   answer, auth capture, and forwarding/proxy evidence.
 
-   ```
-   client-brand name <player>
-   ```
+## 5. Getting the logs out of the Space
 
-   on the proxy console and reads the answer back out of `/tmp/bungee.log`:
+The bucket is the only log location reachable from outside the Space. Log sync
+and full world sync share a lock, so they do not overlap:
 
-   ```
-   Eagler Client Brand: <your brand>
-   Eagler Client Version: u2
-   Eagler Client UUID: <the UUID of that brand>
-   Minecraft Client Brand: EaglercraftX
-   ```
+* `log_sync_loop` runs every 60 seconds by default and syncs only the
+  `security-logs/`, `private-logs/`, and `logs/` prefixes. Each prefix uses
+  `--delete` so obsolete duplicate files are removed.
+* `hf_sync_loop` mirrors the full game-data tree every 600 seconds by default.
+* Both syncs and their staging copies run at low CPU/I/O priority where the
+  container permits (`nice -n 19`, `ionice -c3`). A low priority can make an
+  upload take longer; it is intended to let Paper's tick work win CPU/disk
+  scheduling. No live CPU/TPS/gameplay measurement is available in this repo.
 
-   ANSI/legacy colour codes are stripped first, and the query retries once
-   because a player may not be registered on the proxy yet.
-4. The UUID (or the brand string) is compared with `VERIFIED_CLIENT_UUID` /
-   `VERIFIED_CLIENT_BRAND` and the verdict is written to
-   `security-logs/client-checks.log` plus a `[CLIENT]` line on the container
-   console.
-5. The verdict is cached for the player, so **every later log line carries it**
-   — and for the verified client that is deliberately *nothing*:
-
-   ```
-   logins.log    DATE | LOGIN  | name | hidden                     <- the verified client
-                 DATE | VERIFY | name | ip | OTHER EAGLERCRAFT CLIENT | brand=… | version=… | uuid=…
-                 DATE | LOGOUT | name | ip | client=OTHER EAGLERCRAFT CLIENT
-   commands.log  DATE | name | hidden | command                    <- the verified client
-                 DATE | name | ip | command | client=JAVA CLIENT
-   ```
-
-   The verified client gets no `VERIFY` line and no `client=…` tag either, so
-   nothing in the synced logs points back at it. Anybody else is labelled
-   `OTHER EAGLERCRAFT CLIENT`, `JAVA CLIENT` or `UNKNOWN CLIENT`, with their
-   real IP — that is the whole answer to "was this me or somebody else?".
-6. **Enforcement** (`ENFORCE_VERIFIED_CLIENT=false`, the default — everybody
-   may join and is only *marked*; set it to `true` to kick): every account
-   that is not on the verified client is kicked through RCON right after the
-   login, including real Java Minecraft clients (`ENFORCE_KICK_VANILLA`). A
-   check that never resolved is *not* kicked (`ENFORCE_KICK_ON_UNKNOWN=false`),
-   so a proxy restart can never lock you out of your own server; add names to
-   `ENFORCE_BYPASS_PLAYERS` if somebody may use any client.
-7. **Passwords**: `/login`, `/l`, `/log`, `/register`, `/reg`,
-   `/changepassword`, `/changepass`, `/unregister` and `/authme` are masked in
-   `commands.log` and kept in full in `private-logs/auth.log`. The verified
-   client's own commands are the one exception: your password is never written
-   anywhere — its row there is
-
-   ```
-   DATE | <name> | hidden | /login ******** | client=VERIFIED CLIENT (password not recorded)
-   ```
-
-   i.e. the file still shows that a `/login` happened and still proves the
-   capture path works, without storing the password and without exposing your
-   IP. (Without that row `auth.log` would look dead while everything works,
-   because under enforcement nobody else ever gets the chance to type one.)
-   Commands are queued for a moment when needed, so the verdict is always known
-   before the line is written, and the same command seen twice (Paper and
-   Bungee) is written once.
-
-   The line this reads has to exist in the first place: LoginSecurity 3.3.1
-   installs a log4j filter on the root logger that **deletes** every
-   `… issued server command: /login …` line (AuthMe does the same through
-   `LogFilterHelper`). `start.sh` neutralises the filter's deny strings in the
-   plugin jar before Paper starts (`tools/patch_auth_filter.py`, with a `javap`
-   check, a backup and a rollback when the plugin fails to load), so the auth
-   commands reach the console - see "Why `/login` needs a jar patch" in
-   `README.md`. `AUTH_FILTER_PATCH=false` switches that off.
-8. **IPs**: the login line carries whatever address the game sees. Behind the
-   Hugging Face ingress that is the proxy, so `listeners.yml` is written with
-   `forward_ip` + `forward_ip_header` — and because the plugin disconnects
-   connections *without* that header, the header is proven first: `start.sh`
-   probes each candidate through the public URL after startup, keeps the first
-   one that both completes the upgrade and does not produce the plugin's
-   "Connected without … header, disconnecting" line, and remembers it in
-   `private-logs/forward-ip.state` (synced to the bucket). See the "IPs"
-   section in `README.md`. The per-account result is written to
-   `security-logs/ip-report.log` (and, with your own addresses included, to
-   `private-logs/ip-report-private.log`).
-9. **Logger status**: `security-logs/logger-status.log` is refreshed every
-   `LOG_STATUS_INTERVAL` (60) s: line counts, the login/logout counters, the
-   last RCON `list` answer, the current `forward_ip` setting and the last few
-   raw console lines the parsers see. "It is not logging logins" can be
-   answered from the bucket with that file alone.
-
-## 7. Getting the logs out of the Space
-
-The bucket is the only thing reachable from outside, so `start.sh` keeps two
-sync loops running: a fast one for the logs (`log_sync_loop`,
-`LOG_SYNC_INTERVAL=60` s, never uses `--delete`, uploads `security-logs/`,
-`private-logs/` and the tails of `/tmp/paper.log` + `/tmp/bungee.log`), and the
-full game-data mirror (`hf_sync_loop`, `SYNC_INTERVAL=300` s, `--delete`). Both
-are restarted by the monitor loop if they die, and the shutdown handler pushes
-the logs one last time.
-
-Everything lands here:
+The curated remote files are:
 
 ```
-hf://buckets/smodusermc/1.12/game-data/security-logs/{logins,commands,client-checks}.log
-hf://buckets/smodusermc/1.12/game-data/security-logs/shared-ips.txt
-hf://buckets/smodusermc/1.12/game-data/private-logs/{auth,player-ips,logins-real-ips}.log
-hf://buckets/smodusermc/1.12/game-data/private-logs/shared-ips-private.txt
-hf://buckets/smodusermc/1.12/game-data/logs/{paper,bungee}.log
+hf://buckets/smodusermc/1.12/game-data/security-logs/activity.log
+hf://buckets/smodusermc/1.12/game-data/security-logs/addresses.txt
+hf://buckets/smodusermc/1.12/game-data/security-logs/status.txt
+hf://buckets/smodusermc/1.12/game-data/private-logs/{auth.log,addresses.log,addresses.txt}
+hf://buckets/smodusermc/1.12/game-data/private-logs/{verified-players.txt,proxy-peers.log,forward-ip.state}
+hf://buckets/smodusermc/1.12/game-data/logs/console.log
 ```
 
-`bash tools/fetch-logs.sh [outdir] [bucket/game-data]` downloads all of them in
-one go; a single file works too with
-`hf buckets cp hf://buckets/smodusermc/1.12/game-data/security-logs/logins.log .`
+`bash tools/fetch-logs.sh [outdir] [bucket/game-data]` downloads the current
+folders in one go. Read `activity.log` to filter `LOGIN`, `CHECK`, or `COMMAND`
+rows. `activity.log`, `auth.log`, and `addresses.log` are append-only logs using
+`America/New_York` (EST/EDT), a 12-hour clock, and daily dividers. Address
+reports, status, and the combined console file are snapshots with an Eastern
+12-hour update/capture timestamp.
 
-`backend/private-logs/` is synced to the bucket as well — the logs are only
-useful if you can actually read them, and the bucket is the only place reachable
-from outside the Space. Set `SYNC_PRIVATE_LOGS=false` to stop that (then the
-files below stay inside the Space and *cannot* be read from outside):
+`SYNC_PRIVATE_LOGS=true` is the default because the private files are needed to
+read the verified client's real address and other players' full auth commands.
+Setting `SYNC_PRIVATE_LOGS=false` syncs an empty private prefix with `--delete`,
+removing old private copies from the bucket. `SYNC_CONSOLE_LOGS=false` does the
+same for the console snapshot prefix. Keep the bucket private. Reports
+regenerate every 300 seconds and the status snapshot every 60 seconds by
+default.
 
-| private file | content |
-| --- | --- |
-| `auth.log` | full `/login`, `/register`, `/changepassword`, … commands of everybody except the verified client |
-| `proxy-peers.log` | the addresses the proxy in front of the server connects from, so an address in the logs can be classified as the player's or the proxy's |
-| `player-ips.log` | the real IPs that appear as `hidden` in the synced logs |
-| `logins-real-ips.log`, `shared-ips-private.txt` | the same reports as the bucket ones, but with the verified client's IP put back in |
+On startup `tools/log_migrate.py` converts legacy UTC timestamps to Eastern,
+redacts verified-client identity data, masks the verified owner's legacy auth
+password when historical evidence identifies them, merges duplicate events/IP
+history, and removes the old many-file copies. The migration is marker-based and
+idempotent; `tests/test_verified_client.sh` exercises it with a fixture.
 
-The client file itself is the *optimised* build, in three steps that touch nothing
-else:
+The checked-in client includes earlier End Portal pass-count and asset/animation
+transformations. They are client-side, not Paper tick optimisations. Automated
+fixtures prove that the targeted WASM/package edits remain well-formed; they do
+not prove a visible FPS gain. A previous visual check showed no noticeable
+improvement, and there is no in-game A/B or low-end-phone benchmark available.
 
-1. **The end portal's render pass count.** `RenderEndPortal` draws the portal quad
-   once per pass (up to 15 in the stock client, chosen by
-   `RenderEndPortal.getPasses` from the squared distance to the block), each pass
-   with its own texture matrix change and blended draw.  In the browser every one
-   of those GL calls crosses the wasm → JS boundary, which is the whole of the
-   "the portal in render distance lags really bad" report.  `classes.wasm` carries
-   that function as a chain of single-byte `i32.const` pass counts;
-   `tools/optimize_client.py` finds the chain (it refuses anything that does not
-   look like the stock one) and lowers every count above the cap - 7 by default,
-   so the layered starfield keeps half its layers.  One byte per count, no length
-   change, and the module still compiles (the suite runs it and compares the
-   returned layer counts for stock and patched).
-2. **The end portal texture** (`entity/end_portal.png`, 256x256 → 32x32): it is
-   what every one of those passes samples (the End's sky wallpaper is the
-   separate `environment/end_sky.png`, which pass 0 of a portal face also uses).
-3. **The animated strips**: every n-th frame is kept with a scaled `frametime`
-   (water and lava at 15 fps instead of 60, a quarter of the memory and uploads).
+The reported stutter is near an End gateway or the End return-to-overworld
+portal, not usually the overworld stronghold portal. Do not assume the cause:
+the End Portal pass edit does not diagnose the separate gateway render path,
+server chunk/tick load, entities, or network delay. See the controlled
+client-FPS versus Paper-timings comparison in `README.md` before making further
+gameplay or client-render changes.
 
-The same two asset rules run on a **resource pack** (`--pack`, an EPK or the
-`.zip` the client imports), because a pack replaces the optimised assets with its
-own - which is why some packs are much worse than others.
+## 6. Keeping client and server in sync
 
-A rebuild with `tools/setup-verified-client.sh` runs `tools/optimize_client.py` on
-the result automatically - see "Low-end machines" in `README.md` for the switches
-(`--frames`, `--end-portal`, `--portal-passes`, `PORTAL_PASSES`) and for what is
-deliberately never touched (anything that is UV-mapped, and every gameplay
-setting).
+`tests/test_verified_client.sh` exercises the client/server identity flow and
+related helpers. It checks the built-in pair and history, verified/unverified/
+vanilla/unknown detection, default allow-all enforcement, auth command masking,
+LoginSecurity/AuthMe patch fixtures, forwarded-IP behavior, proxy-peer/IP reports,
+and the low-end client package's structural edits. It also checks:
 
-The shared-IP report in the bucket shows the verified client as `hidden`; the
-private copy shows the real value, so the correlation analysis (same IP used by
-several accounts, one account seen from several IPs) is not lost — it just
-stays inside the Space.
+* Eastern 12-hour timestamps, one divider per date, and consistent spacing;
+* consolidated event/report paths, legacy UTC migration, secret redaction,
+  legacy verified-auth masking, and migration idempotence;
+* per-prefix bucket sync (including disabled-prefix cleanup), combined console
+  redaction, private-log staging, sync intervals, and low-priority wrappers;
+* embedded helper parity with `tools/`, plus optional JVM/client-loader checks
+  when the required runtime and gate credentials are available.
 
-The raw console tails that are pushed to the bucket
-(`game-data/logs/{paper,bungee}.log`) are copies of the running logs, so every
-auth command argument in them is masked (`/login ********`) and the verified
-client's address is written as `hidden` — the full commands exist exactly once,
-in `private-logs/auth.log`.
-
-Console answers about players that are not Eaglercraft (`That player is not
-using eaglercraft!`) become `VANILLA`; no answer at all becomes `UNKNOWN`, never
-`VERIFIED`, so the check never produces false positives.
-
----
-
-## 5. Keeping client and server in sync
-
-`tests/test_verified_client.sh`:
-
-* decodes the pair baked into `start.sh` and asserts it is *not* readable in the
-  file, that it is the same client as `.verified-client.env`, and that neither
-  string appears anywhere in the git history;
-* asserts the committed `client/1.12.html` does not leak the brand (as text) and
-  that its PBKDF2 verifier accepts the configured brand
-  (`--check --expect-brand` → `matches : YES`), and — with the credentials — that
-  the brand inside the sealed payload is the configured one and agrees with the
-  verifier.
-* asserts that the burned brands (stock, `Eaglercraft[VER]`, `EaglercraftX[V2]`)
-  are not the verified client: a mock proxy answering with them gets
-  `UNVERIFIED`, and a configured-but-burned pair is refused with `PUBLIC BRAND`;
-* asserts that with no pair configured nobody is marked and every password in
-  `auth.log` is masked (`client=UNCONFIGURED`) instead of written in clear;
-* extracts the detection functions from `start.sh` and drives them against a
-  fake BungeeCord console, asserting `VERIFIED` / `UNVERIFIED` / `VANILLA` /
-  `CONSOLE_DOWN` classifications and the login flow;
-* asserts the hiding: the verified client's lines say `hidden`, carry no
-  `client=…` tag and get no `VERIFY` line, while everybody else shows the real
-  IP and their label;
-* asserts that everybody may join by default (`ENFORCE_VERIFIED_CLIENT=false`:
-  no kicks whatever the client), that turning enforcement on still kicks, that
-  the verified client and `ENFORCE_BYPASS_PLAYERS` are not kicked, and that an
-  unresolved check
-  is not kicked unless `ENFORCE_KICK_ON_UNKNOWN=true`;
-* asserts the password logging: a stranger's `/login`, `/register` land in full
-  in `private-logs/auth.log`, the verified client's never do, the same command
-  seen twice is written once, and commands that arrive before the verdict are
-  queued until it is known;
-* asserts that the script's own injected console commands are not logged as
-  player commands, and that the private report keeps the real IPs the synced
-  report hides;
-* asserts the auth-filter patch: the rule table names LoginSecurity 3.3.1's
-  `LoggingFilter` and its deny strings, a fixture jar is patched and then
-  **loaded by a real JVM**, the filter's own deny logic answers `DENY` before
-  and `NEUTRAL` after the patch, the plugin's command class is untouched, the
-  patch is idempotent and reversible, a failed `javap` check rolls the jar back,
-  a patched plugin that does not load is restored and Paper restarted once, and
-  `AUTH_FILTER_PATCH=false` really disables it;
-* asserts the bucket's console copies are masked (every auth argument
-  `********`, the verified client's address `hidden`) and that three accounts
-  on one device keep one address while two simultaneous logins never swap
-  addresses;
-* asserts the IP evidence: the proxy peers come out of a fixture of the kernel's
-  tables (IPv4 and IPv6, listener and unrelated sockets ignored), are recorded
-  once with a readable copy in the synced folder, an address equal to a peer is
-  reported as the proxy's and one that is not as a real client address, a
-  proxy-only log is called out with its verdict, IPv4+IPv6 for one account is
-  reported as one device, and the header discovery is retried exactly when it
-  should be (never while somebody is online, never once a header works);
-* asserts the low-end-device asset rules: the end portal texture shrinks to
-  32x32, a 32-frame animation becomes 8 frames with its `frametime` scaled so the
-  animation keeps its speed, a rotated frame list is remapped (never truncated),
-  a hand-written frame list and an undecodable texture are left alone, every
-  other file in the package stays byte for byte, and the rebuilt package still
-  round-trips - plus that re-running the optimiser on the committed client
-  changes nothing and reproduces the file byte for byte;
-* asserts the same rules on a **resource-pack zip**: the rebuilt archive keeps
-  every entry in order with its CRC, the directory entry and every file it did
-  not change byte for byte, and only the portal texture and the animated strip
-  differ;
-* asserts the end portal pass cap on a fixture module shaped exactly like the
-  compiled `getPasses` (found by its threshold chain, one byte per count, only
-  ever lowered, idempotent, `0`/impossible caps refused, a module that does not
-  match refused) and **runs both** the stock and the patched module in Node, so
-  the check is about the returned layer counts and not about the bytes, then
-  checks the committed client really carries the capped chain;
-* asserts the discovered header is remembered in `private-logs/`, i.e. inside
-  the folder that is synced to the bucket and restored at boot - a choice that
-  is written outside it does not survive a restart - and that a header a probe
-  really ruled out is only re-asked about once an hour, not on every tick;
-* **runs the real login gate and boots the client's own `loader.wasm`**: with
-  `VER_CLIENT_USER`/`VER_CLIENT_PASS` set it calls
-  `tools/verify_gated_client.mjs` (no boot before the login, wrong username and
-  wrong password rejected, the payload unseals and the file's own loader accepts
-  it, plaintext credentials absent from the file), then boots
-  `tools/run_epw_loader.mjs` against the unsealed container and requires
-  `LOADER VERDICT: OK`, plus a negative control (a corrupted CRC must be
-  rejected) — this is the check that catches the "EPW file is invalid / Try
-  again later" class of bugs. Without the credentials it prints a clear
-  `skip -` line instead of pretending to pass;
-* asserts the owner's own `/login` shows up in `private-logs/auth.log` with the
-  password masked and the IP hidden (and that nobody's password is ever in a
-  log line it should not be in), so "auth.log is empty" cannot silently return;
-* asserts the IP bookkeeping: placeholders are never treated as an address, the
-  newest real address wins, every sighting keeps its source, the report lists
-  one line per account/address/source, and the synced report leaves the
-  owner's addresses out while the private one keeps them;
-* asserts the forwarded-IP discovery against a fake proxy: a header the plugin
-  refuses is *not* trusted even when the probe succeeds, a working header is
-  saved for the next boot, and no header working ends as `off` rather than as a
-  guess;
-* asserts the helper copies embedded in `start.sh` (`bucket_sync.py`,
-  `forward_ip_probe.py`) are byte-identical to `tools/` and still valid Python;
-* asserts `security-logs/logger-status.log` reports the counters, the last
-  RCON `list` answer and the raw console lines;
-* asserts the tool enforces the loader's 32 MiB dictionary limit;
-* logs a login from every console format the server might use (modern Paper,
-  old Paper, bare, proxy-only) and only once when several report it;
-* catches a login the log files never showed at all, through the RCON player
-  list, and does not log everybody out when RCON hiccups;
-* keeps uploading when `hf` fails, by falling back to `tools/bucket_sync.py`
-  (the copy embedded in `start.sh` must stay byte-identical to that file), and
-  tells the user in the Space logs when the token cannot write at all.
-
-Run it after any change:
+The suite uses local fixtures and fake bucket APIs. It does **not** test a live
+HF bucket/Space, build the Docker image, measure server CPU/TPS, or establish
+that gameplay has no lag. Those require deployment/player-side measurements.
 
 ```bash
-bash tests/test_verified_client.sh               # 201 checks
-VER_CLIENT_USER=<user> VER_CLIENT_PASS=<password> \
-    bash tests/test_verified_client.sh           # 216 checks (adds the boot test)
-PRINT_LOGS=1 bash tests/test_verified_client.sh  # …and dump the logs it built
+bash tests/test_verified_client.sh
+PRINT_LOGS=1 bash tests/test_verified_client.sh
 
-# just the client: gate + loader (prints every check it made)
+# optional: boot the sealed client through its real login gate and loader
+VER_CLIENT_USER=<user> VER_CLIENT_PASS=<password> \
+    bash tests/test_verified_client.sh
 node tools/verify_gated_client.mjs client/1.12.html --user <user> --pass <password>
 ```
 
----
-
-## 6. Changing the marker
+## 7. Changing the marker
 
 ```bash
 # rotate: new random brand, new UUID and new login credentials in one go

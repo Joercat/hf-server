@@ -4,8 +4,8 @@
 # has to go where.
 #
 #   bash tools/setup-verified-client.sh --brand "AnotherBrand16Ch" \
-#        --gate-user <user> --gate-pass '<password>' 
-#   bash tools/setup-verified-client.sh --rotate --gate-user <user> --gate-pass '<password>' 
+#        --gate-user <user> --gate-pass '<password>'
+#   bash tools/setup-verified-client.sh --rotate --gate-user <user> --gate-pass '<password>'
 #   bash tools/setup-verified-client.sh --rotate --gate-user <user>         # asks for the password
 #   bash tools/setup-verified-client.sh --rotate --gate-user <user> --upload  # + puts it in the bucket
 #
